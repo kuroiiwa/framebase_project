@@ -26,7 +26,7 @@ Framebase 是一个在自己电脑上运行的视频整理工具。它把多个�
 
 ### 安装与启动
 
-需要 Node.js **22.13.0 或更新版本**。远程关机和项目自带的快捷启动脚本仅支持 Windows。建议在最新版 Chrome 或 Edge 中使用电脑端视频库。
+需要 Node.js **22.13.0 或更新版本**。远程关机仅支持 Windows。建议在最新版 Chrome 或 Edge 中使用电脑端视频库。
 
 ```bash
 npm install
@@ -34,7 +34,7 @@ npm run build
 npm run lan
 ```
 
-打开 `http://localhost:3000`。`npm run lan` 会同时启动页面服务和局域网服务；关闭启动它的终端，服务也会停止。在本项目配置好的 Windows 环境中，也可以双击 `启动 Framebase.cmd` 启动。修改页面代码后，重新运行 `npm run build` 并重启服务。
+打开 `http://localhost:3000`。`npm run lan` 会同时启动页面服务和局域网服务；关闭启动它的终端，服务也会停止。修改页面代码后，重新运行 `npm run build` 并重启服务。
 
 ### 整理电脑上的视频
 
