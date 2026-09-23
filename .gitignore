@@ -40,3 +40,8 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+/.framebase-lan.json
+/.framebase-lan.json.tmp
+/.framebase-thumbnails/
+/.framebase-power.json
+/.framebase-power.json.tmp
