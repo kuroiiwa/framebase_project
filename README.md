@@ -1,134 +1,73 @@
-# vinext-starter
+# Framebase
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Framebase 是一个在自己电脑上运行的视频整理工具。它把多个本地文件夹汇总成视频库，方便查找、预览、标记、筛选和播放；同一局域网中的手机可以浏览与播放电脑共享的视频。电脑端和手机端的日常使用都通过浏览器完成。
 
-## Prerequisites
+## 原理
 
-- Node.js `>=22.13.0`
+- **电脑端视频库**：Chrome 或 Edge 获得用户选择的文件夹权限后，在浏览器中递归扫描视频。文件夹句柄、视频清单和预览缓存保存在浏览器的 IndexedDB；标签、收藏等整理记录保存在浏览器本地存储。视频通过本地文件句柄读取和播放，不上传到外部服务。
+- **局域网访问**：电脑上的 Node.js 服务只读取在“局域网”页面明确添加的共享目录，向已配对的手机提供视频清单、缩略图和支持分段请求的视频流。手机需要与电脑处于同一局域网，且电脑上的服务必须保持运行。手机端不能删除视频或修改共享目录。
+- **远程关机**：这项功能默认关闭。电脑端开启后，每台手机还需单独申请并获得授权。手机确认关机后，本地服务等待 10 秒，再向 Windows 提交非强制关机指令；倒计时期间可以在手机或电脑端取消。关机后服务停止，因此本项目不提供远程开机。
 
-## Quick Start
+局域网配置和设备授权分别保存在项目目录下的 `.framebase-lan.json` 与 `.framebase-power.json`，两者已被 Git 忽略。浏览器缓存和电脑上的配置互不等同；清除浏览器数据可能丢失该浏览器中的整理记录。
+
+## 使用的开源组件
+
+| 组件 | 用途 |
+| --- | --- |
+| [React](https://react.dev/) | 电脑端与手机端界面 |
+| [Vinext](https://github.com/cloudflare/vinext) | 网站构建与页面服务 |
+| [Vite](https://vite.dev/) | 前端构建工具 |
+| [TypeScript](https://www.typescriptlang.org/) | 页面代码的类型检查 |
+| [Tailwind CSS](https://tailwindcss.com/) | 样式构建 |
+
+局域网服务使用 Node.js 内置模块实现目录读取、设备配对和视频流传输。电脑端文件访问使用浏览器的 File System Access API，整理数据使用 IndexedDB 和 `localStorage`。项目目前不依赖外部数据库来保存视频库。
+
+## 使用方式
+
+### 安装与启动
+
+需要 Node.js **22.13.0 或更新版本**。远程关机和项目自带的快捷启动脚本仅支持 Windows。建议在最新版 Chrome 或 Edge 中使用电脑端视频库。
 
 ```bash
 npm install
-npm run dev
 npm run build
+npm run lan
 ```
 
-This starter does not use `wrangler.jsonc`.
+打开 `http://localhost:3000`。`npm run lan` 会同时启动页面服务和局域网服务；关闭启动它的终端，服务也会停止。在本项目配置好的 Windows 环境中，也可以双击 `启动 Framebase.cmd` 启动。修改页面代码后，重新运行 `npm run build` 并重启服务。
 
-## Included Shape
+### 整理电脑上的视频
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+1. 在电脑端添加一个或多个源文件夹，并允许浏览器访问。需要执行删除操作时，浏览器还需要该文件夹的写入权限。
+2. 等待扫描和预览生成完成；可暂停、继续、取消任务，或重试失败的预览。
+3. 使用搜索、来源、格式、时长、分辨率和标签筛选视频。可切换布局、排序、收藏、标记待清理并管理自定义标签。
+4. 在选择模式中可全选本页、全选筛选结果、反选本页，或按住 Shift 跨页连续选择。
 
-## Workspace Auth Headers
+**注意：批量删除会直接删除源文件，不经过应用回收站，无法在 Framebase 内撤销。**“从视频库移除来源”只移除索引，不会删除源文件。
 
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
+### 手机浏览与播放
 
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
+1. 在电脑端打开 `http://localhost:3000/lan`，添加要共享的目录。电脑端视频库里的来源不会自动共享。
+2. 将手机接入同一 Wi-Fi 或局域网，打开该页面显示的手机访问地址，并输入电脑端的六位配对验证码。
+3. 在手机上搜索、筛选和播放。页面的“到底部 · 关机”按钮可直接跳到远程关机区域；播放视频时该按钮隐藏。
 
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
+如果手机无法连接，请检查电脑与手机是否在同一网络，并允许 Windows 防火墙中的 Node.js 在“专用网络”通信。不要在公共 Wi-Fi 上启用局域网服务。
 
-Treat the full name as optional and fall back to email when it is absent:
+### 可选：授权手机远程关机
 
-```tsx
-import { headers } from "next/headers";
+1. 电脑端在“局域网 → 远程关机设置”开启功能。
+2. 手机在页面底部申请权限；电脑端核对手机显示的设备编号后授权。
+3. 手机点击“关闭电脑…”，再次确认后进入 **10 秒倒计时**。倒计时期间，手机或电脑端均可取消。
 
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
+视频库配对不等于关机授权。关闭关机开关、撤销设备授权或停止服务会取消尚未提交的关机任务。Windows 接受指令后，网页无法再取消；未保存的程序可能阻止关机。网页断开连接也不能证明电脑已关机。
 
-  const displayName = fullName ?? email;
-  // ...
-}
-```
+## 特性
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+- 多文件夹聚合、递归扫描、本地缩略图与视频基础信息缓存。
+- 名称和路径搜索；来源、标签、格式、时长、分辨率筛选；随机、名称、大小、时间和点击次数排序。
+- 收藏、待清理、自定义标签、分页、多种布局，以及跨页批量选择。
+- 悬停分段预览、可搜索的播放队列、顺序或随机播放、单条循环和可选自动连播。
+- 电脑与手机共用播放快捷键：空格播放/暂停，方向键快进快退或调音量，`M` 静音，`F` 全屏，`Esc` 返回。
+- 局域网手机只读浏览与播放；单独授权的手机可发起带 10 秒可取消倒计时的 Windows 关机。
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## 视频库操作
-
-- **选择**：点击“选择”后可全选本页、全选全部筛选结果、反选本页或取消全部。按住 Shift 点击卡片或勾选按钮可按当前排序跨页连选；页面会提示不在本页及不符合筛选的已选数量，也可单独取消隐藏项。
-- **快捷键**：电脑和手机浏览器的播放器统一支持空格播放/暂停、左右快进/快退 10 秒、上下调节音量 5%、M 静音、F 全屏、Esc 退出全屏或返回。输入框内不触发播放快捷键。全屏等能力取决于浏览器支持。
-- **扫描任务**：显示目录扫描数量及预览生成进度，支持暂停、继续、取消、重试失败预览和生成未完成预览。暂停和取消在当前文件处理结束后生效；取消未完成的目录扫描不会替换原清单，已完成的预览保留。扫描全部来源时取消当前任务也会停止后续来源。
-- **播放队列**：电脑端播放器显示打开视频时的全部筛选结果，支持队列搜索、点击切换、顺序播放、随机打乱和单条循环。自动连播可单独开启，队列末尾停止；切回顺序播放会恢复原顺序。
-
-## 局域网访问设置
-
-双击 `启动 Framebase.cmd` 后，电脑端仍使用 `http://localhost:3000`。在电脑端点击顶部的“局域网”，或直接打开 `http://localhost:3000/lan`：
-
-1. 点击电脑端已缓存的来源名称，在弹出的 Windows 文件夹选择窗口中确认对应目录；系统会自动添加并记住完整路径。
-2. 也可以点击“浏览…”选择其他目录，或手动输入完整路径，例如 `D:\视频素材`。
-3. 添加后复制页面生成的固定移动端地址。
-4. 让手机连接同一个 Wi-Fi 或局域网，在手机浏览器打开该地址，并输入电脑端显示的六位验证码。
-5. 保持电脑上的 Framebase 启动窗口打开。验证成功后手机会保持配对，除非电脑端生成了新验证码。
-
-移动端只提供视频清单、缩略图和视频流，并支持搜索、筛选、排序与随机打乱。手机端不能添加或移除共享目录，也没有删除、标记或文件管理接口。共享设置保存在项目目录下的 `.framebase-lan.json`，缩略图会从电脑端现有预览缓存同步到 `.framebase-thumbnails`；两者均已被 Git 忽略。
-
-如果手机无法连接，请在 Windows 防火墙弹窗中允许 Node.js 在“专用网络”通信。不要在公共 Wi-Fi 上启用此服务。
-
-## 手机远程关机（Windows）
-
-1. 重启 `启动 Framebase.cmd`，电脑浏览器打开 `http://localhost:3000/lan`，在“远程关机设置”勾选“允许手机远程关机”（默认关闭）。
-2. 手机连接同一局域网，完成视频库配对后，在页面底部填写设备名称，点击“申请关机权限”。
-3. 电脑端核对手机显示的八位设备编号，点击“核对并授权”。仅凭视频库配对不能关机。
-4. 手机点击“关闭电脑…”，确认目标电脑后点击“确认，10 秒后关机”。手机和电脑设置页均显示倒计时，并可点击“取消关机”。
-
-倒计时由本地服务执行，手机关闭网页不会取消任务。关闭远程关机开关、移除发起设备、更新视频配对凭据或停止服务，会取消尚未提交的任务。服务重启不会恢复旧任务。Windows 接受指令后网页不能再取消；连接中断不代表已成功关机。未保存的程序可能阻止关机，系统不会被强制关闭程序。
-
-独立设备权限保存在被 Git 忽略的 `.framebase-power.json`；浏览器使用独立 HttpOnly 设备凭据。授权管理仅允许电脑通过 localhost 访问；关机接口仅接受同源、局域网请求。当前不提供外网关机或远程开机。
-
-验证：`node --test tests/power.test.mjs` 使用模拟时钟和模拟系统执行器，不会执行真实关机。
-
-## 参考资料
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+可扫描的扩展名包括 MP4、MOV、M4V、WebM、MKV、AVI、WMV、FLV、MPEG 和 MPG。**能扫描到文件不代表浏览器一定支持其视频或音频编码**；实际能否播放取决于使用的浏览器。
