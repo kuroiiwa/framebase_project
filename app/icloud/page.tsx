@@ -19,6 +19,7 @@ type IcloudConfig = {
   lastScanAt: string | null;
   lastBackupAt: string | null;
   updatedAt: string | null;
+  scan?: { scannedAt: string | null; sampleCount: number; samples: Array<{ name: string; extension: string; mediaType: "photo" | "video" }> };
 };
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
@@ -36,7 +37,7 @@ function IcloudCenter({ username }: { username: string }) {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | null>(null);
+  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -158,6 +159,19 @@ function IcloudCenter({ username }: { username: string }) {
     setAuth(data); setPassword(""); setMfaCode("");
   }
 
+  async function scanRecent() {
+    setBusy("scan"); setError(""); setMessage("");
+    try {
+      const response = await fetch("/api/icloud/scan", { method: "POST" });
+      const data = await response.json() as IcloudConfig & { scanResult?: { status: string; message: string }; error?: string };
+      if (!response.ok) throw new Error(data.error || "无法扫描 iCloud 媒体");
+      setConfig(current => ({ ...data, providerInfo: current?.providerInfo }));
+      if (data.scanResult?.status === "ready") setMessage(data.scanResult.message);
+      else setError(data.scanResult?.message || "iCloud 只读扫描失败，请重新验证连接。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法扫描 iCloud 媒体"); }
+    finally { setBusy(null); }
+  }
+
   const readyForConnection = Boolean(config?.backupDirectory);
   const connectionConfigured = Boolean(config?.appleAccount);
   return <main className={styles.page}>
@@ -202,9 +216,14 @@ function IcloudCenter({ username }: { username: string }) {
         </div>}
       </article>
 
-      <article className={`${styles.card} ${styles.disabled}`}>
+      <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>3</span><div><h2>扫描、备份与验证</h2><p>连接后先只读统计，再由当前用户选择测试备份或完整增量备份。</p></div></div>
         <ul><li>原片、视频、Live Photo 与 RAW</li><li>断点续传和失败重试</li><li>本地存在性、大小与媒体可读性验证</li></ul>
+        <div className={styles.actions}><button className={styles.primary} onClick={() => void scanRecent()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在只读扫描…" : "扫描最近 10 个项目"}</button></div>
+        {config?.scan?.scannedAt && <div className={styles.scanResult}>
+          <div><strong>最近一次只读扫描</strong><span>{config.scan.sampleCount} 个媒体项目 · {new Date(config.scan.scannedAt).toLocaleString("zh-CN")}</span></div>
+          {config.scan.samples.length > 0 && <ul>{config.scan.samples.map((item, index) => <li key={`${item.name}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong>{item.name}</strong></li>)}</ul>}
+        </div>}
       </article>
     </section>
 

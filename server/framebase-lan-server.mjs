@@ -386,8 +386,15 @@ async function handleIcloud(request, response, url) {
   const current = requirePc(request, response);
   if (!current) return;
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, providerInfo] = await Promise.all([icloud.read(current.username), icloudProvider.info()]);
-    return json(response, 200, { ...config, providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version } });
+    const [config, scan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloudProvider.info()]);
+    const runtimeReady = icloudProvider.hasRuntimeCredential(current.username);
+    return json(response, 200, {
+      ...config,
+      connectionStatus: config.connectionStatus === "connected" && !runtimeReady ? "expired" : config.connectionStatus,
+      lastConnectionMessage: config.connectionStatus === "connected" && !runtimeReady ? "为保护密码，FrameBase 重启后需要重新登录 Apple ID。" : config.lastConnectionMessage,
+      scan,
+      providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
+    });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/pick-folder") {
     if (process.platform !== "win32") return json(response, 501, { error: "自动选择文件夹目前仅支持 Windows。" });
@@ -409,13 +416,23 @@ async function handleIcloud(request, response, url) {
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/verify") {
     const context = await icloud.connectionContext(current.username);
-    const verification = await icloudProvider.verifyExistingSession(context);
+    const verification = await icloudProvider.verifyRuntimeSession(current.username, context);
     const config = await icloud.recordConnectionCheck(current.username, verification);
     return json(response, 200, {
       ...config,
       providerInfo: { id: verification.providerInfo.id, available: verification.providerInfo.available, version: verification.providerInfo.version },
       verification: { status: verification.status, message: verification.message },
     });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/scan") {
+    const context = await icloud.connectionContext(current.username);
+    const scanResult = await icloudProvider.scanRecent({ ...context, jobKey: current.username, limit: 10 });
+    if (scanResult.status !== "ready") {
+      const config = await icloud.recordConnectionCheck(current.username, scanResult);
+      return json(response, 200, { ...config, scan: await icloud.readScan(current.username), scanResult: { status: scanResult.status, message: scanResult.message } });
+    }
+    const config = await icloud.recordScan(current.username, scanResult);
+    return json(response, 200, { ...config, scanResult: { status: scanResult.status, message: scanResult.message } });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
     const context = await icloud.connectionContext(current.username);

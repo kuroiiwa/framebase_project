@@ -29,6 +29,11 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     assert.equal(connectedAlice.icloudDomain, "com");
     assert.notEqual((await manager.connectionContext("gabri")).sessionDirectory, (await manager.connectionContext("alice")).sessionDirectory);
 
+    await manager.recordScan("gabri", { samples: [{ name: "IMG_0001.HEIC", extension: "heic", mediaType: "photo" }, { name: "terminal prompt", extension: "", mediaType: "photo" }] });
+    await manager.recordScan("alice", { samples: [{ name: "VID_0002.MOV", extension: "mov", mediaType: "video" }] });
+    assert.deepEqual((await manager.readScan("gabri")).samples.map(item => item.name), ["IMG_0001.HEIC"]);
+    assert.deepEqual((await manager.readScan("alice")).samples.map(item => item.name), ["VID_0002.MOV"]);
+
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));
     assert.equal(gabriFile.backupDirectory, gabri.backupDirectory);
@@ -52,11 +57,13 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /\/api\/icloud\/connection/);
   assert.match(page, /验证已有会话/);
   assert.match(page, /开始 Apple 登录/);
+  assert.match(page, /扫描最近 10 个项目/);
   assert.match(page, /← 返回视频库/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
   assert.match(server, /icloud\.configureBackupDirectory\(current\.username/);
-  assert.match(server, /icloudProvider\.verifyExistingSession/);
+  assert.match(server, /icloudProvider\.verifyRuntimeSession/);
   assert.match(server, /icloudProvider\.startAuthentication/);
+  assert.match(server, /icloudProvider\.scanRecent/);
   assert.match(server, /ShowDialog\(\$owner\)/);
 });

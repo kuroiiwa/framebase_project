@@ -2,6 +2,7 @@ import { mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/prom
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 const usernamePattern = /^[a-zA-Z0-9_]{3,32}$/;
+const manifestExtensions = new Set(["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "mov", "mp4", "m4v", "avi", "mkv", "mpeg", "mpg", "webm"]);
 
 function emptyConfig() {
   return {
@@ -35,6 +36,26 @@ export function createIcloudManager({ projectRoot }) {
 
   function configPath(username) {
     return join(userDirectory(username), "config.json");
+  }
+
+  function manifestPath(username) {
+    return join(userDirectory(username), "manifest.json");
+  }
+
+  async function readScan(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(manifestPath(username), "utf8"));
+      const samples = Array.isArray(parsed.samples) ? parsed.samples.filter(item => item && typeof item.name === "string" && manifestExtensions.has(String(item.extension || "").toLowerCase())).slice(0, 25) : [];
+      return {
+        scannedAt: typeof parsed.scannedAt === "string" ? parsed.scannedAt : null,
+        sampleCount: samples.length,
+        samples,
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") return { scannedAt: null, sampleCount: 0, samples: [] };
+      throw error;
+    }
   }
 
   async function read(username) {
@@ -148,5 +169,28 @@ export function createIcloudManager({ projectRoot }) {
     return config;
   }
 
-  return { read, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck };
+  async function recordScan(username, result) {
+    validateUsername(username);
+    const scannedAt = new Date().toISOString();
+    const samples = Array.isArray(result.samples) ? result.samples.slice(0, 25).map(item => ({
+      name: String(item.name || ""),
+      extension: String(item.extension || ""),
+      mediaType: item.mediaType === "video" ? "video" : "photo",
+    })) : [];
+    const directory = userDirectory(username);
+    const destination = manifestPath(username);
+    const temporary = `${destination}.tmp`;
+    const task = writes.then(async () => {
+      await mkdir(directory, { recursive: true });
+      await writeFile(temporary, `${JSON.stringify({ version: 1, scannedAt, sampleCount: samples.length, samples }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, destination);
+    });
+    writes = task.catch(() => undefined);
+    await task;
+    const config = { ...await read(username), lastScanAt: scannedAt, updatedAt: scannedAt };
+    await save(username, config);
+    return { ...config, scan: { scannedAt, sampleCount: samples.length, samples } };
+  }
+
+  return { read, readScan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan };
 }

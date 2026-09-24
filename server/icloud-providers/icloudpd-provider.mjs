@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { mkdir, stat } from "node:fs/promises";
+import { basename, extname } from "node:path";
 import { spawn as spawnPty } from "node-pty";
 
 function runExecutable(executablePath, args, options = {}) {
@@ -36,12 +37,22 @@ function spawnInteractive(executablePath, args) {
 }
 
 const runningAuthStates = new Set(["starting", "waiting_password", "verifying", "waiting_mfa"]);
+const photoExtensions = new Set(["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
+const videoExtensions = new Set(["mov", "mp4", "m4v", "avi", "mkv", "mpeg", "mpg", "webm"]);
 
 function stripTerminalCodes(value) {
   let result = "";
   for (let index = 0; index < value.length; index += 1) {
     if (value.charCodeAt(index) !== 27) {
       result += value[index];
+      continue;
+    }
+    if (value[index + 1] === "]") {
+      index += 2;
+      while (index < value.length && value.charCodeAt(index) !== 7) {
+        if (value.charCodeAt(index) === 27 && value[index + 1] === "\\") { index += 1; break; }
+        index += 1;
+      }
       continue;
     }
     if (value[index + 1] !== "[") continue;
@@ -58,6 +69,61 @@ function publicAuthState(job) {
 
 export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive }) {
   const authJobs = new Map();
+  const sessionSecrets = new Map();
+
+  function runWithRuntimePassword(args, password, timeout = 120_000) {
+    return new Promise((resolve, reject) => {
+      let child;
+      try { child = spawnProcess(executablePath, args); }
+      catch (error) { reject(error); return; }
+      let output = "";
+      let settled = false;
+      let passwordSent = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill();
+        reject(Object.assign(new Error("timed out"), { stderr: output }));
+      }, timeout);
+      timer.unref?.();
+      const observe = chunk => {
+        output = stripTerminalCodes(`${output}${String(chunk)}`).slice(-64_000);
+        if (!passwordSent && /icloud password|password for/i.test(output)) {
+          passwordSent = true;
+          if (typeof child.write === "function") child.write(`${password}\r`);
+          else child.stdin.write(`${password}\n`);
+        }
+        if (/two-factor authentication|2fa|verification code|security code|enter the code/i.test(output) && !settled) {
+          settled = true;
+          clearTimeout(timer);
+          child.kill();
+          reject(Object.assign(new Error("two-factor authentication required"), { stderr: output }));
+        }
+      };
+      if (typeof child.onData === "function") child.onData(observe);
+      else {
+        child.stdout?.on("data", observe);
+        child.stderr?.on("data", observe);
+      }
+      const close = code => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (code === 0) resolve({ stdout: output, stderr: "" });
+        else reject(Object.assign(new Error(`icloudpd exited with code ${code}`), { stderr: output }));
+      };
+      if (typeof child.onExit === "function") child.onExit(event => close(event.exitCode));
+      else {
+        child.once("error", error => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        });
+        child.once("close", close);
+      }
+    });
+  }
   async function info() {
     try {
       if (!(await stat(executablePath)).isFile()) throw new Error("not-file");
@@ -93,9 +159,81 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
+  async function verifyRuntimeSession(jobKey, context) {
+    const password = sessionSecrets.get(jobKey);
+    if (!password) return verifyExistingSession(context);
+    const providerInfo = await info();
+    if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", providerInfo };
+    const args = [
+      "--log-level", "error",
+      "--no-progress-bar",
+      "--domain", context.domain,
+      "--password-provider", "console",
+      "--mfa-provider", "console",
+      "--auth-only",
+      "--cookie-directory", context.sessionDirectory,
+      "--directory", context.backupDirectory,
+      "--username", context.appleAccount,
+    ];
+    try {
+      await runWithRuntimePassword(args, password, 45_000);
+      return { status: "connected", message: "Apple iCloud 会话有效。", providerInfo };
+    } catch (error) {
+      return { ...safeMessage(error), providerInfo };
+    }
+  }
+
+  async function scanRecent({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, limit = 10 }) {
+    const providerInfo = await info();
+    if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", providerInfo };
+    const safeLimit = Math.max(1, Math.min(25, Number(limit) || 10));
+    const baseArgs = [
+      "--log-level", "error",
+      "--no-progress-bar",
+      "--domain", domain,
+      "--password-provider", "console",
+      "--mfa-provider", "console",
+      "--cookie-directory", sessionDirectory,
+      "--directory", backupDirectory,
+      "--username", appleAccount,
+    ];
+    const password = sessionSecrets.get(jobKey);
+    if (!password) return { status: "needs_auth", message: "为保护密码，FrameBase 重启后需要重新登录 Apple ID。", samples: [], requestedLimit: safeLimit, providerInfo };
+    try {
+      const cleanOutput = value => String(value || "").replace(/i?cloud password for [^:\r\n]+:/gi, "");
+      const parseSamples = value => cleanOutput(value).split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => {
+        const name = basename(line);
+        const extension = extname(name).slice(1).toLowerCase();
+        const mediaType = videoExtensions.has(extension) ? "video" : photoExtensions.has(extension) ? "photo" : null;
+        return { name, extension, mediaType };
+      }).filter(item => item.mediaType);
+      const scanLibrary = async library => {
+        const libraryArgs = library ? ["--library", library] : [];
+        const { stdout } = await runWithRuntimePassword([...baseArgs, ...libraryArgs, "--recent", String(safeLimit), "--only-print-filenames"], password);
+        return parseSamples(stdout);
+      };
+      let samples = await scanLibrary(null);
+      let librariesChecked = 1;
+      if (samples.length === 0) {
+        const { stdout } = await runWithRuntimePassword([...baseArgs, "--list-libraries"], password);
+        const libraries = [...new Set(cleanOutput(stdout).split(/\r?\n/).map(line => line.trim()).filter(Boolean))].slice(0, 8);
+        for (const library of libraries) {
+          samples = [...samples, ...await scanLibrary(library)];
+          librariesChecked += 1;
+          if (samples.length >= safeLimit) break;
+        }
+      }
+      samples = samples.slice(0, safeLimit);
+      return { status: "ready", message: `已只读检查 ${librariesChecked} 个图库，找到最近 ${samples.length} 个媒体项目。`, samples, requestedLimit: safeLimit, providerInfo };
+    } catch (error) {
+      return { ...safeMessage(error), samples: [], requestedLimit: safeLimit, providerInfo };
+    }
+  }
+
   async function startAuthentication(jobKey, { appleAccount, domain, sessionDirectory, backupDirectory }) {
     const existing = authJobs.get(jobKey);
     if (existing && runningAuthStates.has(existing.status)) return publicAuthState(existing);
+    sessionSecrets.delete(jobKey);
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。" };
     await mkdir(sessionDirectory, { recursive: true });
@@ -136,6 +274,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       job.status = "failed";
       job.message = "无法启动 icloudpd 登录进程。";
       job.output = "";
+      job.password = "";
+      sessionSecrets.delete(jobKey);
     };
     const close = code => {
       if (job.finished) return;
@@ -144,6 +284,9 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       if (job.status === "cancelled") return;
       job.status = code === 0 ? "connected" : "failed";
       job.message = code === 0 ? "Apple iCloud 登录成功。" : safeMessage({ stderr: job.output }).message;
+      if (code === 0 && job.password) sessionSecrets.set(jobKey, job.password);
+      else sessionSecrets.delete(jobKey);
+      job.password = "";
       job.output = "";
     };
     if (typeof child.onExit === "function") child.onExit(event => close(event.exitCode));
@@ -157,6 +300,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       job.status = "failed";
       job.message = "Apple 登录等待超时，请重新开始。";
       job.output = "";
+      job.password = "";
+      sessionSecrets.delete(jobKey);
       child.kill();
     }, 10 * 60 * 1000);
     job.timer.unref?.();
@@ -173,6 +318,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     if (type === "password") {
       if (job.status !== "waiting_password") throw Object.assign(new Error("当前登录步骤不需要密码。"), { status: 409 });
       if (typeof value !== "string" || value.length < 1 || value.length > 1024) throw Object.assign(new Error("请输入 Apple ID 密码。"), { status: 400 });
+      job.password = value;
     } else if (type === "mfa") {
       if (job.status !== "waiting_mfa") throw Object.assign(new Error("当前登录步骤不需要验证码。"), { status: 409 });
       if (!/^\d{6}$/.test(String(value || "").trim())) throw Object.assign(new Error("请输入六位 Apple 验证码。"), { status: 400 });
@@ -192,10 +338,12 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     job.finished = true;
     job.message = "登录已取消。";
     job.output = "";
+    job.password = "";
+    sessionSecrets.delete(jobKey);
     clearTimeout(job.timer);
     job.child.kill();
     return publicAuthState(job);
   }
 
-  return { id: "icloudpd", info, verifyExistingSession, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication };
+  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
 }

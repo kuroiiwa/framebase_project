@@ -58,6 +58,63 @@ test("icloudpd provider reports a missing authentication session without exposin
   }
 });
 
+test("icloudpd provider scans a bounded recent sample without download or delete flags", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-scan-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const scanCalls = [];
+  let authData;
+  let authExit;
+  let spawnCount = 0;
+  const writes = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async () => ({ stdout: "icloudpd 1.32.3\n", stderr: "" }),
+      spawnProcess: (_executable, args) => {
+        spawnCount += 1;
+        let dataCallback;
+        let exitCallback;
+        const child = {
+          onData: callback => { dataCallback = callback; if (spawnCount === 1) authData = callback; },
+          onExit: callback => { exitCallback = callback; if (spawnCount === 1) authExit = callback; },
+          write: value => { writes.push(value); },
+          kill: () => exitCallback?.({ exitCode: 1 }),
+        };
+        if (spawnCount > 1) {
+          scanCalls.push(args);
+          queueMicrotask(() => {
+            dataCallback(`${String.fromCharCode(27)}]0;icloudpd.exe${String.fromCharCode(7)}iCloud Password for alice@example.com:`);
+            if (spawnCount === 3) dataCallback("SharedSync\r\n");
+            if (spawnCount === 4) dataCallback("2026/09/IMG_0001.HEIC\r\nnot-a-media-entry\r\n2026/09/IMG_0002.MOV\r\n");
+            exitCallback({ exitCode: 0 });
+          });
+        }
+        return child;
+      },
+    });
+    const context = { appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") };
+    await provider.startAuthentication("alice", context);
+    authData("iCloud Password for alice@example.com:");
+    provider.submitAuthenticationInput("alice", "password", "runtime-secret");
+    authExit({ exitCode: 0 });
+    const result = await provider.scanRecent({ ...context, jobKey: "alice", limit: 10 });
+    assert.equal(result.status, "ready");
+    assert.deepEqual(result.samples.map(item => item.mediaType), ["photo", "video"]);
+    assert.deepEqual(writes, ["runtime-secret\r", "runtime-secret\r", "runtime-secret\r", "runtime-secret\r"]);
+    assert.ok(scanCalls[0].includes("--only-print-filenames"));
+    assert.ok(scanCalls[1].includes("--list-libraries"));
+    assert.equal(scanCalls[2][scanCalls[2].indexOf("--library") + 1], "SharedSync");
+    assert.equal(scanCalls[2][scanCalls[2].indexOf("--recent") + 1], "10");
+    assert.equal(scanCalls.flat().includes("--dry-run"), false);
+    assert.equal(scanCalls.flat().includes("--auto-delete"), false);
+    assert.equal(scanCalls.flat().includes("--delete-after-download"), false);
+    assert.equal(scanCalls.flat().includes("--keep-icloud-recent-days"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("icloudpd provider passes password and MFA only through the temporary pseudo-terminal", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-login-"));
   const executablePath = join(root, "icloudpd.exe");
