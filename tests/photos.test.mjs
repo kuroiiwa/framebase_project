@@ -14,6 +14,10 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(photos, /heic/);
   assert.match(photos, /图片来源、索引和标记与原视频库彻底隔离/);
   assert.match(photos, /iCloud 照片与视频备份目录/);
+  assert.match(photos, /loadSource\(source, next\)/);
+  assert.match(photos, /<a href="\/">视频库<\/a>/);
+  assert.match(photos, /<a href="\/icloud">iCloud 备份<\/a>/);
+  assert.match(photos, /<a href="\/lan">局域网<\/a>/);
   assert.doesNotMatch(photos, /removeEntry\(/);
   assert.match(videos, /href="\/photos"/);
   assert.match(videos, /VIDEO_EXTENSIONS/);

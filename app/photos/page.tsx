@@ -1,8 +1,7 @@
 "use client";
 
-/* eslint-disable @next/next/no-img-element -- previews use local Blob URLs from user-approved folders. */
+/* eslint-disable @next/next/no-img-element, @next/next/no-html-link-for-pages -- previews use local Blob URLs; hard navigation avoids losing File System Access state in the compatibility router. */
 
-import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
@@ -228,7 +227,7 @@ function PhotoLibrary({ username }: { username: string }) {
     localStorage.setItem(marksKey(sourceId), JSON.stringify(marks));
   }, []);
 
-  const loadSource = useCallback(async (source: SourceFolder) => {
+  const loadSource = useCallback(async (source: SourceFolder, knownSources?: SourceFolder[]) => {
     setLoading(true); setProgress(0); setError(""); setNotice("");
     try {
       const current = await source.handle.queryPermission?.({ mode: "read" });
@@ -236,7 +235,10 @@ function PhotoLibrary({ username }: { username: string }) {
       if (permission !== "granted") throw new Error(`需要“${source.name}”的读取权限。`);
       const found = await scanDirectory(source, setProgress);
       const updatedSource = { ...source, lastScan: Date.now(), photoCount: found.length, totalSize: found.reduce((sum, item) => sum + item.size, 0) };
-      const nextSources = sources.map(item => item.id === source.id ? updatedSource : item);
+      const baseSources = knownSources || sources;
+      const nextSources = baseSources.some(item => item.id === source.id)
+        ? baseSources.map(item => item.id === source.id ? updatedSource : item)
+        : [...baseSources, updatedSource];
       setSources(nextSources);
       setPhotos(currentPhotos => [...currentPhotos.filter(item => item.sourceId !== source.id), ...found]);
       await Promise.all([dbSet(SOURCES_KEY, nextSources), dbSet(`photo-library:${source.id}`, found)]);
@@ -256,6 +258,8 @@ function PhotoLibrary({ username }: { username: string }) {
         const next = [...sources, source];
         setSources(next);
         await dbSet(SOURCES_KEY, next);
+        await loadSource(source, next);
+        return;
       }
       await loadSource(source);
     } catch (reason) { if ((reason as DOMException)?.name !== "AbortError") setError("未能打开文件夹，请确认已授予读取权限。"); }
@@ -305,9 +309,9 @@ function PhotoLibrary({ username }: { username: string }) {
 
   return <main className={styles.page}>
     <header className={styles.topbar}>
-      <Link href="/"><span>F</span>Framebase</Link>
+      <a href="/"><span>F</span>Framebase</a>
       <label><span>⌕</span><input value={query} onChange={event => { setQuery(event.target.value); setPage(1); }} placeholder="搜索图片名称或路径…" aria-label="搜索图片" /></label>
-      <nav><Link href="/">视频库</Link><Link href="/icloud">iCloud 备份</Link><b>{username}</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></nav>
+      <nav><a href="/">视频库</a><a href="/icloud">iCloud 备份</a><a href="/lan">局域网</a><b>{username}</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></nav>
     </header>
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {notice && <div className={styles.notice} role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
@@ -323,7 +327,7 @@ function PhotoLibrary({ username }: { username: string }) {
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
     {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""}`}>{visible.map(item => <article className={styles.card} key={item.id}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} /><div><h2 title={item.path}>{item.name}</h2><p><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)}</p><small>{formatDate(item.modified)}</small><nav><button className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥ 已收藏" : "♡ 收藏"}</button><button className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓ 待整理" : "待整理"}</button></nav></div></article>)}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
-    <footer><span>图片库只读取用户明确授权的本地文件夹</span><Link href="/">返回视频库 →</Link></footer>
+    <footer><span>图片库只读取用户明确授权的本地文件夹</span><a href="/">返回视频库 →</a></footer>
     {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} />}
   </main>;
 }
