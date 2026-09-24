@@ -32,6 +32,7 @@ type ReleasePlan = { id: string | null; status: "ready" | "blocked" | "confirmed
 type FullBackupState = {
   status: "idle" | "planning" | "downloading" | "verifying" | "paused" | "cancelled" | "completed" | "failed";
   message: string; startedAt: string | null; updatedAt: string | null; completedAt: string | null; phase: string; currentLibrary: string | null;
+  currentRange: string | null; rangeIndex: number; rangeCount: number; completedRanges: string[];
   planned: number; downloaded: number; verified: number; skipped: number; failed: number; photoCount: number; videoCount: number; verifiedBytes: number; manifestFileCount: number;
   ranges: BackupRange[];
 };
@@ -295,10 +296,9 @@ function IcloudCenter({ username }: { username: string }) {
   const connectionConfigured = Boolean(config?.appleAccount);
   const timelineBuckets = config?.timeline?.[timelineGranularity] || [];
   return <main className={styles.page}>
-    <div className="route-theme"><ThemeSelector /></div>
     <header className={styles.topbar}>
       <Link href="/"><span>F</span>Framebase</Link>
-      <div><button className={styles.backLink} onClick={() => window.location.assign("/")}>← 返回视频库</button><b>{username} · iCloud 备份中心</b><button onClick={() => void signOut()}>退出</button></div>
+      <div><button className={styles.backLink} onClick={() => window.location.assign("/")}>← 返回视频库</button><b>{username} · iCloud 备份中心</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></div>
     </header>
 
     <section className={styles.hero}>
@@ -367,6 +367,7 @@ function IcloudCenter({ username }: { username: string }) {
         <div className={styles.safetyBanner}><strong>安全边界</strong><span>此任务不带任何云端删除参数。暂停或取消只会停止本机任务，已下载文件会保留。</span></div>
         <div className={styles.fullStatus}>
           <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? "任务运行中" : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>
+          {config?.fullBackup?.rangeCount ? <div className={styles.rangeStatus}><strong>时间范围 {config.fullBackup.rangeIndex || 1}/{config.fullBackup.rangeCount}</strong><span>{config.fullBackup.currentRange || "正在准备"} · 已完成 {config.fullBackup.completedRanges.length} 个范围</span></div> : null}
           {config?.fullBackup && <dl><div><dt>计划</dt><dd>{config.fullBackup.planned}</dd></div><div><dt>已验证</dt><dd>{config.fullBackup.verified}</dd></div><div><dt>增量跳过</dt><dd>{config.fullBackup.skipped}</dd></div><div><dt>失败</dt><dd>{config.fullBackup.failed}</dd></div><div><dt>图片</dt><dd>{config.fullBackup.photoCount}</dd></div><div><dt>视频</dt><dd>{config.fullBackup.videoCount}</dd></div></dl>}
           {config?.fullBackup?.planned ? <div className={styles.progress} aria-label="完整备份进度"><i style={{ width: `${Math.min(100, Math.round(config.fullBackup.verified / config.fullBackup.planned * 100))}%` }} /></div> : null}
           {config?.fullBackup?.verifiedBytes ? <small>已通过完整性校验：{formatBytes(config.fullBackup.verifiedBytes)} · 清单共 {config.fullManifest?.fileCount || config.fullBackup.verified} 个文件</small> : null}

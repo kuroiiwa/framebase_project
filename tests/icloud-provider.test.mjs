@@ -269,8 +269,56 @@ test("full backup re-verifies existing local media when iCloud has nothing new t
     });
     assert.equal(result.status, "completed");
     assert.equal(result.files.length, 1);
+    assert.equal(result.planned, 1);
     assert.equal(result.skipped, 1);
     assert.equal(result.files[0].sha256, sha256);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("selected backup ranges are planned, downloaded, and verified one at a time", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-ranges-in-order-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const firstPath = join(backupDirectory, "2024", "01", "first.jpg");
+  const secondPath = join(backupDirectory, "2025", "01", "second.jpg");
+  const events = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "", stderr: "" };
+        const start = args[args.indexOf("--skip-created-before") + 1];
+        const year = start?.slice(0, 4);
+        if (args.includes("--only-print-filenames")) {
+          events.push(`plan-${year}`);
+          return { stdout: `${year === "2024" ? firstPath : secondPath}\n`, stderr: "" };
+        }
+        events.push(`download-${year}`);
+        const destination = year === "2024" ? firstPath : secondPath;
+        await mkdir(join(backupDirectory, year, "01"), { recursive: true });
+        await writeFile(destination, year);
+        return { stdout: "", stderr: "" };
+      },
+    });
+    const progress = [];
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
+      ranges: [
+        { key: "2024", label: "2024 年", start: "2024-01-01T00:00:00", end: "2024-12-31T23:59:59" },
+        { key: "2025", label: "2025 年", start: "2025-01-01T00:00:00", end: "2025-12-31T23:59:59" },
+      ],
+      onProgress: update => progress.push(update),
+    });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(events, ["plan-2024", "download-2024", "plan-2025", "download-2025"]);
+    assert.deepEqual(result.completedRanges, ["2024", "2025"]);
+    assert.equal(result.files.length, 2);
+    assert.ok(progress.some(item => item.currentRange === "2024 年" && item.rangeIndex === 1 && item.phase === "verifying"));
+    assert.ok(progress.some(item => item.currentRange === "2025 年" && item.rangeIndex === 2 && item.phase === "planning"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

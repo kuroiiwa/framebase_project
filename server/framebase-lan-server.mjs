@@ -493,8 +493,8 @@ async function handleIcloud(request, response, url) {
     const startedAt = url.pathname.endsWith("/resume") && previousState.startedAt ? previousState.startedAt : new Date().toISOString();
     const initial = await icloud.writeFullBackup(current.username, {
       status: "planning", phase: "planning", message: previousManifest.files.length ? "正在检查增量变化并准备继续…" : "正在读取完整 iCloud 图库清单…",
-      startedAt, completedAt: null, currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0,
-      photoCount: 0, videoCount: 0, verifiedBytes: 0,
+      startedAt, completedAt: null, currentLibrary: null, currentRange: null, rangeIndex: 0, rangeCount: ranges.length || 1,
+      completedRanges: [], planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0,
       ranges,
     });
     void (async () => {
@@ -511,7 +511,8 @@ async function handleIcloud(request, response, url) {
         const completed = result.status === "completed";
         await icloud.writeFullBackup(current.username, {
           status: completed ? "completed" : "failed", phase: completed ? "completed" : "failed", message: result.message,
-          completedAt: completed ? new Date().toISOString() : null, currentLibrary: null,
+          completedAt: completed ? new Date().toISOString() : null, currentLibrary: null, currentRange: null,
+          rangeIndex: result.completedRanges?.length || 0, rangeCount: ranges.length || 1, completedRanges: result.completedRanges || [],
           planned: result.planned || 0, downloaded: result.planned || 0, verified: result.files?.length || 0,
           skipped: result.skipped || 0, failed: result.failed || 0, photoCount: result.photoCount || 0,
           videoCount: result.videoCount || 0, verifiedBytes: result.verifiedBytes || 0, manifestFileCount: savedManifest.files.length,

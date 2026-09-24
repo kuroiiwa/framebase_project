@@ -112,6 +112,10 @@ export function createIcloudManager({ projectRoot }) {
         completedAt: typeof parsed.completedAt === "string" ? parsed.completedAt : null,
         phase: typeof parsed.phase === "string" ? parsed.phase : "idle",
         currentLibrary: typeof parsed.currentLibrary === "string" ? parsed.currentLibrary : null,
+        currentRange: typeof parsed.currentRange === "string" ? parsed.currentRange : null,
+        rangeIndex: Math.max(0, Number(parsed.rangeIndex) || 0),
+        rangeCount: Math.max(0, Number(parsed.rangeCount) || 0),
+        completedRanges: Array.isArray(parsed.completedRanges) ? parsed.completedRanges.filter(item => typeof item === "string").slice(0, 60) : [],
         planned: Math.max(0, Number(parsed.planned) || 0),
         downloaded: Math.max(0, Number(parsed.downloaded) || 0),
         verified: Math.max(0, Number(parsed.verified) || 0),
@@ -124,7 +128,7 @@ export function createIcloudManager({ projectRoot }) {
         ranges: Array.isArray(parsed.ranges) ? parsed.ranges.filter(item => item && typeof item.key === "string" && typeof item.start === "string" && typeof item.end === "string").slice(0, 60) : [],
       };
     } catch (error) {
-      if (error.code === "ENOENT") return { status: "idle", message: "尚未开始完整备份。", startedAt: null, updatedAt: null, completedAt: null, phase: "idle", currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, manifestFileCount: 0, ranges: [] };
+      if (error.code === "ENOENT") return { status: "idle", message: "尚未开始完整备份。", startedAt: null, updatedAt: null, completedAt: null, phase: "idle", currentLibrary: null, currentRange: null, rangeIndex: 0, rangeCount: 0, completedRanges: [], planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, manifestFileCount: 0, ranges: [] };
       throw error;
     }
   }

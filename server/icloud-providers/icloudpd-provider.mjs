@@ -373,7 +373,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     const rangeArgs = range => range.start ? ["--skip-created-before", range.start, "--skip-created-after", range.end] : [];
     const listLocalMedia = async (directory, plannedByPath) => {
       const files = [];
-      for (const entry of await readdir(directory, { withFileTypes: true })) {
+      let entries;
+      try { entries = await readdir(directory, { withFileTypes: true }); }
+      catch (error) { if (error?.code === "ENOENT") return files; throw error; }
+      for (const entry of entries) {
         if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
         const absolutePath = join(directory, entry.name);
         if (entry.isDirectory()) files.push(...await listLocalMedia(absolutePath, plannedByPath));
@@ -387,68 +390,102 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       }
       return files;
     };
+    const verificationDirectories = range => {
+      if (!range.start) return [backupDirectory];
+      const start = new Date(`${range.start}Z`);
+      const end = new Date(`${range.end}Z`);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return [];
+      const directories = [];
+      const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1));
+      const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1));
+      while (cursor <= last && directories.length < 720) {
+        directories.push(join(backupDirectory, String(cursor.getUTCFullYear()), String(cursor.getUTCMonth() + 1).padStart(2, "0")));
+        cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+      }
+      return directories;
+    };
     try {
       await mkdir(backupDirectory, { recursive: true });
-      await onProgress({ status: "planning", phase: "planning", message: "正在读取 iCloud 图库清单…" });
+      await onProgress({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [], message: "正在读取 iCloud 图库清单…" });
       const libraryResult = await run([...baseArgs, "--list-libraries"], 180_000);
       const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
       const libraries = [null, ...namedLibraries];
       const planByPath = new Map();
-      const activeOperations = [];
-      for (const library of libraries) {
-        for (const range of requestedRanges) {
+      const filesByPath = new Map();
+      let skipped = 0;
+      let failed = 0;
+      let verifiedBytes = 0;
+      const completedRanges = [];
+      for (let rangeOffset = 0; rangeOffset < requestedRanges.length; rangeOffset += 1) {
+        const range = requestedRanges[rangeOffset];
+        const rangeIndex = rangeOffset + 1;
+        const currentRange = range.label || range.key;
+        const rangePlan = new Map();
+        const activeOperations = [];
+        await onProgress({ status: "planning", phase: "planning", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在规划 ${rangeIndex}/${requestedRanges.length}：${currentRange}…` });
+        for (const library of libraries) {
           if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
           const libraryArgs = library ? ["--library", library] : [];
           const result = await run([...mediaArgs, ...libraryArgs, ...rangeArgs(range), "--only-print-filenames"], 30 * 60_000);
           const items = parsePaths(result.stdout, library);
           if (items.length > 0) activeOperations.push({ library, range });
-          for (const item of items) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
-          await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", planned: planByPath.size, message: `已规划 ${planByPath.size} 个媒体文件（${range.label || range.key}）。` });
+          for (const item of items) {
+            if (!rangePlan.has(item.relativePath)) rangePlan.set(item.relativePath, item);
+            if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
+          }
+          await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `${currentRange} 已规划 ${rangePlan.size} 个媒体文件。` });
         }
-      }
-      const plan = [...planByPath.values()];
-      let completedLibraries = 0;
-      for (const operation of activeOperations) {
-        const { library, range } = operation;
-        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
-        const libraryArgs = library ? ["--library", library] : [];
-        const downloadArgs = [...mediaArgs, ...libraryArgs, ...rangeArgs(range)];
-        if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
-        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, message: `正在增量备份 ${range.label || range.key} · ${library ? `图库“${library}”` : "主图库"}…` });
-        await run(downloadArgs, 24 * 60 * 60_000, 8 * 1024 * 1024);
-        completedLibraries += 1;
-        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, downloaded: Math.round(plan.length * completedLibraries / activeOperations.length), message: "当前时间范围下载阶段已完成。" });
-      }
-      const verificationPlan = await listLocalMedia(backupDirectory, planByPath);
-      if (verificationPlan.length === 0) return { status: "empty", message: "备份目录和 iCloud 下载计划中都没有找到图片或视频。", files: [], planned: 0, providerInfo };
-      const files = [];
-      let skipped = 0;
-      let failed = 0;
-      let verifiedBytes = 0;
-      for (let index = 0; index < verificationPlan.length; index += 1) {
-        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
-        const item = verificationPlan[index];
-        try {
-          const fileInfo = await stat(item.absolutePath);
-          if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
-          const sha256 = await sha256File(item.absolutePath);
-          const previous = previousByPath.get(item.relativePath);
-          if (previous?.size === fileInfo.size && previous?.sha256 === sha256) skipped += 1;
-          verifiedBytes += fileInfo.size;
-          files.push({
-            name: basename(item.absolutePath), relativePath: item.relativePath, extension: item.extension,
-            mediaType: videoExtensions.has(item.extension) ? "video" : "photo", size: fileInfo.size,
-            sha256, library: item.library, verifiedAt: new Date().toISOString(),
-          });
-        } catch { failed += 1; }
-        if (index % 10 === 0 || index === plan.length - 1) {
-          await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, planned: verificationPlan.length, downloaded: verificationPlan.length, verified: files.length, skipped, failed, verifiedBytes, message: `正在校验本地文件 ${index + 1}/${verificationPlan.length}…` });
+        let completedLibraries = 0;
+        for (const operation of activeOperations) {
+          const { library } = operation;
+          if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+          const libraryArgs = library ? ["--library", library] : [];
+          const downloadArgs = [...mediaArgs, ...libraryArgs, ...rangeArgs(range)];
+          if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
+          await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在备份 ${rangeIndex}/${requestedRanges.length}：${currentRange} · ${library ? `图库“${library}”` : "主图库"}…` });
+          await run(downloadArgs, 24 * 60 * 60_000, 8 * 1024 * 1024);
+          completedLibraries += 1;
+          await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `${currentRange} 下载进度 ${completedLibraries}/${activeOperations.length} 个图库。` });
         }
+        const rangeVerificationByPath = new Map();
+        for (const directory of verificationDirectories(range)) {
+          for (const item of await listLocalMedia(directory, rangePlan)) rangeVerificationByPath.set(item.relativePath, item);
+        }
+        for (const item of rangeVerificationByPath.values()) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
+        const verificationPlan = [...rangeVerificationByPath.values()];
+        for (let index = 0; index < verificationPlan.length; index += 1) {
+          if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+          const item = verificationPlan[index];
+          try {
+            const fileInfo = await stat(item.absolutePath);
+            if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
+            const sha256 = await sha256File(item.absolutePath);
+            const previous = previousByPath.get(item.relativePath);
+            if (previous?.size === fileInfo.size && previous?.sha256 === sha256) skipped += 1;
+            const existing = filesByPath.get(item.relativePath);
+            if (existing) verifiedBytes -= existing.size;
+            const verifiedFile = {
+              name: basename(item.absolutePath), relativePath: item.relativePath, extension: item.extension,
+              mediaType: videoExtensions.has(item.extension) ? "video" : "photo", size: fileInfo.size,
+              sha256, library: item.library, verifiedAt: new Date().toISOString(),
+            };
+            filesByPath.set(item.relativePath, verifiedFile);
+            verifiedBytes += fileInfo.size;
+          } catch { failed += 1; }
+          if (index % 10 === 0 || index === verificationPlan.length - 1) {
+            await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${index + 1}/${verificationPlan.length}）…` });
+          }
+        }
+        completedRanges.push(range.key);
+        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` });
       }
+      const files = [...filesByPath.values()];
+      const verificationTotal = files.length + failed;
+      if (verificationTotal === 0) return { status: "empty", message: "所选时间范围内没有找到可备份的图片或视频。", files: [], planned: planByPath.size, completedRanges, providerInfo };
       const photoCount = files.filter(item => item.mediaType === "photo").length;
       const videoCount = files.length - photoCount;
-      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${verificationPlan.length} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: verificationPlan.length, skipped, failed, photoCount, videoCount, verifiedBytes, providerInfo };
-      return { status: "completed", message: `完整增量备份已验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: verificationPlan.length, skipped, failed: 0, photoCount, videoCount, verifiedBytes, providerInfo };
+      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${verificationTotal} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: planByPath.size, skipped, failed, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
+      return { status: "completed", message: `已依次完成 ${completedRanges.length} 个时间范围，验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: planByPath.size, skipped, failed: 0, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) return { status: "aborted", message: "备份任务已安全停止，可稍后从本地已有文件继续。", files: [], providerInfo };
       return { ...safeMessage(error), files: [], providerInfo };
