@@ -244,6 +244,35 @@ test("icloudpd provider incrementally backs up and hashes photos, videos, Live P
   }
 });
 
+test("full backup re-verifies existing local media when iCloud has nothing new to download", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-full-existing-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const existingPath = join(backupDirectory, "2025", "IMG_0001.JPG");
+  try {
+    await writeFile(executablePath, "test");
+    await mkdir(join(backupDirectory, "2025"), { recursive: true });
+    await writeFile(existingPath, "existing-photo");
+    const sha256 = createHash("sha256").update("existing-photo").digest("hex");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => args.includes("--version")
+        ? { stdout: "version:1.32.3\n", stderr: "" }
+        : { stdout: "", stderr: "" },
+    });
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
+      previousFiles: [{ relativePath: "2025/IMG_0001.JPG", size: 14, sha256 }],
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.files.length, 1);
+    assert.equal(result.skipped, 1);
+    assert.equal(result.files[0].sha256, sha256);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("icloudpd provider passes password and MFA only through the temporary pseudo-terminal", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-login-"));
   const executablePath = join(root, "icloudpd.exe");

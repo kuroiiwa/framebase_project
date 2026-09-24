@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, stat } from "node:fs/promises";
-import { basename, extname, isAbsolute, relative, resolve } from "node:path";
+import { mkdir, readdir, stat } from "node:fs/promises";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn as spawnPty } from "node-pty";
 
 function runExecutable(executablePath, args, options = {}) {
@@ -368,6 +368,22 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       return { absolutePath, relativePath: pathWithinBackup.split("\\").join("/"), extension, library };
     }).filter(Boolean);
     const previousByPath = new Map(previousFiles.map(item => [item.relativePath, item]));
+    const listLocalMedia = async (directory, plannedByPath) => {
+      const files = [];
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+        const absolutePath = join(directory, entry.name);
+        if (entry.isDirectory()) files.push(...await listLocalMedia(absolutePath, plannedByPath));
+        else if (entry.isFile()) {
+          const extension = extname(entry.name).slice(1).toLowerCase();
+          if (photoExtensions.has(extension) || videoExtensions.has(extension)) {
+            const relativePath = relative(resolve(backupDirectory), absolutePath).split("\\").join("/");
+            files.push({ absolutePath, relativePath, extension, library: plannedByPath.get(relativePath)?.library || null });
+          }
+        }
+      }
+      return files;
+    };
     try {
       await mkdir(backupDirectory, { recursive: true });
       await onProgress({ status: "planning", phase: "planning", message: "正在读取 iCloud 图库清单…" });
@@ -386,7 +402,6 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", planned: planByPath.size, message: `已规划 ${planByPath.size} 个媒体文件。` });
       }
       const plan = [...planByPath.values()];
-      if (plan.length === 0) return { status: "empty", message: "iCloud 图库中没有找到可备份的图片或视频。", files: [], planned: 0, providerInfo };
       let completedLibraries = 0;
       for (const library of activeLibraries) {
         if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
@@ -398,13 +413,15 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         completedLibraries += 1;
         await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, downloaded: Math.round(plan.length * completedLibraries / activeLibraries.length), message: "当前图库下载阶段已完成。" });
       }
+      const verificationPlan = await listLocalMedia(backupDirectory, planByPath);
+      if (verificationPlan.length === 0) return { status: "empty", message: "备份目录和 iCloud 下载计划中都没有找到图片或视频。", files: [], planned: 0, providerInfo };
       const files = [];
       let skipped = 0;
       let failed = 0;
       let verifiedBytes = 0;
-      for (let index = 0; index < plan.length; index += 1) {
+      for (let index = 0; index < verificationPlan.length; index += 1) {
         if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
-        const item = plan[index];
+        const item = verificationPlan[index];
         try {
           const fileInfo = await stat(item.absolutePath);
           if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
@@ -419,13 +436,13 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           });
         } catch { failed += 1; }
         if (index % 10 === 0 || index === plan.length - 1) {
-          await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, planned: plan.length, downloaded: plan.length, verified: files.length, skipped, failed, verifiedBytes, message: `正在校验本地文件 ${index + 1}/${plan.length}…` });
+          await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, planned: verificationPlan.length, downloaded: verificationPlan.length, verified: files.length, skipped, failed, verifiedBytes, message: `正在校验本地文件 ${index + 1}/${verificationPlan.length}…` });
         }
       }
       const photoCount = files.filter(item => item.mediaType === "photo").length;
       const videoCount = files.length - photoCount;
-      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${plan.length} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: plan.length, skipped, failed, photoCount, videoCount, verifiedBytes, providerInfo };
-      return { status: "completed", message: `完整增量备份已验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: plan.length, skipped, failed: 0, photoCount, videoCount, verifiedBytes, providerInfo };
+      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${verificationPlan.length} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: verificationPlan.length, skipped, failed, photoCount, videoCount, verifiedBytes, providerInfo };
+      return { status: "completed", message: `完整增量备份已验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: verificationPlan.length, skipped, failed: 0, photoCount, videoCount, verifiedBytes, providerInfo };
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) return { status: "aborted", message: "备份任务已安全停止，可稍后从本地已有文件继续。", files: [], providerInfo };
       return { ...safeMessage(error), files: [], providerInfo };
