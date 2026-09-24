@@ -7,6 +7,7 @@ Framebase 是一个在自己电脑上运行的视频整理工具。它把多个�
 - **电脑端视频库**：Chrome 或 Edge 获得用户选择的文件夹权限后，在浏览器中递归扫描视频。文件夹句柄、视频清单和预览缓存保存在浏览器的 IndexedDB；标签、收藏等整理记录保存在浏览器本地存储。视频通过本地文件句柄读取和播放，不上传到外部服务。
 - **局域网访问**：电脑上的 Node.js 服务只读取在“局域网”页面明确添加的共享目录，向已配对的手机提供视频清单、缩略图和支持分段请求的视频流。手机需要与电脑处于同一局域网，且电脑上的服务必须保持运行。手机端不能删除视频或修改共享目录。
 - **远程关机**：这项功能默认关闭。电脑端开启后，每台手机还需单独申请并获得授权。手机确认关机后，本地服务等待 10 秒，再向 Windows 提交非强制关机指令；倒计时期间可以在手机或电脑端取消。关机后服务停止，因此本项目不提供远程开机。
+- **iCloud 备份中心**：按 Framebase 用户隔离 Apple 会话、备份目录和清单，支持照片与视频的只读扫描及一次性少量安全备份。主媒体库目前仍只管理视频；iCloud 流程不会自动删除云端文件。
 
 局域网配置按账户保存在项目目录下的 `.framebase-lan-用户名.json`，旧共享配置在 gabri 首次使用时迁入；设备关机授权也按账户保存，gabri 沿用原有的 `.framebase-power.json`。浏览器缓存和电脑上的配置互不等同；清除浏览器数据可能丢失该浏览器中的整理记录。
 
@@ -19,6 +20,7 @@ Framebase 是一个在自己电脑上运行的视频整理工具。它把多个�
 | [Vite](https://vite.dev/) | 前端构建工具 |
 | [TypeScript](https://www.typescriptlang.org/) | 页面代码的类型检查 |
 | [Tailwind CSS](https://tailwindcss.com/) | 样式构建 |
+| [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader) | 从 Apple iCloud Photos 只读扫描并备份原始媒体 |
 
 局域网服务使用 Node.js 内置模块实现目录读取、设备配对和视频流传输。电脑端文件访问使用浏览器的 File System Access API，整理数据使用 IndexedDB 和 `localStorage`。项目目前不依赖外部数据库来保存视频库。
 
@@ -35,6 +37,8 @@ npm run lan
 ```
 
 打开 `http://localhost:3000`。`npm run lan` 会同时启动页面服务和局域网服务；关闭启动它的终端，服务也会停止。修改页面代码后，重新运行 `npm run build` 并重启服务。
+
+`tools/` 不受 Git 跟踪。首次在新工作副本启用 iCloud 功能前，请阅读 [icloudpd 兼容说明](docs/icloudpd-compatibility.md)，重建包含 Apple Photos 主区域发现修复的 Windows 兼容程序。
 
 首次打开时先为 `admin` 设置密码。普通用户只需用户名即可自行注册和进入；登录后只能看到自己在当前浏览器添加的视频库。管理员页面汇总每位用户的源文件夹名称、视频数量和总大小。原有未分账户的电脑端缓存会在 `gabri` 首次进入时复制到其专属视频库，原始浏览器缓存保留。账户和汇总信息保存在本机 `.framebase-accounts.json`，请妥善保管这个文件及管理员密码。
 
