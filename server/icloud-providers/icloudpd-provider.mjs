@@ -337,7 +337,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], ranges = [], signal, onProgress = () => undefined }) {
+  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], ranges = [], initialCompletedRanges = [], signal, onProgress = () => undefined, onRangeComplete = () => undefined }) {
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", files: [], providerInfo };
     const password = sessionSecrets.get(jobKey);
@@ -407,7 +407,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     };
     try {
       await mkdir(backupDirectory, { recursive: true });
-      await onProgress({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [], message: "正在读取 iCloud 图库清单…" });
+      const completedRanges = [...new Set((Array.isArray(initialCompletedRanges) ? initialCompletedRanges : []).filter(key => requestedRanges.some(range => range.key === key)))];
+      await onProgress({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], message: "正在读取 iCloud 图库清单…" });
       const libraryResult = await run([...baseArgs, "--list-libraries"], 180_000);
       const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
       const libraries = [null, ...namedLibraries];
@@ -416,7 +417,6 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       let skipped = 0;
       let failed = 0;
       let verifiedBytes = 0;
-      const completedRanges = [];
       for (let rangeOffset = 0; rangeOffset < requestedRanges.length; rangeOffset += 1) {
         const range = requestedRanges[rangeOffset];
         const rangeIndex = rangeOffset + 1;
@@ -454,6 +454,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         }
         for (const item of rangeVerificationByPath.values()) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
         const verificationPlan = [...rangeVerificationByPath.values()];
+        const failedBeforeRange = failed;
         for (let batchStart = 0; batchStart < verificationPlan.length; batchStart += safeVerificationConcurrency) {
           if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
           const batch = verificationPlan.slice(batchStart, batchStart + safeVerificationConcurrency);
@@ -488,8 +489,16 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在使用 ${safeVerificationConcurrency} 路并行校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${processed}/${verificationPlan.length}）…` });
           }
         }
-        completedRanges.push(range.key);
-        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` });
+        const rangeVerified = verificationPlan.length > 0 && failed === failedBeforeRange;
+        if (rangeVerified) {
+          if (!completedRanges.includes(range.key)) completedRanges.push(range.key);
+          const rangeFiles = verificationPlan.map(item => filesByPath.get(item.relativePath)).filter(Boolean);
+          await onRangeComplete({ range, files: rangeFiles, completedRanges: [...completedRanges] });
+        } else {
+          const completedIndex = completedRanges.indexOf(range.key);
+          if (completedIndex >= 0) completedRanges.splice(completedIndex, 1);
+        }
+        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: rangeVerified ? `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` : `${currentRange} 有文件未通过完整性校验，保留为未完成状态。` });
       }
       const files = [...filesByPath.values()];
       const verificationTotal = files.length + failed;

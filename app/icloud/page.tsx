@@ -303,10 +303,10 @@ function IcloudCenter({ username }: { username: string }) {
     const bucketRange = periodRange(bucket.key);
     const fullBackup = config?.fullBackup;
     const activeRange = fullBackup?.ranges?.length ? fullBackup.ranges[Math.max(0, (fullBackup.rangeIndex || 1) - 1)] : null;
-    if (fullBackupActive && (!fullBackup?.ranges?.length || (activeRange && rangesOverlap(activeRange, bucketRange)))) return { key: "backupRunning", label: "备份中", detail: "正在处理" };
     const completedDefinitions = (fullBackup?.ranges || []).filter(range => fullBackup?.completedRanges.includes(range.key));
     const coverage = coverageByKey.get(bucket.key);
     if (completedDefinitions.some(range => rangeContains(range, bucketRange))) return { key: "backupComplete", label: "已备份", detail: coverage ? `本地已验证 ${coverage.verifiedCount} 个文件` : "本轮已完成校验" };
+    if (fullBackupActive && (!fullBackup?.ranges?.length || (activeRange && rangesOverlap(activeRange, bucketRange)))) return { key: "backupRunning", label: "备份中", detail: "正在处理" };
     if (coverage && coverage.verifiedCount >= bucket.itemCount) return { key: "backupComplete", label: "已备份", detail: `本地已验证 ${coverage.verifiedCount} 个文件` };
     if (coverage?.verifiedCount) return { key: "backupPartial", label: "部分备份", detail: `本地已验证 ${coverage.verifiedCount} 个文件` };
     return { key: "backupMissing", label: "未备份", detail: "没有已验证的本地文件" };

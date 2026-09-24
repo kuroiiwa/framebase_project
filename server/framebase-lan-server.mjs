@@ -485,7 +485,8 @@ async function handleIcloud(request, response, url) {
     const previousState = await icloud.readFullBackup(current.username);
     const body = await readJsonBody(request);
     const submittedRanges = Array.isArray(body.ranges) ? body.ranges.filter(item => item && typeof item.key === "string" && typeof item.label === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.start) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.end)).slice(0, 60) : [];
-    const ranges = url.pathname.endsWith("/resume") && submittedRanges.length === 0 && ["paused", "failed"].includes(previousState.status) ? previousState.ranges : submittedRanges;
+    const resumingExisting = url.pathname.endsWith("/resume") && submittedRanges.length === 0 && ["paused", "failed"].includes(previousState.status);
+    const ranges = resumingExisting ? previousState.ranges : submittedRanges;
     const controller = new AbortController();
     const job = { controller, stopAs: "paused" };
     icloudFullBackupJobs.set(current.username, job);
@@ -493,15 +494,31 @@ async function handleIcloud(request, response, url) {
     const startedAt = url.pathname.endsWith("/resume") && previousState.startedAt ? previousState.startedAt : new Date().toISOString();
     const initial = await icloud.writeFullBackup(current.username, {
       status: "planning", phase: "planning", message: previousManifest.files.length ? "正在检查增量变化并准备继续…" : "正在读取完整 iCloud 图库清单…",
-      startedAt, completedAt: null, currentLibrary: null, currentRange: null, rangeIndex: 0, rangeCount: ranges.length || 1,
-      completedRanges: [], planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0,
+      startedAt, completedAt: null, currentLibrary: null, currentRange: resumingExisting ? previousState.currentRange : null,
+      rangeIndex: resumingExisting ? previousState.rangeIndex : 0, rangeCount: ranges.length || 1,
+      completedRanges: resumingExisting ? previousState.completedRanges : [], planned: resumingExisting ? previousState.planned : 0,
+      downloaded: resumingExisting ? previousState.downloaded : 0, verified: resumingExisting ? previousState.verified : 0,
+      skipped: resumingExisting ? previousState.skipped : 0, failed: 0, photoCount: resumingExisting ? previousState.photoCount : 0,
+      videoCount: resumingExisting ? previousState.videoCount : 0, verifiedBytes: resumingExisting ? previousState.verifiedBytes : 0,
       ranges,
     });
     void (async () => {
       try {
         const result = await icloudProvider.backupAll({
-          ...context, jobKey: current.username, previousFiles: previousManifest.files, ranges, signal: controller.signal,
-          onProgress: update => icloud.writeFullBackup(current.username, update),
+          ...context, jobKey: current.username, previousFiles: previousManifest.files, ranges,
+          initialCompletedRanges: resumingExisting ? previousState.completedRanges : [], signal: controller.signal,
+          onProgress: update => icloud.writeFullBackup(current.username, resumingExisting ? {
+            ...update,
+            planned: Math.max(previousState.planned, Number(update.planned) || 0),
+            downloaded: Math.max(previousState.downloaded, Number(update.downloaded) || 0),
+            verified: Math.max(previousState.verified, Number(update.verified) || 0),
+            skipped: Math.max(previousState.skipped, Number(update.skipped) || 0),
+            verifiedBytes: Math.max(previousState.verifiedBytes, Number(update.verifiedBytes) || 0),
+          } : update),
+          onRangeComplete: async update => {
+            const savedManifest = update.files.length ? await icloud.writeFullManifest(current.username, update.files) : await icloud.readFullManifest(current.username);
+            await icloud.writeFullBackup(current.username, { completedRanges: update.completedRanges, manifestFileCount: savedManifest.files.length });
+          },
         });
         if (result.status === "aborted") {
           await icloud.writeFullBackup(current.username, { status: job.stopAs, phase: job.stopAs, message: job.stopAs === "cancelled" ? "完整备份已取消；已下载的本地文件会保留。" : result.message });

@@ -305,18 +305,23 @@ test("selected backup ranges are planned, downloaded, and verified one at a time
       },
     });
     const progress = [];
+    const rangeCompletions = [];
     const result = await provider.backupAll({
       jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
       ranges: [
         { key: "2024", label: "2024 年", start: "2024-01-01T00:00:00", end: "2024-12-31T23:59:59" },
         { key: "2025", label: "2025 年", start: "2025-01-01T00:00:00", end: "2025-12-31T23:59:59" },
       ],
+      initialCompletedRanges: ["2024"],
       onProgress: update => progress.push(update),
+      onRangeComplete: update => rangeCompletions.push(update),
     });
     assert.equal(result.status, "completed");
     assert.deepEqual(events, ["plan-2024", "download-2024", "plan-2025", "download-2025"]);
     assert.deepEqual(result.completedRanges, ["2024", "2025"]);
     assert.equal(result.files.length, 2);
+    assert.deepEqual(rangeCompletions.map(update => update.completedRanges), [["2024"], ["2024", "2025"]]);
+    assert.deepEqual(rangeCompletions.map(update => update.files.length), [1, 1]);
     assert.ok(progress.some(item => item.currentRange === "2024 年" && item.rangeIndex === 1 && item.phase === "verifying"));
     assert.ok(progress.some(item => item.currentRange === "2025 年" && item.rangeIndex === 2 && item.phase === "planning"));
   } finally {
