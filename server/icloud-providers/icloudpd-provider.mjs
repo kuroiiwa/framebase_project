@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
-import { basename, extname } from "node:path";
+import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 import { spawn as spawnPty } from "node-pty";
 
 function runExecutable(executablePath, args, options = {}) {
@@ -39,6 +41,17 @@ function spawnInteractive(executablePath, args) {
 const runningAuthStates = new Set(["starting", "waiting_password", "verifying", "waiting_mfa"]);
 const photoExtensions = new Set(["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
 const videoExtensions = new Set(["mov", "mp4", "m4v", "avi", "mkv", "mpeg", "mpg", "webm"]);
+const destructiveFlags = new Set(["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"]);
+
+function sha256File(path) {
+  return new Promise((resolvePromise, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("error", reject);
+    stream.on("data", chunk => hash.update(chunk));
+    stream.on("end", () => resolvePromise(hash.digest("hex")));
+  });
+}
 
 function stripTerminalCodes(value) {
   let result = "";
@@ -235,6 +248,83 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
+  async function backupRecent({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, limit = 3 }) {
+    const providerInfo = await info();
+    if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", files: [], providerInfo };
+    const safeLimit = Math.max(1, Math.min(3, Number(limit) || 3));
+    const password = sessionSecrets.get(jobKey);
+    const baseArgs = [
+      "--log-level", "error",
+      "--no-progress-bar",
+      "--domain", domain,
+      "--password-provider", password ? "console" : "parameter",
+      "--mfa-provider", "console",
+      "--cookie-directory", sessionDirectory,
+      "--directory", backupDirectory,
+      "--username", appleAccount,
+    ];
+    const runReadOnly = args => password
+      ? runWithRuntimePassword(args, password, 180_000)
+      : runCommand(executablePath, args, { timeout: 180_000 });
+    const cleanLines = value => String(value || "").replace(/i?cloud password for [^:\r\n]+:/gi, "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const plannedPaths = value => cleanLines(value).map(line => {
+      const extension = extname(line).slice(1).toLowerCase();
+      if (!photoExtensions.has(extension) && !videoExtensions.has(extension)) return null;
+      const absolutePath = isAbsolute(line) ? resolve(line) : resolve(backupDirectory, line);
+      const pathWithinBackup = relative(resolve(backupDirectory), absolutePath);
+      if (pathWithinBackup.startsWith("..") || isAbsolute(pathWithinBackup)) return null;
+      return { absolutePath, relativePath: pathWithinBackup.split("\\").join("/"), extension };
+    }).filter(Boolean).slice(0, safeLimit);
+    try {
+      await mkdir(backupDirectory, { recursive: true });
+      let library = null;
+      let libraryArgs = [];
+      let { stdout } = await runReadOnly([...baseArgs, "--recent", String(safeLimit), "--only-print-filenames"]);
+      let plan = plannedPaths(stdout);
+      if (plan.length === 0) {
+        const librariesResult = await runReadOnly([...baseArgs, "--list-libraries"]);
+        const libraries = [...new Set(cleanLines(librariesResult.stdout))].slice(0, 8);
+        for (const candidate of libraries) {
+          const candidateArgs = ["--library", candidate];
+          ({ stdout } = await runReadOnly([...baseArgs, ...candidateArgs, "--recent", String(safeLimit), "--only-print-filenames"]));
+          plan = plannedPaths(stdout);
+          if (plan.length > 0) { library = candidate; libraryArgs = candidateArgs; break; }
+        }
+      }
+      if (plan.length === 0) return { status: "empty", message: "没有找到可用于测试备份的媒体项目。", files: [], providerInfo };
+      const downloadArgs = [
+        ...baseArgs,
+        ...libraryArgs,
+        "--recent", String(safeLimit),
+        "--size", "original",
+        "--live-photo-size", "original",
+      ];
+      if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
+      await runReadOnly(downloadArgs);
+      const files = [];
+      for (const item of plan) {
+        try {
+          const info = await stat(item.absolutePath);
+          if (!info.isFile() || info.size <= 0) continue;
+          files.push({
+            name: basename(item.absolutePath),
+            relativePath: item.relativePath,
+            extension: item.extension,
+            mediaType: videoExtensions.has(item.extension) ? "video" : "photo",
+            size: info.size,
+            sha256: await sha256File(item.absolutePath),
+          });
+        } catch { /* A missing or empty file fails local verification and is not reported as safe. */ }
+      }
+      if (files.length !== plan.length) {
+        return { status: "verification_failed", message: `已下载，但只有 ${files.length}/${plan.length} 个项目通过本地非空验证。`, files, library, providerInfo };
+      }
+      return { status: "completed", message: `已安全备份并验证 ${files.length} 个项目；iCloud 原文件未删除。`, files, library, providerInfo };
+    } catch (error) {
+      return { ...safeMessage(error), files: [], providerInfo };
+    }
+  }
+
   async function startAuthentication(jobKey, { appleAccount, domain, sessionDirectory, backupDirectory }) {
     const existing = authJobs.get(jobKey);
     if (existing && runningAuthStates.has(existing.status)) return publicAuthState(existing);
@@ -350,5 +440,5 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     return publicAuthState(job);
   }
 
-  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
+  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, backupRecent, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
 }

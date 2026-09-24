@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -143,6 +143,51 @@ test("icloudpd provider reuses a trusted session after FrameBase restarts", asyn
     const scanArgs = calls.at(-1);
     assert.equal(scanArgs[scanArgs.indexOf("--password-provider") + 1], "parameter");
     assert.equal(scanArgs.includes("--password"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("icloudpd provider safely backs up at most three recent originals and verifies local files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-safe-backup-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const plannedPath = join(backupDirectory, "2026", "09", "IMG_7100.PNG");
+  const calls = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => {
+        calls.push(args);
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--only-print-filenames")) return { stdout: `${plannedPath}\n`, stderr: "" };
+        await mkdir(join(backupDirectory, "2026", "09"), { recursive: true });
+        await writeFile(plannedPath, "verified-media");
+        return { stdout: "", stderr: "" };
+      },
+      spawnProcess: () => { throw new Error("trusted session backups must not open an interactive login"); },
+    });
+    const result = await provider.backupRecent({
+      jobKey: "alice",
+      appleAccount: "alice@example.com",
+      domain: "cn",
+      sessionDirectory: join(root, "session"),
+      backupDirectory,
+      limit: 99,
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].size, 14);
+    assert.match(result.files[0].sha256, /^[a-f0-9]{64}$/);
+    const downloadArgs = calls.find(args => args.includes("--size"));
+    assert.equal(downloadArgs[downloadArgs.indexOf("--recent") + 1], "3");
+    assert.equal(downloadArgs[downloadArgs.indexOf("--size") + 1], "original");
+    assert.equal(downloadArgs[downloadArgs.indexOf("--live-photo-size") + 1], "original");
+    assert.equal(downloadArgs.includes("--only-print-filenames"), false);
+    assert.equal(downloadArgs.includes("--auto-delete"), false);
+    assert.equal(downloadArgs.includes("--delete-after-download"), false);
+    assert.equal(downloadArgs.includes("--keep-icloud-recent-days"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

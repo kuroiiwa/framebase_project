@@ -42,6 +42,10 @@ export function createIcloudManager({ projectRoot }) {
     return join(userDirectory(username), "manifest.json");
   }
 
+  function backupResultPath(username) {
+    return join(userDirectory(username), "last-backup.json");
+  }
+
   async function readScan(username) {
     validateUsername(username);
     try {
@@ -54,6 +58,25 @@ export function createIcloudManager({ projectRoot }) {
       };
     } catch (error) {
       if (error.code === "ENOENT") return { scannedAt: null, sampleCount: 0, samples: [] };
+      throw error;
+    }
+  }
+
+  async function readBackup(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(backupResultPath(username), "utf8"));
+      const files = Array.isArray(parsed.files) ? parsed.files.filter(item => item && typeof item.name === "string" && Number(item.size) > 0).slice(0, 100).map(item => ({
+        name: item.name,
+        relativePath: typeof item.relativePath === "string" ? item.relativePath : item.name,
+        extension: String(item.extension || "").toLowerCase(),
+        mediaType: item.mediaType === "video" ? "video" : "photo",
+        size: Number(item.size),
+        sha256: /^[a-f0-9]{64}$/.test(String(item.sha256 || "")) ? item.sha256 : null,
+      })) : [];
+      return { completedAt: typeof parsed.completedAt === "string" ? parsed.completedAt : null, fileCount: files.length, files };
+    } catch (error) {
+      if (error.code === "ENOENT") return { completedAt: null, fileCount: 0, files: [] };
       throw error;
     }
   }
@@ -192,5 +215,35 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, scan: { scannedAt, sampleCount: samples.length, samples } };
   }
 
-  return { read, readScan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan };
+  async function recordBackup(username, result) {
+    validateUsername(username);
+    const completedAt = new Date().toISOString();
+    const newFiles = Array.isArray(result.files) ? result.files.slice(0, 10).map(item => ({
+      name: String(item.name || ""),
+      relativePath: String(item.relativePath || item.name || ""),
+      extension: String(item.extension || "").toLowerCase(),
+      mediaType: item.mediaType === "video" ? "video" : "photo",
+      size: Math.max(0, Number(item.size) || 0),
+      sha256: /^[a-f0-9]{64}$/.test(String(item.sha256 || "")) ? item.sha256 : null,
+    })).filter(item => item.name && item.size > 0) : [];
+    const previous = await readBackup(username);
+    const filesByPath = new Map(previous.files.map(item => [item.relativePath, item]));
+    for (const file of newFiles) filesByPath.set(file.relativePath, file);
+    const files = [...filesByPath.values()].slice(0, 100);
+    const directory = userDirectory(username);
+    const destination = backupResultPath(username);
+    const temporary = `${destination}.tmp`;
+    const task = writes.then(async () => {
+      await mkdir(directory, { recursive: true });
+      await writeFile(temporary, `${JSON.stringify({ version: 1, completedAt, fileCount: files.length, files }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, destination);
+    });
+    writes = task.catch(() => undefined);
+    await task;
+    const config = { ...await read(username), lastBackupAt: completedAt, updatedAt: completedAt };
+    await save(username, config);
+    return { ...config, backup: { completedAt, fileCount: files.length, files } };
+  }
+
+  return { read, readScan, readBackup, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

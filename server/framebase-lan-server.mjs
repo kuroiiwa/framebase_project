@@ -24,6 +24,7 @@ const icloudProvider = createIcloudPdProvider({
       || (existsSync(compatibleIcloudPdPath) ? compatibleIcloudPdPath : bundledIcloudPdPath),
   ),
 });
+const icloudBackupUsers = new Set();
 const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
 const appPort = Number(process.env.FRAMEBASE_APP_PORT || 3001);
@@ -390,11 +391,13 @@ async function handleFolderPicker(request, response) {
 async function handleIcloud(request, response, url) {
   const current = requirePc(request, response);
   if (!current) return;
+  if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloudProvider.info()]);
+    const [config, scan, backup, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloudProvider.info()]);
     return json(response, 200, {
       ...config,
       scan,
+      backup,
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });
   }
@@ -435,6 +438,24 @@ async function handleIcloud(request, response, url) {
     }
     const config = await icloud.recordScan(current.username, scanResult);
     return json(response, 200, { ...config, scanResult: { status: scanResult.status, message: scanResult.message } });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/backup/test") {
+    const previousBackup = await icloud.readBackup(current.username);
+    if (previousBackup.completedAt) return json(response, 409, { error: "测试备份已经完成。为避免扩大下载范围，不能重复执行。" });
+    if (icloudBackupUsers.has(current.username)) return json(response, 409, { error: "当前用户已有 iCloud 备份任务正在运行。" });
+    icloudBackupUsers.add(current.username);
+    try {
+      const context = await icloud.connectionContext(current.username);
+      const backupResult = await icloudProvider.backupRecent({ ...context, jobKey: current.username, limit: 3 });
+      if (backupResult.status !== "completed") {
+        if (backupResult.status === "needs_auth") await icloud.recordConnectionCheck(current.username, backupResult);
+        return json(response, 200, { ...await icloud.read(current.username), backup: await icloud.readBackup(current.username), backupResult: { status: backupResult.status, message: backupResult.message, files: backupResult.files } });
+      }
+      const config = await icloud.recordBackup(current.username, backupResult);
+      return json(response, 200, { ...config, backupResult: { status: backupResult.status, message: backupResult.message, files: backupResult.files } });
+    } finally {
+      icloudBackupUsers.delete(current.username);
+    }
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
     const context = await icloud.connectionContext(current.username);

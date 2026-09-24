@@ -33,6 +33,13 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     await manager.recordScan("alice", { samples: [{ name: "VID_0002.MOV", extension: "mov", mediaType: "video" }] });
     assert.deepEqual((await manager.readScan("gabri")).samples.map(item => item.name), ["IMG_0001.HEIC"]);
     assert.deepEqual((await manager.readScan("alice")).samples.map(item => item.name), ["VID_0002.MOV"]);
+    await manager.recordBackup("gabri", { files: [{ name: "IMG_0001.HEIC", relativePath: "2026/09/IMG_0001.HEIC", extension: "heic", mediaType: "photo", size: 2048, sha256: "a".repeat(64) }] });
+    await manager.recordBackup("gabri", { files: [{ name: "IMG_0002.JPG", relativePath: "2026/09/IMG_0002.JPG", extension: "jpg", mediaType: "photo", size: 1024, sha256: "b".repeat(64) }] });
+    assert.deepEqual((await manager.readBackup("gabri")).files.map(item => item.relativePath), ["2026/09/IMG_0001.HEIC", "2026/09/IMG_0002.JPG"]);
+    assert.equal((await manager.readBackup("gabri")).files[0].sha256, "a".repeat(64));
+    assert.equal((await manager.readBackup("gabri")).fileCount, 2);
+    assert.equal((await manager.readBackup("alice")).fileCount, 0);
+    assert.ok((await manager.read("gabri")).lastBackupAt);
 
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));
@@ -58,6 +65,8 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /验证已有会话/);
   assert.match(page, /开始 Apple 登录/);
   assert.match(page, /扫描最近 10 个项目/);
+  assert.match(page, /安全备份最近 3 个/);
+  assert.match(page, /当前仅管理视频/);
   assert.match(page, /← 返回视频库/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
@@ -65,5 +74,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /icloudProvider\.verifyRuntimeSession/);
   assert.match(server, /icloudProvider\.startAuthentication/);
   assert.match(server, /icloudProvider\.scanRecent/);
+  assert.match(server, /icloudProvider\.backupRecent/);
+  assert.match(server, /\/api\/icloud\/backup\/test/);
   assert.match(server, /ShowDialog\(\$owner\)/);
 });

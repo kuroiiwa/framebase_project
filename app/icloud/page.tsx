@@ -20,6 +20,7 @@ type IcloudConfig = {
   lastBackupAt: string | null;
   updatedAt: string | null;
   scan?: { scannedAt: string | null; sampleCount: number; samples: Array<{ name: string; extension: string; mediaType: "photo" | "video" }> };
+  backup?: { completedAt: string | null; fileCount: number; files: Array<{ name: string; relativePath: string; extension: string; mediaType: "photo" | "video"; size: number; sha256: string | null }> };
 };
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
@@ -37,7 +38,7 @@ function IcloudCenter({ username }: { username: string }) {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | null>(null);
+  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -172,6 +173,26 @@ function IcloudCenter({ username }: { username: string }) {
     finally { setBusy(null); }
   }
 
+  async function backupRecent() {
+    if (!window.confirm("将最近 3 个 iCloud 媒体项目复制到当前用户的备份目录。此操作不会删除或移动 iCloud 原文件，是否继续？")) return;
+    setBusy("backup"); setError(""); setMessage("");
+    try {
+      const response = await fetch("/api/icloud/backup/test", { method: "POST" });
+      const data = await response.json() as IcloudConfig & { backupResult?: { status: string; message: string }; error?: string };
+      if (!response.ok) throw new Error(data.error || "无法完成测试备份");
+      setConfig(current => ({ ...data, providerInfo: current?.providerInfo }));
+      if (data.backupResult?.status === "completed") setMessage(data.backupResult.message);
+      else setError(data.backupResult?.message || "测试备份未完成，请检查连接和本地目录。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法完成测试备份"); }
+    finally { setBusy(null); }
+  }
+
+  function formatBytes(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  }
+
   const readyForConnection = Boolean(config?.backupDirectory);
   const connectionConfigured = Boolean(config?.appleAccount);
   return <main className={styles.page}>
@@ -218,11 +239,16 @@ function IcloudCenter({ username }: { username: string }) {
 
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>3</span><div><h2>扫描、备份与验证</h2><p>连接后先只读统计，再由当前用户选择测试备份或完整增量备份。</p></div></div>
-        <ul><li>原片、视频、Live Photo 与 RAW</li><li>断点续传和失败重试</li><li>本地存在性、大小与媒体可读性验证</li></ul>
-        <div className={styles.actions}><button className={styles.primary} onClick={() => void scanRecent()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在只读扫描…" : "扫描最近 10 个项目"}</button></div>
+        <div className={styles.capabilities}><div><strong>iCloud 照片与视频</strong><span>支持只读扫描和安全备份</span></div><div><strong>FrameBase 主媒体库</strong><span>当前仅管理视频；图片浏览与整理尚未开放</span></div></div>
+        <ul><li>测试备份硬性限制为最近 3 个项目</li><li>保存原始尺寸，完成后验证本地文件存在且非空</li><li>不会传入云端删除、移动或自动清理参数</li></ul>
+        <div className={styles.actions}><button onClick={() => void scanRecent()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在只读扫描…" : "扫描最近 10 个项目"}</button><button className={styles.primary} onClick={() => void backupRecent()} disabled={busy !== null || config?.connectionStatus !== "connected" || !config?.scan?.sampleCount || Boolean(config?.backup?.completedAt)}>{busy === "backup" ? "正在安全备份与验证…" : config?.backup?.completedAt ? "测试备份已完成" : "安全备份最近 3 个"}</button></div>
         {config?.scan?.scannedAt && <div className={styles.scanResult}>
           <div><strong>最近一次只读扫描</strong><span>{config.scan.sampleCount} 个媒体项目 · {new Date(config.scan.scannedAt).toLocaleString("zh-CN")}</span></div>
           {config.scan.samples.length > 0 && <ul>{config.scan.samples.map((item, index) => <li key={`${item.name}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong>{item.name}</strong></li>)}</ul>}
+        </div>}
+        {config?.backup?.completedAt && <div className={styles.scanResult}>
+          <div><strong>已验证的安全备份清单</strong><span>{config.backup.fileCount} 个项目 · {new Date(config.backup.completedAt).toLocaleString("zh-CN")}</span></div>
+          {config.backup.files.length > 0 && <ul>{config.backup.files.map((item, index) => <li key={`${item.relativePath}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong title={`${item.relativePath}${item.sha256 ? ` · SHA-256 ${item.sha256}` : ""}`}>{item.name} · {formatBytes(item.size)} · {item.sha256 ? "SHA-256 已记录" : "基础校验"}</strong></li>)}</ul>}
         </div>}
       </article>
     </section>
