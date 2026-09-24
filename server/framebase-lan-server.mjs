@@ -397,7 +397,7 @@ async function handleIcloud(request, response, url) {
     const [config, scan, backup, fullBackupStored, backupCoverage, timeline, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
     if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
-      fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
+      fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", transferRateBps: 0, message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
     }
     return json(response, 200, {
       ...config,
@@ -498,6 +498,9 @@ async function handleIcloud(request, response, url) {
       rangeIndex: resumingExisting ? previousState.rangeIndex : 0, rangeCount: ranges.length || 1,
       completedRanges: resumingExisting ? previousState.completedRanges : [], planned: resumingExisting ? previousState.planned : 0,
       downloaded: resumingExisting ? previousState.downloaded : 0, verified: resumingExisting ? previousState.verified : 0,
+      plannedPhotoCount: resumingExisting ? previousState.plannedPhotoCount : 0, plannedVideoCount: resumingExisting ? previousState.plannedVideoCount : 0,
+      syncedPhotoCount: resumingExisting ? previousState.syncedPhotoCount : 0, syncedVideoCount: resumingExisting ? previousState.syncedVideoCount : 0,
+      downloadedBytes: resumingExisting ? previousState.downloadedBytes : 0, transferRateBps: 0,
       skipped: resumingExisting ? previousState.skipped : 0, failed: 0, photoCount: resumingExisting ? previousState.photoCount : 0,
       videoCount: resumingExisting ? previousState.videoCount : 0, verifiedBytes: resumingExisting ? previousState.verifiedBytes : 0,
       ranges,
@@ -511,6 +514,11 @@ async function handleIcloud(request, response, url) {
             ...update,
             planned: Math.max(previousState.planned, Number(update.planned) || 0),
             downloaded: Math.max(previousState.downloaded, Number(update.downloaded) || 0),
+            plannedPhotoCount: Math.max(previousState.plannedPhotoCount, Number(update.plannedPhotoCount) || 0),
+            plannedVideoCount: Math.max(previousState.plannedVideoCount, Number(update.plannedVideoCount) || 0),
+            syncedPhotoCount: Math.max(previousState.syncedPhotoCount, Number(update.syncedPhotoCount) || 0),
+            syncedVideoCount: Math.max(previousState.syncedVideoCount, Number(update.syncedVideoCount) || 0),
+            downloadedBytes: Math.max(previousState.downloadedBytes, Number(update.downloadedBytes) || 0),
             verified: Math.max(previousState.verified, Number(update.verified) || 0),
             skipped: Math.max(previousState.skipped, Number(update.skipped) || 0),
             verifiedBytes: Math.max(previousState.verifiedBytes, Number(update.verifiedBytes) || 0),
@@ -521,7 +529,7 @@ async function handleIcloud(request, response, url) {
           },
         });
         if (result.status === "aborted") {
-          await icloud.writeFullBackup(current.username, { status: job.stopAs, phase: job.stopAs, message: job.stopAs === "cancelled" ? "完整备份已取消；已下载的本地文件会保留。" : result.message });
+          await icloud.writeFullBackup(current.username, { status: job.stopAs, phase: job.stopAs, transferRateBps: 0, message: job.stopAs === "cancelled" ? "完整备份已取消；已下载的本地文件会保留。" : result.message });
           return;
         }
         const savedManifest = result.files?.length ? await icloud.writeFullManifest(current.username, result.files) : previousManifest;
@@ -530,7 +538,10 @@ async function handleIcloud(request, response, url) {
           status: completed ? "completed" : "failed", phase: completed ? "completed" : "failed", message: result.message,
           completedAt: completed ? new Date().toISOString() : null, currentLibrary: null, currentRange: null,
           rangeIndex: result.completedRanges?.length || 0, rangeCount: ranges.length || 1, completedRanges: result.completedRanges || [],
-          planned: result.planned || 0, downloaded: result.planned || 0, verified: result.files?.length || 0,
+          planned: result.planned || 0, downloaded: result.files?.length || 0, verified: result.files?.length || 0,
+          plannedPhotoCount: result.plannedPhotoCount || result.photoCount || 0, plannedVideoCount: result.plannedVideoCount || result.videoCount || 0,
+          syncedPhotoCount: result.photoCount || 0, syncedVideoCount: result.videoCount || 0,
+          downloadedBytes: result.downloadedBytes || result.verifiedBytes || 0, transferRateBps: 0,
           skipped: result.skipped || 0, failed: result.failed || 0, photoCount: result.photoCount || 0,
           videoCount: result.videoCount || 0, verifiedBytes: result.verifiedBytes || 0, manifestFileCount: savedManifest.files.length,
         });
@@ -550,7 +561,7 @@ async function handleIcloud(request, response, url) {
     if (!job) {
       const currentState = await icloud.readFullBackup(current.username);
       if (!["planning", "downloading", "verifying"].includes(currentState.status)) return json(response, 409, { error: "当前没有正在运行的完整备份任务。" });
-      return json(response, 200, { fullBackup: await icloud.writeFullBackup(current.username, { status: stopAs, phase: stopAs, message: stopAs === "cancelled" ? "完整备份已取消。" : "完整备份已暂停，可稍后继续。" }) });
+      return json(response, 200, { fullBackup: await icloud.writeFullBackup(current.username, { status: stopAs, phase: stopAs, transferRateBps: 0, message: stopAs === "cancelled" ? "完整备份已取消。" : "完整备份已暂停，可稍后继续。" }) });
     }
     job.stopAs = stopAs;
     job.controller.abort();

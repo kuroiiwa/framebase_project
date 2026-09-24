@@ -80,10 +80,11 @@ function publicAuthState(job) {
   return { status: job.status, message: job.message, startedAt: job.startedAt };
 }
 
-export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive, hashFile = sha256File, verificationConcurrency = 2 }) {
+export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive, hashFile = sha256File, verificationConcurrency = 2, progressInterval = 1000 }) {
   const authJobs = new Map();
   const sessionSecrets = new Map();
   const safeVerificationConcurrency = Math.min(4, Math.max(1, Math.floor(Number(verificationConcurrency) || 2)));
+  const safeProgressInterval = Math.max(10, Math.floor(Number(progressInterval) || 1000));
 
   function runWithRuntimePassword(args, password, timeout = 120_000, signal, processOptions = {}) {
     return new Promise((resolve, reject) => {
@@ -414,9 +415,57 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const libraries = [null, ...namedLibraries];
       const planByPath = new Map();
       const filesByPath = new Map();
+      const downloadedSizes = new Map();
+      const transferSamples = [{ at: Date.now(), bytes: 0 }];
+      let transferredBytes = 0;
+      let lastTransferAt = 0;
+      let plannedPhotoCount = 0;
+      let plannedVideoCount = 0;
       let skipped = 0;
       let failed = 0;
       let verifiedBytes = 0;
+      const inspectPlannedItems = async items => {
+        const found = [];
+        let cursor = 0;
+        const workers = Array.from({ length: Math.min(8, items.length) }, async () => {
+          while (cursor < items.length) {
+            const item = items[cursor++];
+            try {
+              const fileInfo = await stat(item.absolutePath);
+              if (fileInfo.isFile() && fileInfo.size > 0) found.push({ item, size: fileInfo.size });
+            } catch (error) { if (error?.code !== "ENOENT") throw error; }
+          }
+        });
+        await Promise.all(workers);
+        return found;
+      };
+      const downloadMetrics = () => {
+        let downloadedBytes = 0; let syncedPhotoCount = 0; let syncedVideoCount = 0;
+        for (const [relativePath, size] of downloadedSizes) {
+          downloadedBytes += size;
+          const extension = planByPath.get(relativePath)?.extension || extname(relativePath).slice(1).toLowerCase();
+          if (videoExtensions.has(extension)) syncedVideoCount += 1; else syncedPhotoCount += 1;
+        }
+        const latest = transferSamples.at(-1);
+        const earliest = transferSamples[0];
+        const elapsedSeconds = latest && earliest ? Math.max(0.001, (latest.at - earliest.at) / 1000) : 0;
+        const transferRateBps = Date.now() - lastTransferAt > safeProgressInterval * 4 || !elapsedSeconds ? 0 : Math.max(0, Math.round((latest.bytes - earliest.bytes) / elapsedSeconds));
+        return { plannedPhotoCount, plannedVideoCount, downloaded: syncedPhotoCount + syncedVideoCount, syncedPhotoCount, syncedVideoCount, downloadedBytes, transferRateBps };
+      };
+      const refreshDownloadMetrics = async (items, countTransfer = true) => {
+        const found = await inspectPlannedItems(items);
+        let addedBytes = 0;
+        for (const { item, size } of found) {
+          const previousSize = downloadedSizes.get(item.relativePath) || 0;
+          if (countTransfer && size > previousSize) addedBytes += size - previousSize;
+          downloadedSizes.set(item.relativePath, size);
+        }
+        const now = Date.now();
+        if (addedBytes > 0) { transferredBytes += addedBytes; lastTransferAt = now; }
+        transferSamples.push({ at: now, bytes: transferredBytes });
+        while (transferSamples.length > 2 && transferSamples[0].at < now - 8000) transferSamples.shift();
+        return downloadMetrics();
+      };
       for (let rangeOffset = 0; rangeOffset < requestedRanges.length; rangeOffset += 1) {
         const range = requestedRanges[rangeOffset];
         const rangeIndex = rangeOffset + 1;
@@ -429,24 +478,38 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           const libraryArgs = library ? ["--library", library] : [];
           const result = await run([...mediaArgs, ...libraryArgs, ...rangeArgs(range), "--only-print-filenames"], 30 * 60_000);
           const items = parsePaths(result.stdout, library);
-          if (items.length > 0) activeOperations.push({ library, range });
+          if (items.length > 0) activeOperations.push({ library, range, items });
           for (const item of items) {
             if (!rangePlan.has(item.relativePath)) rangePlan.set(item.relativePath, item);
-            if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
+            if (!planByPath.has(item.relativePath)) {
+              planByPath.set(item.relativePath, item);
+              if (videoExtensions.has(item.extension)) plannedVideoCount += 1; else plannedPhotoCount += 1;
+            }
           }
-          await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `${currentRange} 已规划 ${rangePlan.size} 个媒体文件。` });
+          await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), message: `${currentRange} 已规划 ${rangePlan.size} 个媒体文件。` });
         }
         let completedLibraries = 0;
         for (const operation of activeOperations) {
-          const { library } = operation;
+          const { library, items } = operation;
           if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
           const libraryArgs = library ? ["--library", library] : [];
           const downloadArgs = [...mediaArgs, ...libraryArgs, ...rangeArgs(range)];
           if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
-          await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在备份 ${rangeIndex}/${requestedRanges.length}：${currentRange} · ${library ? `图库“${library}”` : "主图库"}…` });
-          await run(downloadArgs, 24 * 60 * 60_000, 8 * 1024 * 1024);
+          await refreshDownloadMetrics(items, false);
+          await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), message: `正在备份 ${rangeIndex}/${requestedRanges.length}：${currentRange} · ${library ? `图库“${library}”` : "主图库"}…` });
+          let polling = false;
+          let progressPoll = Promise.resolve();
+          const progressTimer = setInterval(() => {
+            if (polling) return;
+            polling = true;
+            progressPoll = refreshDownloadMetrics(items).then(metrics => onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...metrics, message: `正在同步 ${metrics.syncedPhotoCount}/${metrics.plannedPhotoCount} 张图片、${metrics.syncedVideoCount}/${metrics.plannedVideoCount} 个视频…` })).catch(() => undefined).finally(() => { polling = false; });
+          }, safeProgressInterval);
+          progressTimer.unref?.();
+          try { await run(downloadArgs, 24 * 60 * 60_000, 8 * 1024 * 1024); }
+          finally { clearInterval(progressTimer); await progressPoll; }
           completedLibraries += 1;
-          await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `${currentRange} 下载进度 ${completedLibraries}/${activeOperations.length} 个图库。` });
+          const metrics = await refreshDownloadMetrics(items);
+          await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...metrics, transferRateBps: 0, message: `${currentRange} 下载进度 ${completedLibraries}/${activeOperations.length} 个图库。` });
         }
         const rangeVerificationByPath = new Map();
         for (const directory of verificationDirectories(range)) {
@@ -486,7 +549,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           }
           const processed = batchStart + batch.length;
           if (processed % 10 === 0 || processed === verificationPlan.length) {
-            await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在使用 ${safeVerificationConcurrency} 路并行校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${processed}/${verificationPlan.length}）…` });
+            await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), transferRateBps: 0, message: `正在使用 ${safeVerificationConcurrency} 路并行校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${processed}/${verificationPlan.length}）…` });
           }
         }
         const rangeVerified = verificationPlan.length > 0 && failed === failedBeforeRange;
@@ -498,15 +561,15 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           const completedIndex = completedRanges.indexOf(range.key);
           if (completedIndex >= 0) completedRanges.splice(completedIndex, 1);
         }
-        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: rangeVerified ? `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` : `${currentRange} 有文件未通过完整性校验，保留为未完成状态。` });
+        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), transferRateBps: 0, message: rangeVerified ? `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` : `${currentRange} 有文件未通过完整性校验，保留为未完成状态。` });
       }
       const files = [...filesByPath.values()];
       const verificationTotal = files.length + failed;
       if (verificationTotal === 0) return { status: "empty", message: "所选时间范围内没有找到可备份的图片或视频。", files: [], planned: planByPath.size, completedRanges, providerInfo };
       const photoCount = files.filter(item => item.mediaType === "photo").length;
       const videoCount = files.length - photoCount;
-      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${verificationTotal} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: planByPath.size, skipped, failed, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
-      return { status: "completed", message: `已依次完成 ${completedRanges.length} 个时间范围，验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: planByPath.size, skipped, failed: 0, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
+      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${verificationTotal} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: planByPath.size, plannedPhotoCount, plannedVideoCount, downloadedBytes: downloadMetrics().downloadedBytes, skipped, failed, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
+      return { status: "completed", message: `已依次完成 ${completedRanges.length} 个时间范围，验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: planByPath.size, plannedPhotoCount, plannedVideoCount, downloadedBytes: downloadMetrics().downloadedBytes, skipped, failed: 0, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) return { status: "aborted", message: "备份任务已安全停止，可稍后从本地已有文件继续。", files: [], providerInfo };
       return { ...safeMessage(error), files: [], providerInfo };

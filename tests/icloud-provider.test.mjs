@@ -373,6 +373,47 @@ test("full backup verifies local files with a bounded two-worker pool", async ()
   }
 });
 
+test("full backup reports live transfer rate and photo/video download counts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-live-progress-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const mediaDirectory = join(backupDirectory, "2025", "07");
+  const photoPath = join(mediaDirectory, "IMG_1001.HEIC");
+  const videoPath = join(mediaDirectory, "IMG_1001.MOV");
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      progressInterval: 10,
+      runCommand: async (_executable, args) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "", stderr: "" };
+        if (args.includes("--only-print-filenames")) return { stdout: `${photoPath}\n${videoPath}\n`, stderr: "" };
+        await mkdir(mediaDirectory, { recursive: true });
+        await writeFile(photoPath, Buffer.alloc(4096, 1));
+        await new Promise(resolve => setTimeout(resolve, 30));
+        await writeFile(videoPath, Buffer.alloc(8192, 2));
+        await new Promise(resolve => setTimeout(resolve, 30));
+        return { stdout: "", stderr: "" };
+      },
+    });
+    const progress = [];
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
+      ranges: [{ key: "2025-07", label: "2025 年 7 月", start: "2025-07-01T00:00:00", end: "2025-07-31T23:59:59" }],
+      onProgress: update => progress.push(update),
+    });
+    const live = progress.filter(item => item.phase === "downloading");
+    assert.equal(result.status, "completed");
+    assert.ok(live.some(item => item.plannedPhotoCount === 1 && item.plannedVideoCount === 1));
+    assert.ok(live.some(item => item.syncedPhotoCount >= 1 && item.downloadedBytes >= 4096));
+    assert.ok(live.some(item => item.transferRateBps > 0));
+    assert.ok(live.some(item => item.syncedPhotoCount === 1 && item.syncedVideoCount === 1));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("provider builds exact year, quarter, and month summaries from read-only inventory metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-timeline-"));
   const executablePath = join(root, "icloudpd.exe");
