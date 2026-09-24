@@ -60,6 +60,10 @@ export function createIcloudManager({ projectRoot }) {
     return join(userDirectory(username), "release-plan.json");
   }
 
+  function timelinePath(username) {
+    return join(userDirectory(username), "timeline.json");
+  }
+
   function sha256File(path) {
     return new Promise((resolvePromise, reject) => {
       const hash = createHash("sha256");
@@ -117,9 +121,10 @@ export function createIcloudManager({ projectRoot }) {
         videoCount: Math.max(0, Number(parsed.videoCount) || 0),
         verifiedBytes: Math.max(0, Number(parsed.verifiedBytes) || 0),
         manifestFileCount: Math.max(0, Number(parsed.manifestFileCount) || 0),
+        ranges: Array.isArray(parsed.ranges) ? parsed.ranges.filter(item => item && typeof item.key === "string" && typeof item.start === "string" && typeof item.end === "string").slice(0, 60) : [],
       };
     } catch (error) {
-      if (error.code === "ENOENT") return { status: "idle", message: "尚未开始完整备份。", startedAt: null, updatedAt: null, completedAt: null, phase: "idle", currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, manifestFileCount: 0 };
+      if (error.code === "ENOENT") return { status: "idle", message: "尚未开始完整备份。", startedAt: null, updatedAt: null, completedAt: null, phase: "idle", currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, manifestFileCount: 0, ranges: [] };
       throw error;
     }
   }
@@ -150,6 +155,40 @@ export function createIcloudManager({ projectRoot }) {
     const merged = [...byPath.values()].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     await atomicJson(username, fullManifestPath(username), { version: 1, updatedAt, fileCount: merged.length, files: merged });
     return { updatedAt, files: merged };
+  }
+
+  function cleanTimelineBuckets(value) {
+    return Array.isArray(value) ? value.map(item => ({
+      key: String(item?.key || ""), itemCount: Math.max(0, Number(item?.itemCount) || 0),
+      photoCount: Math.max(0, Number(item?.photoCount) || 0), videoCount: Math.max(0, Number(item?.videoCount) || 0),
+      livePhotoCount: Math.max(0, Number(item?.livePhotoCount) || 0), rawCount: Math.max(0, Number(item?.rawCount) || 0),
+      originalBytes: Math.max(0, Number(item?.originalBytes) || 0),
+    })).filter(item => item.key && item.itemCount > 0).slice(0, 500) : [];
+  }
+
+  async function readTimeline(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(timelinePath(username), "utf8"));
+      return {
+        scannedAt: typeof parsed.scannedAt === "string" ? parsed.scannedAt : null,
+        total: cleanTimelineBuckets([parsed.total])[0] || null,
+        years: cleanTimelineBuckets(parsed.years), quarters: cleanTimelineBuckets(parsed.quarters), months: cleanTimelineBuckets(parsed.months),
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") return { scannedAt: null, total: null, years: [], quarters: [], months: [] };
+      throw error;
+    }
+  }
+
+  async function recordTimeline(username, result) {
+    const timeline = {
+      version: 1, scannedAt: typeof result.scannedAt === "string" ? result.scannedAt : new Date().toISOString(),
+      total: cleanTimelineBuckets([result.total])[0] || null,
+      years: cleanTimelineBuckets(result.years), quarters: cleanTimelineBuckets(result.quarters), months: cleanTimelineBuckets(result.months),
+    };
+    await atomicJson(username, timelinePath(username), timeline);
+    return timeline;
   }
 
   async function readReleasePlan(username) {
@@ -425,5 +464,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, readFullBackup, readFullManifest, writeFullBackup, writeFullManifest, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

@@ -91,7 +91,31 @@ PR #1367 修改了两处：
 
 7. 运行 `--version` 并记录生成文件的 SHA-256，确认文件可执行。源码快照缺少官方构建元数据时，程序自身可能显示 `0.0.1`；FrameBase 会依据兼容文件名在界面显示 `1.32.3 · FrameBase 兼容版`。
 
-   本次已验证的本机构建 SHA-256 为 `3FA7764A8F01197D98BC6437B63896716CDC3C9CB065BDF2BDC3992C7F173B57`。重新构建后哈希可能变化，应以新构建的测试结果为准，不能仅凭文件名判断是否包含补丁。
+   当前加入 FrameBase 只读时间清单能力后的本机构建 SHA-256 为 `8116AE89652A13A09A05800890CE65EF3AF36DCF42829D6DC618928D69193245`。重新构建后哈希可能变化，应以新构建的测试结果为准，不能仅凭文件名判断是否包含补丁。
+
+## FrameBase 时间清单扩展
+
+上游 `--only-print-filenames` 只输出尚需下载的文件名，无法提供完整图库的拍摄时间和原始大小。FrameBase 兼容版在 `src/icloudpd/base.py` 的 `download_builder` 中增加了受环境变量保护的只读输出模式：
+
+```text
+FRAMEBASE_INVENTORY_JSON=1
+```
+
+该模式必须与 `--only-print-filenames` 一起使用。它在检查本地文件或下载之前，为每个云端对象输出一行：
+
+```text
+FRAMEBASE_INVENTORY {JSON}
+```
+
+JSON 只包含对象 ID、文件名、拍摄时间、图片/视频类型、原始资源大小、Live Photo 视频大小和 RAW 标记。它不会下载文件，也不会调用删除接口。Provider 只解析带此前缀的行，并在内存中汇总为年份、季度和月份；原始逐项清单不会写入浏览器或普通日志。
+
+重建时还必须运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests/test_framebase_inventory.py
+```
+
+该测试确认清单模式能输出元数据且不会创建媒体文件。不要把 Apple 密码或会话令牌放入环境变量；环境变量仅用于启用清单输出协议。
 
 ## 只读验证顺序
 

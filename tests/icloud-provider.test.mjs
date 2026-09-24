@@ -225,6 +225,7 @@ test("icloudpd provider incrementally backs up and hashes photos, videos, Live P
     const result = await provider.backupAll({
       jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
       previousFiles: [{ relativePath: "2026/09/IMG_7100.HEIC", size: 5, sha256: photoHash }],
+      ranges: [{ key: "2026-Q3", label: "2026 年第 3 季度", start: "2026-07-01T00:00:00", end: "2026-09-30T23:59:59" }],
       onProgress: update => progress.push(update),
     });
     assert.equal(result.status, "completed");
@@ -238,6 +239,8 @@ test("icloudpd provider incrementally backs up and hashes photos, videos, Live P
     const downloadArgs = calls.find(args => args.includes("--library") && !args.includes("--only-print-filenames"));
     assert.equal(downloadArgs[downloadArgs.indexOf("--size") + 1], "original");
     assert.equal(downloadArgs[downloadArgs.indexOf("--live-photo-size") + 1], "original");
+    assert.equal(downloadArgs[downloadArgs.indexOf("--skip-created-before") + 1], "2026-07-01T00:00:00");
+    assert.equal(downloadArgs[downloadArgs.indexOf("--skip-created-after") + 1], "2026-09-30T23:59:59");
     assert.equal(downloadArgs.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -268,6 +271,40 @@ test("full backup re-verifies existing local media when iCloud has nothing new t
     assert.equal(result.files.length, 1);
     assert.equal(result.skipped, 1);
     assert.equal(result.files[0].sha256, sha256);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider builds exact year, quarter, and month summaries from read-only inventory metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-timeline-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const calls = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args, options) => {
+        calls.push({ args, options });
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "SharedSync\n", stderr: "" };
+        return { stdout: [
+          'FRAMEBASE_INVENTORY {"id":"a","created":"2024-03-02T10:00:00+08:00","mediaType":"photo","originalBytes":100,"livePhoto":true,"raw":false}',
+          'FRAMEBASE_INVENTORY {"id":"b","created":"2024-04-03T10:00:00+08:00","mediaType":"video","originalBytes":200,"livePhoto":false,"raw":false}',
+          'FRAMEBASE_INVENTORY {"id":"c","created":"2023-12-04T10:00:00+08:00","mediaType":"photo","originalBytes":300,"livePhoto":false,"raw":true}',
+        ].join("\n"), stderr: "" };
+      },
+    });
+    const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") });
+    assert.equal(result.status, "ready");
+    assert.equal(result.total.itemCount, 3);
+    assert.equal(result.total.originalBytes, 600);
+    assert.deepEqual(result.years.map(item => [item.key, item.itemCount]), [["2024", 2], ["2023", 1]]);
+    assert.deepEqual(result.quarters.map(item => item.key), ["2024-Q2", "2024-Q1", "2023-Q4"]);
+    assert.deepEqual(result.months.map(item => item.key), ["2024-04", "2024-03", "2023-12"]);
+    const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1");
+    assert.ok(inventoryCall.args.includes("--only-print-filenames"));
+    assert.equal(inventoryCall.args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

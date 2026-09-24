@@ -21,6 +21,7 @@ type IcloudConfig = {
   updatedAt: string | null;
   scan?: { scannedAt: string | null; sampleCount: number; samples: Array<{ name: string; extension: string; mediaType: "photo" | "video" }> };
   backup?: { completedAt: string | null; fileCount: number; files: Array<{ name: string; relativePath: string; extension: string; mediaType: "photo" | "video"; size: number; sha256: string | null }> };
+  timeline?: TimelineState;
   fullBackup?: FullBackupState;
   fullManifest?: { updatedAt: string | null; fileCount: number };
   releasePlan?: ReleasePlan | null;
@@ -32,7 +33,12 @@ type FullBackupState = {
   status: "idle" | "planning" | "downloading" | "verifying" | "paused" | "cancelled" | "completed" | "failed";
   message: string; startedAt: string | null; updatedAt: string | null; completedAt: string | null; phase: string; currentLibrary: string | null;
   planned: number; downloaded: number; verified: number; skipped: number; failed: number; photoCount: number; videoCount: number; verifiedBytes: number; manifestFileCount: number;
+  ranges: BackupRange[];
 };
+type TimelineBucket = { key: string; itemCount: number; photoCount: number; videoCount: number; livePhotoCount: number; rawCount: number; originalBytes: number };
+type TimelineState = { scannedAt: string | null; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
+type BackupRange = { key: string; label: string; start: string; end: string };
+type TimelineGranularity = "years" | "quarters" | "months";
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
 const activeAuthStates = new Set<AuthState["status"]>(["starting", "waiting_password", "verifying", "waiting_mfa"]);
@@ -51,6 +57,8 @@ function IcloudCenter({ username }: { username: string }) {
   const [mfaCode, setMfaCode] = useState("");
   const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | "release" | null>(null);
   const [releaseConfirmation, setReleaseConfirmation] = useState("");
+  const [timelineGranularity, setTimelineGranularity] = useState<TimelineGranularity>("years");
+  const [selectedPeriods, setSelectedPeriods] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -211,18 +219,42 @@ function IcloudCenter({ username }: { username: string }) {
     finally { setBusy(null); }
   }
 
-  async function controlFullBackup(action: "start" | "resume" | "pause" | "cancel") {
-    if (action === "start" && !window.confirm("将开始备份当前用户 iCloud 中的全部图片和视频原文件。任务不会删除或移动任何云端内容；可以暂停并稍后继续。是否开始？")) return;
+  async function controlFullBackup(action: "start" | "resume" | "pause" | "cancel", ranges: BackupRange[] = []) {
+    if (action === "start" && !window.confirm(ranges.length ? `将增量备份所选的 ${ranges.length} 个时间范围，包含图片、视频、Live Photo 和 RAW 原件。不会删除或移动云端内容，是否开始？` : "将开始备份当前用户 iCloud 中的全部图片和视频原文件。任务不会删除或移动任何云端内容；可以暂停并稍后继续。是否开始？")) return;
     if (action === "cancel" && !window.confirm("取消任务会停止当前下载，但保留已下载文件和已验证清单。是否取消？")) return;
     setBusy("full"); setError(""); setMessage("");
     try {
-      const response = await fetch(`/api/icloud/backup/full/${action}`, { method: "POST" });
+      const response = await fetch(`/api/icloud/backup/full/${action}`, { method: "POST", headers: action === "start" || action === "resume" ? { "Content-Type": "application/json" } : undefined, body: action === "start" || action === "resume" ? JSON.stringify({ ranges }) : undefined });
       const data = await response.json() as { fullBackup?: FullBackupState; error?: string };
       if (!response.ok) throw new Error(data.error || "无法更新完整备份任务");
       if (data.fullBackup) setConfig(current => current ? { ...current, fullBackup: data.fullBackup } : current);
       setMessage(action === "pause" ? "正在安全暂停任务…" : action === "cancel" ? "正在安全取消任务…" : "完整增量备份已进入后台运行。可留在此页查看进度。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法更新完整备份任务"); }
     finally { setBusy(null); }
+  }
+
+  async function scanTimeline() {
+    setBusy("scan"); setError(""); setMessage("");
+    try {
+      const response = await fetch("/api/icloud/timeline", { method: "POST" });
+      const data = await response.json() as { timeline?: TimelineState; timelineResult?: { status: string; message: string }; error?: string };
+      if (!response.ok) throw new Error(data.error || "无法读取 iCloud 时间统计");
+      if (data.timeline) setConfig(current => current ? { ...current, timeline: data.timeline } : current);
+      setSelectedPeriods([]);
+      if (data.timelineResult?.status === "ready") setMessage(data.timelineResult.message); else setError(data.timelineResult?.message || "时间统计失败，请重新验证连接。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取 iCloud 时间统计"); }
+    finally { setBusy(null); }
+  }
+
+  function periodRange(key: string): BackupRange {
+    let year: number; let startMonth: number; let monthCount: number; let label: string;
+    if (timelineGranularity === "years") { year = Number(key); startMonth = 1; monthCount = 12; label = `${year} 年`; }
+    else if (timelineGranularity === "quarters") { const match = /^(\d{4})-Q([1-4])$/.exec(key)!; year = Number(match[1]); startMonth = (Number(match[2]) - 1) * 3 + 1; monthCount = 3; label = `${year} 年第 ${match[2]} 季度`; }
+    else { const [yearText, monthText] = key.split("-"); year = Number(yearText); startMonth = Number(monthText); monthCount = 1; label = `${year} 年 ${startMonth} 月`; }
+    const endBase = new Date(Date.UTC(year, startMonth - 1 + monthCount, 1));
+    endBase.setUTCSeconds(endBase.getUTCSeconds() - 1);
+    const pad = (value: number) => String(value).padStart(2, "0");
+    return { key, label, start: `${year}-${pad(startMonth)}-01T00:00:00`, end: `${endBase.getUTCFullYear()}-${pad(endBase.getUTCMonth() + 1)}-${pad(endBase.getUTCDate())}T23:59:59` };
   }
 
   async function createReleasePlan() {
@@ -261,6 +293,7 @@ function IcloudCenter({ username }: { username: string }) {
 
   const readyForConnection = Boolean(config?.backupDirectory);
   const connectionConfigured = Boolean(config?.appleAccount);
+  const timelineBuckets = config?.timeline?.[timelineGranularity] || [];
   return <main className={styles.page}>
     <div className="route-theme"><ThemeSelector /></div>
     <header className={styles.topbar}>
@@ -320,7 +353,17 @@ function IcloudCenter({ username }: { username: string }) {
       </article>
 
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>4</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；再次运行只补充变化，并复核本地 SHA-256。</p></div></div>
+        <div className={styles.cardHead}><span>4</span><div><h2>按时间统计与选择</h2><p>只读获取拍摄时间、类型和原始资源大小，可按年、季度或月份选择增量备份范围。</p></div></div>
+        <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button></div>
+        {config?.timeline?.scannedAt && <>
+          <div className={styles.timelineTabs}><button className={timelineGranularity === "years" ? styles.active : ""} onClick={() => { setTimelineGranularity("years"); setSelectedPeriods([]); }}>按年份</button><button className={timelineGranularity === "quarters" ? styles.active : ""} onClick={() => { setTimelineGranularity("quarters"); setSelectedPeriods([]); }}>每 3 个月</button><button className={timelineGranularity === "months" ? styles.active : ""} onClick={() => { setTimelineGranularity("months"); setSelectedPeriods([]); }}>按月份</button></div>
+          <div className={styles.timelineTable}><div className={styles.timelineRow}><span>选择</span><strong>时间</strong><span>图片</span><span>视频</span><span>Live Photo</span><span>RAW</span><span>原始大小</span></div>{timelineBuckets.map(bucket => <label className={styles.timelineRow} key={bucket.key}><input type="checkbox" checked={selectedPeriods.includes(bucket.key)} onChange={() => setSelectedPeriods(current => current.includes(bucket.key) ? current.filter(key => key !== bucket.key) : [...current, bucket.key])} /><strong>{periodRange(bucket.key).label}</strong><span>{bucket.photoCount}</span><span>{bucket.videoCount}</span><span>{bucket.livePhotoCount}</span><span>{bucket.rawCount}</span><span>{formatBytes(bucket.originalBytes)}</span></label>)}</div>
+          <div className={styles.timelineActions}><span>已选择 {selectedPeriods.length} 个时间范围</span><button className={styles.primary} onClick={() => void controlFullBackup("start", selectedPeriods.map(periodRange))} disabled={busy !== null || selectedPeriods.length === 0 || fullBackupActive}>备份所选范围</button></div>
+        </>}
+      </article>
+
+      <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
+        <div className={styles.cardHead}><span>5</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；再次运行只补充变化，并复核本地 SHA-256。</p></div></div>
         <div className={styles.safetyBanner}><strong>安全边界</strong><span>此任务不带任何云端删除参数。暂停或取消只会停止本机任务，已下载文件会保留。</span></div>
         <div className={styles.fullStatus}>
           <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? "任务运行中" : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>
@@ -338,7 +381,7 @@ function IcloudCenter({ username }: { username: string }) {
       </article>
 
       <article className={`${styles.card} ${config?.fullBackup?.status !== "completed" ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>5</span><div><h2>iCloud 容量释放</h2><p>先重新复核本地清单，再进入独立确认；任何云端删除都不与备份按钮绑定。</p></div></div>
+        <div className={styles.cardHead}><span>6</span><div><h2>iCloud 容量释放</h2><p>先重新复核本地清单，再进入独立确认；任何云端删除都不与备份按钮绑定。</p></div></div>
         <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>icloudpd 不能按 SHA-256 清单精确指定云端对象，因此自动删除保持锁定，避免误删刚上传但尚未备份的新项目。</span></div>
         {config?.releasePlan ? <div className={styles.fullStatus}>
           <div><strong>{config.releasePlan.status === "confirmed" ? "本地副本已确认" : config.releasePlan.status === "ready" ? "释放计划待确认" : "释放计划被阻止"}</strong><span>{config.releasePlan.message}</span></div>

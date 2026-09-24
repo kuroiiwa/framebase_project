@@ -28,12 +28,12 @@ function safeMessage(error) {
   return { status: "error", message: "无法验证 iCloud 会话，请稍后重试。" };
 }
 
-function spawnInteractive(executablePath, args) {
+function spawnInteractive(executablePath, args, options = {}) {
   return spawnPty(executablePath, args, {
     name: "xterm-color",
     cols: 120,
     rows: 30,
-    env: process.env,
+    env: { ...process.env, ...(options.env || {}) },
     useConpty: true,
   });
 }
@@ -84,10 +84,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
   const authJobs = new Map();
   const sessionSecrets = new Map();
 
-  function runWithRuntimePassword(args, password, timeout = 120_000, signal) {
+  function runWithRuntimePassword(args, password, timeout = 120_000, signal, processOptions = {}) {
     return new Promise((resolve, reject) => {
       let child;
-      try { child = spawnProcess(executablePath, args); }
+      try { child = spawnProcess(executablePath, args, processOptions); }
       catch (error) { reject(error); return; }
       let output = "";
       let settled = false;
@@ -336,7 +336,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], signal, onProgress = () => undefined }) {
+  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], ranges = [], signal, onProgress = () => undefined }) {
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", files: [], providerInfo };
     const password = sessionSecrets.get(jobKey);
@@ -368,6 +368,9 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       return { absolutePath, relativePath: pathWithinBackup.split("\\").join("/"), extension, library };
     }).filter(Boolean);
     const previousByPath = new Map(previousFiles.map(item => [item.relativePath, item]));
+    const safeRanges = Array.isArray(ranges) ? ranges.filter(item => item && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.start) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.end)).slice(0, 60) : [];
+    const requestedRanges = safeRanges.length ? safeRanges : [{ key: "all", label: "全部时间", start: null, end: null }];
+    const rangeArgs = range => range.start ? ["--skip-created-before", range.start, "--skip-created-after", range.end] : [];
     const listLocalMedia = async (directory, plannedByPath) => {
       const files = [];
       for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -391,27 +394,30 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
       const libraries = [null, ...namedLibraries];
       const planByPath = new Map();
-      const activeLibraries = [];
+      const activeOperations = [];
       for (const library of libraries) {
-        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
-        const libraryArgs = library ? ["--library", library] : [];
-        const result = await run([...mediaArgs, ...libraryArgs, "--only-print-filenames"], 30 * 60_000);
-        const items = parsePaths(result.stdout, library);
-        if (items.length > 0) activeLibraries.push(library);
-        for (const item of items) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
-        await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", planned: planByPath.size, message: `已规划 ${planByPath.size} 个媒体文件。` });
+        for (const range of requestedRanges) {
+          if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+          const libraryArgs = library ? ["--library", library] : [];
+          const result = await run([...mediaArgs, ...libraryArgs, ...rangeArgs(range), "--only-print-filenames"], 30 * 60_000);
+          const items = parsePaths(result.stdout, library);
+          if (items.length > 0) activeOperations.push({ library, range });
+          for (const item of items) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
+          await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", planned: planByPath.size, message: `已规划 ${planByPath.size} 个媒体文件（${range.label || range.key}）。` });
+        }
       }
       const plan = [...planByPath.values()];
       let completedLibraries = 0;
-      for (const library of activeLibraries) {
+      for (const operation of activeOperations) {
+        const { library, range } = operation;
         if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
         const libraryArgs = library ? ["--library", library] : [];
-        const downloadArgs = [...mediaArgs, ...libraryArgs];
+        const downloadArgs = [...mediaArgs, ...libraryArgs, ...rangeArgs(range)];
         if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
-        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, message: `正在增量备份${library ? `图库“${library}”` : "主图库"}…` });
+        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, message: `正在增量备份 ${range.label || range.key} · ${library ? `图库“${library}”` : "主图库"}…` });
         await run(downloadArgs, 24 * 60 * 60_000, 8 * 1024 * 1024);
         completedLibraries += 1;
-        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, downloaded: Math.round(plan.length * completedLibraries / activeLibraries.length), message: "当前图库下载阶段已完成。" });
+        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, downloaded: Math.round(plan.length * completedLibraries / activeOperations.length), message: "当前时间范围下载阶段已完成。" });
       }
       const verificationPlan = await listLocalMedia(backupDirectory, planByPath);
       if (verificationPlan.length === 0) return { status: "empty", message: "备份目录和 iCloud 下载计划中都没有找到图片或视频。", files: [], planned: 0, providerInfo };
@@ -446,6 +452,69 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) return { status: "aborted", message: "备份任务已安全停止，可稍后从本地已有文件继续。", files: [], providerInfo };
       return { ...safeMessage(error), files: [], providerInfo };
+    }
+  }
+
+  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory }) {
+    const providerInfo = await info();
+    if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", providerInfo, years: [], quarters: [], months: [] };
+    const password = sessionSecrets.get(jobKey);
+    const baseArgs = [
+      "--log-level", "error", "--no-progress-bar", "--domain", domain,
+      "--password-provider", password ? "console" : "parameter", "--mfa-provider", "console",
+      "--cookie-directory", sessionDirectory, "--directory", backupDirectory, "--username", appleAccount,
+      "--size", "original", "--live-photo-size", "original", "--align-raw", "original", "--only-print-filenames",
+    ];
+    const inventoryEnv = { ...process.env, FRAMEBASE_INVENTORY_JSON: "1" };
+    const runInventory = args => password
+      ? runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env: inventoryEnv })
+      : runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env: inventoryEnv });
+    const empty = key => ({ key, photoCount: 0, videoCount: 0, livePhotoCount: 0, rawCount: 0, originalBytes: 0, itemCount: 0 });
+    const increment = (map, key, item) => {
+      const bucket = map.get(key) || empty(key);
+      bucket.itemCount += 1;
+      bucket.originalBytes += Math.max(0, Number(item.originalBytes) || 0);
+      if (item.mediaType === "video") bucket.videoCount += 1; else bucket.photoCount += 1;
+      if (item.livePhoto) bucket.livePhotoCount += 1;
+      if (item.raw) bucket.rawCount += 1;
+      map.set(key, bucket);
+    };
+    try {
+      const libraryArgs = baseArgs.filter(argument => argument !== "--only-print-filenames");
+      const librariesResult = password
+        ? await runWithRuntimePassword([...libraryArgs, "--list-libraries"], password, 180_000)
+        : await runCommand(executablePath, [...libraryArgs, "--list-libraries"], { timeout: 180_000, maxBuffer: 1024 * 1024 });
+      const libraries = [...new Set(String(librariesResult.stdout || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
+      const targets = libraries.length ? libraries.slice(0, 32) : [null];
+      const itemsById = new Map();
+      for (const library of targets) {
+        const result = await runInventory([...baseArgs, ...(library ? ["--library", library] : [])]);
+        for (const line of String(result.stdout || "").split(/\r?\n/)) {
+          if (!line.startsWith("FRAMEBASE_INVENTORY ")) continue;
+          try {
+            const item = JSON.parse(line.slice("FRAMEBASE_INVENTORY ".length));
+            if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, item);
+          } catch { /* Ignore malformed provider output without exposing it. */ }
+        }
+      }
+      const years = new Map(); const quarters = new Map(); const months = new Map();
+      for (const item of itemsById.values()) {
+        const created = new Date(item.created);
+        if (Number.isNaN(created.getTime())) continue;
+        const year = created.getFullYear();
+        if (year < 1900 || year > 2200) continue;
+        const month = created.getMonth() + 1;
+        increment(years, String(year), item);
+        increment(quarters, `${year}-Q${Math.floor((month - 1) / 3) + 1}`, item);
+        increment(months, `${year}-${String(month).padStart(2, "0")}`, item);
+      }
+      const newestFirst = map => [...map.values()].sort((a, b) => b.key.localeCompare(a.key));
+      const totals = new Map();
+      for (const item of itemsById.values()) increment(totals, "total", item);
+      const total = totals.get("total") || empty("total");
+      return { status: "ready", message: `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), providerInfo };
+    } catch (error) {
+      return { ...safeMessage(error), years: [], quarters: [], months: [], providerInfo };
     }
   }
 
@@ -564,5 +633,5 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     return publicAuthState(job);
   }
 
-  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, backupRecent, backupAll, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
+  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, scanTimeline, backupRecent, backupAll, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
 }

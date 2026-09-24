@@ -394,7 +394,7 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, backup, fullBackupStored, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
+    const [config, scan, backup, fullBackupStored, timeline, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readTimeline(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
     if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
       fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
@@ -403,6 +403,7 @@ async function handleIcloud(request, response, url) {
       ...config,
       scan,
       backup,
+      timeline,
       fullBackup,
       fullManifest: { updatedAt: fullBackup.updatedAt, fileCount: fullBackup.manifestFileCount },
       releasePlan,
@@ -447,6 +448,16 @@ async function handleIcloud(request, response, url) {
     const config = await icloud.recordScan(current.username, scanResult);
     return json(response, 200, { ...config, scanResult: { status: scanResult.status, message: scanResult.message } });
   }
+  if (request.method === "POST" && url.pathname === "/api/icloud/timeline") {
+    if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "备份任务运行时不能刷新时间统计。" });
+    const context = await icloud.connectionContext(current.username);
+    const result = await icloudProvider.scanTimeline({ ...context, jobKey: current.username });
+    if (result.status !== "ready") {
+      if (result.status === "needs_auth") await icloud.recordConnectionCheck(current.username, result);
+      return json(response, 200, { timeline: await icloud.readTimeline(current.username), timelineResult: { status: result.status, message: result.message } });
+    }
+    return json(response, 200, { timeline: await icloud.recordTimeline(current.username, result), timelineResult: { status: result.status, message: result.message } });
+  }
   if (request.method === "POST" && url.pathname === "/api/icloud/backup/test") {
     const previousBackup = await icloud.readBackup(current.username);
     if (previousBackup.completedAt) return json(response, 409, { error: "测试备份已经完成。为避免扩大下载范围，不能重复执行。" });
@@ -472,6 +483,9 @@ async function handleIcloud(request, response, url) {
     if (config.connectionStatus !== "connected") return json(response, 409, { error: "请先验证 iCloud 登录会话。" });
     const previousManifest = await icloud.readFullManifest(current.username);
     const previousState = await icloud.readFullBackup(current.username);
+    const body = await readJsonBody(request);
+    const submittedRanges = Array.isArray(body.ranges) ? body.ranges.filter(item => item && typeof item.key === "string" && typeof item.label === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.start) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.end)).slice(0, 60) : [];
+    const ranges = url.pathname.endsWith("/resume") && submittedRanges.length === 0 ? previousState.ranges : submittedRanges;
     const controller = new AbortController();
     const job = { controller, stopAs: "paused" };
     icloudFullBackupJobs.set(current.username, job);
@@ -481,11 +495,12 @@ async function handleIcloud(request, response, url) {
       status: "planning", phase: "planning", message: previousManifest.files.length ? "正在检查增量变化并准备继续…" : "正在读取完整 iCloud 图库清单…",
       startedAt, completedAt: null, currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0,
       photoCount: 0, videoCount: 0, verifiedBytes: 0,
+      ranges,
     });
     void (async () => {
       try {
         const result = await icloudProvider.backupAll({
-          ...context, jobKey: current.username, previousFiles: previousManifest.files, signal: controller.signal,
+          ...context, jobKey: current.username, previousFiles: previousManifest.files, ranges, signal: controller.signal,
           onProgress: update => icloud.writeFullBackup(current.username, update),
         });
         if (result.status === "aborted") {

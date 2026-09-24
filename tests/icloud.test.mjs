@@ -48,6 +48,9 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     assert.equal((await manager.readFullBackup("gabri")).status, "verifying");
     assert.equal((await manager.readFullManifest("gabri")).files.length, 2);
     assert.equal((await manager.readFullManifest("alice")).files.length, 0);
+    await manager.recordTimeline("gabri", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }, years: [{ key: "2026", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }], quarters: [{ key: "2026-Q3", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }], months: [{ key: "2026-09", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }] });
+    assert.equal((await manager.readTimeline("gabri")).months[0].key, "2026-09");
+    assert.equal((await manager.readTimeline("alice")).years.length, 0);
 
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));
@@ -105,6 +108,9 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /安全备份最近 3 个/);
   assert.match(page, /完整增量备份/);
   assert.match(page, /开始完整备份/);
+  assert.match(page, /按时间统计与选择/);
+  assert.match(page, /每 3 个月/);
+  assert.match(page, /备份所选范围/);
   assert.match(page, /生成只读释放计划/);
   assert.match(page, /自动删除保持锁定/);
   assert.match(page, /视频库与独立图片库按格式隔离管理/);
@@ -118,6 +124,8 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /icloudProvider\.backupRecent/);
   assert.match(server, /\/api\/icloud\/backup\/test/);
   assert.match(server, /icloudProvider\.backupAll/);
+  assert.match(server, /icloudProvider\.scanTimeline/);
+  assert.match(server, /\/api\/icloud\/timeline/);
   assert.match(server, /\/api\/icloud\/backup\/full\/pause/);
   assert.match(server, /\/api\/icloud\/release\/plan/);
   assert.match(server, /icloud\.confirmReleasePlan/);
