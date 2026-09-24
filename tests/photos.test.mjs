@@ -27,6 +27,10 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(icloud, /<a className=\{styles\.backLink\} href="\/photos">返回图片库<\/a>/);
   assert.match(photos, /import\("heic2any"\)/);
   assert.match(photos, /HEIC 预览生成失败/);
+  assert.match(photos, /IntersectionObserver/);
+  assert.match(photos, /createImageBitmap/);
+  assert.match(photos, /activeThumbnailJobs < 1/);
+  assert.match(photoStyles, /content-visibility:auto/);
   assert.doesNotMatch(photos, /createWritable\(/);
   assert.doesNotMatch(photos, /removeEntry\(/);
   assert.match(videos, /href="\/photos"/);

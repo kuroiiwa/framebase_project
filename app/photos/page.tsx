@@ -2,7 +2,7 @@
 
 /* eslint-disable @next/next/no-img-element, @next/next/no-html-link-for-pages -- previews use local Blob URLs; hard navigation avoids losing File System Access state in the compatibility router. */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
 import ThemeSelector from "../theme-selector";
@@ -43,6 +43,28 @@ const BROWSER_PREVIEW_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp",
 const HEIC_PREVIEW_EXTENSIONS = new Set(["heic", "heif"]);
 const SOURCES_KEY = "photo-source-folders-v1";
 const PAGE_SIZE = 48;
+const THUMBNAIL_WIDTH = 640;
+const thumbnailQueue: Array<() => void> = [];
+let activeThumbnailJobs = 0;
+
+function drainThumbnailQueue() {
+  while (activeThumbnailJobs < 1 && thumbnailQueue.length) {
+    activeThumbnailJobs += 1;
+    thumbnailQueue.shift()?.();
+  }
+}
+
+function scheduleThumbnail<T>(task: () => Promise<T>) {
+  return new Promise<T>((resolve, reject) => {
+    thumbnailQueue.push(() => {
+      void task().then(resolve, reject).finally(() => {
+        activeThumbnailJobs -= 1;
+        drainThumbnailQueue();
+      });
+    });
+    drainThumbnailQueue();
+  });
+}
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -132,15 +154,38 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
   return found;
 }
 
-async function createPreviewObjectUrl(item: PhotoItem) {
+async function createPreviewBlob(item: PhotoItem) {
   const file = await item.handle.getFile();
   if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
     const { default: heic2any } = await import("heic2any");
     const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.86 });
-    return URL.createObjectURL(Array.isArray(converted) ? converted[0] : converted);
+    return Array.isArray(converted) ? converted[0] : converted;
   }
-  if (BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) return URL.createObjectURL(file);
+  if (BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) return file;
   return null;
+}
+
+async function createPreviewObjectUrl(item: PhotoItem) {
+  const blob = await createPreviewBlob(item);
+  return blob ? URL.createObjectURL(blob) : null;
+}
+
+async function createThumbnailObjectUrl(item: PhotoItem) {
+  return scheduleThumbnail(async () => {
+    const blob = await createPreviewBlob(item);
+    if (!blob) return null;
+    const bitmap = await createImageBitmap(blob, { resizeWidth: THUMBNAIL_WIDTH, resizeQuality: "high" });
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+      const thumbnail = await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("thumbnail_failed")), "image/webp", 0.82));
+      return URL.createObjectURL(thumbnail);
+    } finally {
+      bitmap.close();
+    }
+  });
 }
 
 function previewStatus(extension: string, failed: boolean) {
@@ -151,20 +196,38 @@ function previewStatus(extension: string, failed: boolean) {
 }
 
 function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [nearViewport, setNearViewport] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
+    const button = buttonRef.current;
+    if (!button) return;
+    if (!("IntersectionObserver" in window)) {
+      queueMicrotask(() => setNearViewport(true));
+      return;
+    }
+    const observer = new IntersectionObserver(entries => {
+      if (!entries.some(entry => entry.isIntersecting)) return;
+      setNearViewport(true);
+      observer.disconnect();
+    }, { rootMargin: "500px 0px" });
+    observer.observe(button);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!nearViewport) return;
     let cancelled = false;
     let objectUrl = "";
-    void createPreviewObjectUrl(item).then(createdUrl => {
+    void createThumbnailObjectUrl(item).then(createdUrl => {
       if (!createdUrl) return;
       if (cancelled) URL.revokeObjectURL(createdUrl);
       else { objectUrl = createdUrl; setUrl(createdUrl); }
     }).catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [item]);
-  return <button className={styles.thumb} onClick={onOpen} aria-label={`查看 ${item.name}`}>
-    {url && !failed ? <img src={url} alt="" loading="lazy" onError={() => setFailed(true)} /> : <span><b>{item.extension.toUpperCase()}</b><small>{previewStatus(item.extension, failed)}</small></span>}
+  }, [item, nearViewport]);
+  return <button ref={buttonRef} className={styles.thumb} onClick={onOpen} aria-label={`查看 ${item.name}`}>
+    {url && !failed ? <img src={url} alt="" loading="lazy" decoding="async" onError={() => setFailed(true)} /> : <span><b>{item.extension.toUpperCase()}</b><small>{nearViewport ? previewStatus(item.extension, failed) : "接近时加载预览"}</small></span>}
   </button>;
 }
 
