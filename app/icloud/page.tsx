@@ -239,7 +239,8 @@ function IcloudCenter({ username }: { username: string }) {
 
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>3</span><div><h2>扫描、备份与验证</h2><p>连接后先只读统计，再由当前用户选择测试备份或完整增量备份。</p></div></div>
-        <div className={styles.capabilities}><div><strong>iCloud 照片与视频</strong><span>支持只读扫描和安全备份</span></div><div><strong>FrameBase 主媒体库</strong><span>当前仅管理视频；图片浏览与整理尚未开放</span></div></div>
+        <div className={styles.capabilities}><div><strong>iCloud 照片与视频</strong><span>支持只读扫描和安全备份</span></div><div><strong>FrameBase 媒体库</strong><span>视频库与独立图片库按格式隔离管理</span></div></div>
+        <p className={styles.libraryHint}>同一备份目录可以分别加入 <Link href="/photos">独立图片库</Link> 和 <Link href="/">视频库</Link>；图片与视频索引会按格式自动分流。</p>
         <ul><li>测试备份硬性限制为最近 3 个项目</li><li>保存原始尺寸，完成后验证本地文件存在且非空</li><li>不会传入云端删除、移动或自动清理参数</li></ul>
         <div className={styles.actions}><button onClick={() => void scanRecent()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在只读扫描…" : "扫描最近 10 个项目"}</button><button className={styles.primary} onClick={() => void backupRecent()} disabled={busy !== null || config?.connectionStatus !== "connected" || !config?.scan?.sampleCount || Boolean(config?.backup?.completedAt)}>{busy === "backup" ? "正在安全备份与验证…" : config?.backup?.completedAt ? "测试备份已完成" : "安全备份最近 3 个"}</button></div>
         {config?.scan?.scannedAt && <div className={styles.scanResult}>

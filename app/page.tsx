@@ -1079,6 +1079,7 @@ function Library({ username }: { username: string }) {
         <span className="brand"><span className="brand-mark">F</span> Framebase</span>
         <label className="search"><span>⌕</span><input value={query} onChange={event => { setQuery(event.target.value); setCurrentPage(1); }} placeholder="搜索名称或路径…" aria-label="搜索视频" /></label>
         <div className="header-actions">
+          <a className="lan-link" href="/photos" title="打开独立图片库">图片库</a>
           <a className="lan-link" href="/icloud" title="管理当前用户的 iCloud 本地备份">iCloud 备份</a>
           <a className="lan-link" href="/lan" title="设置手机局域网只读访问">局域网</a>
           <span className="account-name">{username}</span><button className="account-logout" onClick={() => void signOut()}>退出</button>

@@ -66,7 +66,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /开始 Apple 登录/);
   assert.match(page, /扫描最近 10 个项目/);
   assert.match(page, /安全备份最近 3 个/);
-  assert.match(page, /当前仅管理视频/);
+  assert.match(page, /视频库与独立图片库按格式隔离管理/);
   assert.match(page, /← 返回视频库/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
