@@ -7,10 +7,15 @@ import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import { createPowerManager, isLocalAdmin, validatePowerRequest } from "./framebase-power.mjs";
+import { createAccounts } from "./framebase-accounts.mjs";
+import { createIcloudManager } from "./framebase-icloud.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const configPath = join(projectRoot, ".framebase-lan.json");
 const thumbnailDirectory = join(projectRoot, ".framebase-thumbnails");
+const accounts = createAccounts(join(projectRoot, ".framebase-accounts.json"));
+const icloud = createIcloudManager({ projectRoot });
+const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
 const appPort = Number(process.env.FRAMEBASE_APP_PORT || 3001);
 const appHost = "127.0.0.1";
@@ -21,17 +26,88 @@ const mimeTypes = {
   flv: "video/x-flv", mpeg: "video/mpeg", mpg: "video/mpeg",
 };
 
-let indexCache = { signature: "", expires: 0, videos: [], byId: new Map() };
-let indexingPromise = null;
+const indexCaches = new Map();
+const indexingPromises = new Map();
 const pairingAttempts = new Map();
-const powerManager = createPowerManager({ path: join(projectRoot, ".framebase-power.json"), readPairingToken: async () => (await readConfig()).accessToken });
+const powerManagers = new Map();
+function powerManagerFor(username) {
+  if (!powerManagers.has(username)) powerManagers.set(username, createPowerManager({
+    path: join(projectRoot, username === "gabri" ? ".framebase-power.json" : `.framebase-power-${username}.json`),
+    readPairingToken: async () => (await readConfig(username)).accessToken,
+  }));
+  return powerManagers.get(username);
+}
+
+function requirePc(request, response) {
+  const current = isLocalAdmin(request) ? accounts.session(request) : null;
+  if (!current) json(response, 401, { error: "请先在电脑端登录账户。" });
+  else if (request.method !== "GET" && request.method !== "HEAD" && request.headers.origin !== `http://${request.headers.host}`) {
+    json(response, 403, { error: "请从 Framebase 页面发起操作。" });
+    return null;
+  }
+  return current;
+}
+
+function mobileSession(request) {
+  const token = cookieValue(request, "framebase_lan_session");
+  const current = mobileSessions.get(token);
+  if (!current || !accounts.hasSession(current.pcToken)) return null;
+  return current;
+}
+
+async function handleAccount(request, response, url) {
+  if (!isLocalAdmin(request)) return json(response, 403, { error: "账户操作只能在这台电脑上进行。" });
+  if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
+  if (request.method === "GET" && url.pathname === "/api/account/session") {
+    const current = accounts.session(request);
+    const data = await accounts.read();
+    return json(response, 200, { user: current?.username || null, needsSetup: !data.users.some(item => item.username === "admin") });
+  }
+  if (request.method === "POST" && ["/api/account/setup", "/api/account/register", "/api/account/login"].includes(url.pathname)) {
+    const body = await readJsonBody(request);
+    const username = String(body.username || "").trim().toLowerCase();
+    const password = body.password;
+    const token = url.pathname === "/api/account/login" ? await accounts.login(username, password, request.socket.remoteAddress) : await accounts.register(username, password, url.pathname === "/api/account/setup");
+    const previous = accounts.logout(request);
+    if (previous) {
+      for (const [mobileToken, mobile] of mobileSessions) if (mobile.pcToken === previous.token) mobileSessions.delete(mobileToken);
+      powerManagers.get(previous.username)?.stop();
+    }
+    return json(response, 200, { user: username }, { "Set-Cookie": accounts.cookie(token) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/account/logout") {
+    const current = accounts.logout(request);
+    if (current) {
+      for (const [token, mobile] of mobileSessions) if (mobile.pcToken === current.token) mobileSessions.delete(token);
+      powerManagers.get(current.username)?.stop();
+    }
+    return json(response, 200, { ok: true }, { "Set-Cookie": "framebase_account=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
+  }
+  const current = requirePc(request, response);
+  if (!current) return;
+  if (request.method === "POST" && url.pathname === "/api/account/summary") {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.sources) || body.sources.length > 1000) return json(response, 400, { error: "源文件夹信息无效。" });
+    await accounts.updateSummary(current.username, body.sources);
+    return json(response, 200, { ok: true });
+  }
+  if (request.method === "GET" && url.pathname === "/api/account/users") {
+    if (current.username !== "admin") return json(response, 403, { error: "仅管理员可以查看。" });
+    const data = await accounts.read();
+    return json(response, 200, { users: data.users.map(({ username, sources, videoCount, totalSize }) => ({ username, sources, videoCount, totalSize })) });
+  }
+  return json(response, 405, { error: "不支持的操作。" });
+}
 
 async function handlePower(request, response, url) {
   try {
     validatePowerRequest(request);
-    const admin = isLocalAdmin(request);
-    const paired = isPaired(request, await readConfig());
+    const pc = isLocalAdmin(request) ? accounts.session(request) : null;
+    const mobile = mobileSession(request);
+    const admin = Boolean(pc);
+    const paired = Boolean(mobile);
     if (!admin && !paired) return json(response, 401, { error: "请先输入配对验证码进入视频库。" });
+    const powerManager = powerManagerFor((pc || mobile).username);
     const secret = cookieValue(request, "framebase_power_device");
     if (request.method === "GET" && url.pathname === "/api/lan/power") return json(response, 200, await powerManager.status(secret, admin));
     if (request.method !== "POST") return json(response, 405, { error: "不支持的操作。" });
@@ -45,29 +121,41 @@ function createPairingCode() {
   return String(randomBytes(4).readUInt32BE(0) % 1_000_000).padStart(6, "0");
 }
 
-async function readConfig() {
+function userConfigPath(username) { return join(projectRoot, `.framebase-lan-${username}.json`); }
+function userThumbnailDirectory(username) { return join(thumbnailDirectory, username); }
+
+async function readConfig(username) {
+  const path = userConfigPath(username);
   try {
-    const parsed = JSON.parse(await readFile(configPath, "utf8"));
+    let parsed;
+    let migrated = false;
+    try { parsed = JSON.parse(await readFile(path, "utf8")); }
+    catch (error) {
+      if (error.code !== "ENOENT" || username !== "gabri") throw error;
+      parsed = JSON.parse(await readFile(configPath, "utf8"));
+      migrated = true;
+    }
     const config = {
       accessToken: typeof parsed.accessToken === "string" && parsed.accessToken.length >= 16 ? parsed.accessToken : randomBytes(18).toString("base64url"),
       pairingCode: typeof parsed.pairingCode === "string" && /^\d{6}$/.test(parsed.pairingCode) ? parsed.pairingCode : createPairingCode(),
       videoFolders: Array.isArray(parsed.videoFolders) ? parsed.videoFolders.filter(value => typeof value === "string") : [],
     };
-    if (config.accessToken !== parsed.accessToken || config.pairingCode !== parsed.pairingCode) await saveConfig(config);
+    if (migrated || config.accessToken !== parsed.accessToken || config.pairingCode !== parsed.pairingCode) await saveConfig(username, config);
     return config;
   } catch {
     const config = { accessToken: randomBytes(18).toString("base64url"), pairingCode: createPairingCode(), videoFolders: [] };
-    await saveConfig(config);
+    await saveConfig(username, config);
     return config;
   }
 }
 
-async function saveConfig(config) {
-  await mkdir(dirname(configPath), { recursive: true });
-  const temporary = `${configPath}.tmp`;
+async function saveConfig(username, config) {
+  const path = userConfigPath(username);
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.tmp`;
   await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-  await rename(temporary, configPath);
-  indexCache.expires = 0;
+  await rename(temporary, path);
+  indexCaches.delete(username);
 }
 
 function isLoopback(address = "") {
@@ -98,10 +186,6 @@ function cookieValue(request, name) {
     if (key === name) return decodeURIComponent(value.join("="));
   }
   return "";
-}
-
-function isPaired(request, config) {
-  return safeEqual(cookieValue(request, "framebase_lan_session"), config.accessToken);
 }
 
 function videoId(path) {
@@ -144,19 +228,20 @@ async function walkVideos(root, directory, output) {
   }
 }
 
-async function buildIndex(force = false) {
+async function buildIndex(username, force = false) {
+  let indexCache = indexCaches.get(username) || { signature: "", expires: 0, videos: [], byId: new Map() };
   if (!force && indexCache.expires > 0) {
-    if (indexCache.expires <= Date.now() && !indexingPromise) {
-      void buildIndex(true).catch(error => {
+    if (indexCache.expires <= Date.now() && !indexingPromises.has(username)) {
+      void buildIndex(username, true).catch(error => {
         indexCache.expires = Date.now() + 20_000;
         console.error("后台更新视频索引失败", error);
       });
     }
     return indexCache;
   }
-  if (indexingPromise) return indexingPromise;
-  indexingPromise = (async () => {
-    const config = await readConfig();
+  if (indexingPromises.has(username)) return indexingPromises.get(username);
+  const indexingPromise = (async () => {
+    const config = await readConfig(username);
     const roots = await configuredRoots(config);
     const signature = roots.map(root => root.path).join("\n");
     if (!force && indexCache.signature === signature && indexCache.expires > Date.now()) return indexCache;
@@ -164,9 +249,11 @@ async function buildIndex(force = false) {
     for (const root of roots) await walkVideos(root, root.path, videos);
     videos.sort((a, b) => b.modified - a.modified);
     indexCache = { signature, expires: Date.now() + 20_000, videos, byId: new Map(videos.map(video => [video.id, video])) };
+    indexCaches.set(username, indexCache);
     return indexCache;
   })();
-  try { return await indexingPromise; } finally { indexingPromise = null; }
+  indexingPromises.set(username, indexingPromise);
+  try { return await indexingPromise; } finally { indexingPromises.delete(username); }
 }
 
 function accessUrls() {
@@ -215,19 +302,33 @@ function pickWindowsFolder(expectedSource = "") {
   return new Promise((resolvePromise, rejectPromise) => {
     const script = [
       "Add-Type -AssemblyName System.Windows.Forms",
+      "Add-Type -AssemblyName System.Drawing",
+      "$owner = New-Object System.Windows.Forms.Form",
+      "$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen",
+      "$owner.Size = New-Object System.Drawing.Size(1, 1)",
+      "$owner.ShowInTaskbar = $false",
+      "$owner.TopMost = $true",
+      "$owner.Opacity = 0",
+      "$owner.Show()",
+      "$owner.Activate()",
       "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
       "$name = $env:FRAMEBASE_EXPECTED_SOURCE",
       "$dialog.Description = if ($name) { '请选择与缓存来源“' + $name + '”对应的文件夹' } else { '请选择要共享给手机浏览的文件夹' }",
       "$dialog.ShowNewFolderButton = $false",
-      "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {",
+      "$result = $dialog.ShowDialog($owner)",
+      "if ($result -eq [System.Windows.Forms.DialogResult]::OK) {",
       "  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
       "  [Console]::Out.Write($dialog.SelectedPath)",
       "}",
       "$dialog.Dispose()",
+      "$owner.Close()",
+      "$owner.Dispose()",
     ].join("\n");
     execFile("powershell.exe", ["-NoLogo", "-NoProfile", "-STA", "-Command", script], {
       encoding: "utf8",
       env: { ...process.env, FRAMEBASE_EXPECTED_SOURCE: expectedSource },
+      timeout: 10 * 60 * 1000,
+      windowsHide: true,
     }, (error, stdout) => {
       if (error) return rejectPromise(error);
       resolvePromise(stdout.trim() || null);
@@ -235,8 +336,40 @@ function pickWindowsFolder(expectedSource = "") {
   });
 }
 
+function pickWindowsBackupFolder() {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const script = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "Add-Type -AssemblyName System.Drawing",
+      "$owner = New-Object System.Windows.Forms.Form",
+      "$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen",
+      "$owner.Size = New-Object System.Drawing.Size(1, 1)",
+      "$owner.ShowInTaskbar = $false",
+      "$owner.TopMost = $true",
+      "$owner.Opacity = 0",
+      "$owner.Show()",
+      "$owner.Activate()",
+      "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+      "$dialog.Description = '请选择 iCloud 备份的上级文件夹。FrameBase 会在其中创建按用户隔离的目录。'",
+      "$dialog.ShowNewFolderButton = $true",
+      "$result = $dialog.ShowDialog($owner)",
+      "if ($result -eq [System.Windows.Forms.DialogResult]::OK) {",
+      "  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+      "  [Console]::Out.Write($dialog.SelectedPath)",
+      "}",
+      "$dialog.Dispose()",
+      "$owner.Close()",
+      "$owner.Dispose()",
+    ].join("\n");
+    execFile("powershell.exe", ["-NoLogo", "-NoProfile", "-STA", "-Command", script], { encoding: "utf8", timeout: 10 * 60 * 1000, windowsHide: true }, (error, stdout) => {
+      if (error) return rejectPromise(error);
+      resolvePromise(stdout.trim() || null);
+    });
+  });
+}
+
 async function handleFolderPicker(request, response) {
-  if (!isLoopback(request.socket.remoteAddress)) return json(response, 403, { error: "文件夹选择窗口只能从这台电脑打开。" });
+  if (!requirePc(request, response)) return;
   if (request.method !== "POST") return json(response, 405, { error: "不支持的操作。" });
   if (process.platform !== "win32") return json(response, 501, { error: "自动选择文件夹目前仅支持 Windows，请手动输入完整路径。" });
   const body = await readJsonBody(request);
@@ -245,18 +378,39 @@ async function handleFolderPicker(request, response) {
   return json(response, 200, selectedPath ? { path: selectedPath } : { cancelled: true });
 }
 
-async function thumbnailAvailable(id) {
-  try { return (await stat(join(thumbnailDirectory, `${id}.webp`))).isFile(); } catch { return false; }
+async function handleIcloud(request, response, url) {
+  const current = requirePc(request, response);
+  if (!current) return;
+  if (request.method === "GET" && url.pathname === "/api/icloud/config") {
+    return json(response, 200, await icloud.read(current.username));
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/pick-folder") {
+    if (process.platform !== "win32") return json(response, 501, { error: "自动选择文件夹目前仅支持 Windows。" });
+    const selectedPath = await pickWindowsBackupFolder();
+    if (!selectedPath) return json(response, 200, { cancelled: true });
+    return json(response, 200, await icloud.configureBackupDirectory(current.username, selectedPath));
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/config") {
+    const body = await readJsonBody(request);
+    return json(response, 200, await icloud.configureBackupDirectory(current.username, body.path));
+  }
+  return json(response, 405, { error: "不支持的操作。" });
+}
+
+async function thumbnailAvailable(username, id) {
+  try { return (await stat(join(userThumbnailDirectory(username), `${id}.webp`))).isFile(); } catch { return false; }
 }
 
 async function handleConfig(request, response, url) {
-  if (!isLoopback(request.socket.remoteAddress)) return json(response, 403, { error: "共享设置只能在这台电脑上修改。" });
-  const config = await readConfig();
+  const current = requirePc(request, response);
+  if (!current) return;
+  const username = current.username;
+  const config = await readConfig(username);
   if (request.method === "GET") {
-    const index = await buildIndex();
+    const index = await buildIndex(username);
     const videoIndex = await Promise.all(index.videos.map(async video => ({
       id: video.id, sourceName: video.sourceName, path: video.path, size: video.size, modified: video.modified,
-      thumbnailAvailable: await thumbnailAvailable(video.id),
+      thumbnailAvailable: await thumbnailAvailable(username, video.id),
     })));
     return json(response, 200, { folders: await folderDetails(config), accessUrls: accessUrls(), pairingCode: config.pairingCode, videoCount: index.videos.length, videoIndex });
   }
@@ -272,27 +426,28 @@ async function handleConfig(request, response, url) {
     const existing = await Promise.all(config.videoFolders.map(async value => realpath(resolve(value)).catch(() => resolve(value))));
     if (!existing.some(value => value.toLocaleLowerCase() === canonicalPath.toLocaleLowerCase())) {
       config.videoFolders.push(canonicalPath);
-      await saveConfig(config);
+      await saveConfig(username, config);
     }
-    const index = await buildIndex(true);
+    const index = await buildIndex(username, true);
     return json(response, 200, { ok: true, videoCount: index.videos.length });
   }
   if (request.method === "DELETE") {
     const index = Number(url.searchParams.get("index"));
     if (!Number.isInteger(index) || index < 0 || index >= config.videoFolders.length) return json(response, 400, { error: "共享目录不存在。" });
     config.videoFolders.splice(index, 1);
-    await saveConfig(config);
-    const updated = await buildIndex(true);
+    await saveConfig(username, config);
+    const updated = await buildIndex(username, true);
     return json(response, 200, { ok: true, videoCount: updated.videos.length });
   }
   if (request.method === "POST" && url.pathname === "/api/lan/rescan") {
-    const index = await buildIndex(true);
+    const index = await buildIndex(username, true);
     return json(response, 200, { ok: true, videoCount: index.videos.length });
   }
   if (request.method === "POST" && url.pathname === "/api/lan/pairing-code") {
     config.pairingCode = createPairingCode();
     config.accessToken = randomBytes(18).toString("base64url");
-    await saveConfig(config);
+    await saveConfig(username, config);
+    for (const [token, mobile] of mobileSessions) if (mobile.username === username) mobileSessions.delete(token);
     pairingAttempts.clear();
     return json(response, 200, { ok: true, pairingCode: config.pairingCode });
   }
@@ -306,30 +461,38 @@ async function handlePairing(request, response) {
   const attempt = !previous || previous.resetAt <= Date.now() ? { count: 0, resetAt: Date.now() + 10 * 60_000 } : previous;
   if (attempt.count >= 8) return json(response, 429, { error: "验证码尝试次数过多，请十分钟后重试。" });
   const body = await readJsonBody(request);
-  const config = await readConfig();
-  if (typeof body.code !== "string" || !safeEqual(body.code.trim(), config.pairingCode)) {
+  const code = String(body.code || "").trim();
+  const sessions = accounts.activeSessions();
+  let matched;
+  for (const item of sessions) {
+    const config = await readConfig(item.username);
+    if (safeEqual(code, config.pairingCode)) { matched = item; break; }
+  }
+  if (!matched) {
     attempt.count += 1;
     pairingAttempts.set(address, attempt);
     return json(response, 401, { error: `验证码不正确，还可尝试 ${Math.max(0, 8 - attempt.count)} 次。` });
   }
   pairingAttempts.delete(address);
-  return json(response, 200, { ok: true }, { "Set-Cookie": `framebase_lan_session=${encodeURIComponent(config.accessToken)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` });
+  const token = randomBytes(32).toString("hex");
+  mobileSessions.set(token, { username: matched.username, pcToken: matched.token });
+  return json(response, 200, { ok: true }, { "Set-Cookie": `framebase_lan_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800` });
 }
 
 async function handleVideoList(request, response) {
-  const config = await readConfig();
-  if (!isPaired(request, config)) return json(response, 401, { error: "请输入电脑端显示的六位验证码。", codeRequired: true });
-  const index = await buildIndex();
+  const current = mobileSession(request);
+  if (!current) return json(response, 401, { error: "请输入当前电脑端用户显示的六位验证码。", codeRequired: true });
+  const index = await buildIndex(current.username);
   return json(response, 200, {
     videos: index.videos.map(video => ({ id: video.id, name: video.name, ext: video.ext, size: video.size, modified: video.modified, sourceName: video.sourceName, path: video.path, streamUrl: `/api/lan/videos/${video.id}/stream`, thumbnailUrl: `/api/lan/videos/${video.id}/thumbnail` })),
-    sourceCount: indexCache.signature ? indexCache.signature.split("\n").length : 0,
+    sourceCount: index.signature ? index.signature.split("\n").length : 0,
   });
 }
 
 async function handleVideoStream(request, response, id) {
-  const config = await readConfig();
-  if (!isPaired(request, config)) return json(response, 401, { error: "设备尚未配对。" });
-  const index = await buildIndex();
+  const current = mobileSession(request);
+  if (!current) return json(response, 401, { error: "设备尚未配对。" });
+  const index = await buildIndex(current.username);
   const video = index.byId.get(id);
   if (!video) return json(response, 404, { error: "视频不存在或共享目录已经变更。" });
   let info;
@@ -361,21 +524,25 @@ async function handleVideoStream(request, response, id) {
 }
 
 async function handleThumbnail(request, response, id) {
-  const config = await readConfig();
-  const index = await buildIndex();
+  const pc = isLocalAdmin(request) ? accounts.session(request) : null;
+  const mobile = mobileSession(request);
+  const current = request.method === "POST" ? pc : mobile;
+  if (!current) return json(response, 401, { error: "请先登录或配对。" });
+  const index = await buildIndex(current.username);
   if (!index.byId.has(id)) return json(response, 404, { error: "视频不存在。" });
-  const thumbnailPath = join(thumbnailDirectory, `${id}.webp`);
+  const directory = userThumbnailDirectory(current.username);
+  const thumbnailPath = join(directory, `${id}.webp`);
   if (request.method === "POST") {
     if (!isLoopback(request.socket.remoteAddress)) return json(response, 403, { error: "缩略图只能从电脑端同步。" });
+    if (request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
     if (request.headers["content-type"] !== "image/webp") return json(response, 415, { error: "只接受 WebP 缩略图。" });
     const data = await readBinaryBody(request);
     if (!data.length) return json(response, 400, { error: "缩略图为空。" });
-    await mkdir(thumbnailDirectory, { recursive: true });
+    await mkdir(directory, { recursive: true });
     await writeFile(thumbnailPath, data);
     return json(response, 200, { ok: true });
   }
   if (request.method !== "GET" && request.method !== "HEAD") return json(response, 405, { error: "不支持的操作。" });
-  if (!isPaired(request, config)) return json(response, 401, { error: "设备尚未配对。" });
   let info;
   try { info = await stat(thumbnailPath); } catch { return json(response, 404, { error: "缩略图尚未同步。" }); }
   response.writeHead(200, { "Content-Type": "image/webp", "Content-Length": info.size, "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" });
@@ -412,6 +579,8 @@ function proxyToApp(request, response, attempt = 0) {
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    if (url.pathname.startsWith("/api/account/")) return await handleAccount(request, response, url);
+    if (url.pathname === "/api/icloud/config" || url.pathname === "/api/icloud/pick-folder") return await handleIcloud(request, response, url);
     if (url.pathname === "/api/lan/power" || url.pathname.startsWith("/api/lan/power/")) return await handlePower(request, response, url);
     if (url.pathname === "/api/lan/config" || url.pathname === "/api/lan/rescan" || url.pathname === "/api/lan/pairing-code") return await handleConfig(request, response, url);
     if (url.pathname === "/api/lan/pick-folder") return await handleFolderPicker(request, response);
@@ -432,18 +601,16 @@ const appArguments = ["start", "--hostname", appHost, "--port", String(appPort)]
 const appProcess = spawn(process.execPath, [vinextCommand, ...appArguments], { cwd: projectRoot, env: process.env, stdio: "inherit" });
 
 server.listen(publicPort, "0.0.0.0", async () => {
-  const config = await readConfig();
   console.log(`\nFramebase: http://localhost:${publicPort}`);
   for (const url of accessUrls()) console.log(`移动端: ${url}`);
-  console.log(`配对验证码: ${config.pairingCode}`);
-  console.log(`共享设置: http://localhost:${publicPort}/lan\n`);
+  console.log(`请在电脑端登录后打开共享设置: http://localhost:${publicPort}/lan\n`);
 });
 
 let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  powerManager.stop();
+  for (const manager of powerManagers.values()) manager.stop();
   server.close();
   if (!appProcess.killed) appProcess.kill();
   setTimeout(() => process.exit(0), 1200).unref();

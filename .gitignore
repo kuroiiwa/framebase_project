@@ -45,5 +45,13 @@ yarn-error.log*
 /.framebase-thumbnails/
 /.framebase-power.json
 /.framebase-power.json.tmp
+/.framebase-accounts.json
+/.framebase-accounts.json.tmp
+/.framebase-lan-*.json
+/.framebase-lan-*.json.tmp
+/.framebase-power-*.json
+/.framebase-power-*.json.tmp
+/.framebase-icloud/
+/tools/
 /启动 Framebase.cmd
 /打开项目PowerShell.cmd

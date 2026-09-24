@@ -10,7 +10,7 @@
     "build": "vinext build",
     "start": "vinext start",
     "lan": "node server/framebase-lan-server.mjs",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/library-controls.test.mjs tests/player-shortcuts.test.mjs tests/power.test.mjs tests/accounts.test.mjs tests/icloud.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },

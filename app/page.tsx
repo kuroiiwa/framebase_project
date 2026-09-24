@@ -1,9 +1,14 @@
 "use client";
+/* eslint-disable @next/next/no-img-element -- all images here are local Blob URLs and cannot use next/image. */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import ThemeSelector from "./theme-selector";
 import { ScanControl, selectRange } from "./library-controls";
+import { buildStoryboard, STORYBOARD_FRAME_COUNT, type StoryboardFrame } from "./library-insights";
 import { usePlayerShortcuts } from "./player-shortcuts";
+import AccountGate, { signOut } from "./account-gate";
+import { accountDbName, accountKey } from "./account-storage";
+import AdminDashboard from "./admin-dashboard";
 
 type FsPermission = "granted" | "denied" | "prompt";
 type FileHandle = {
@@ -66,12 +71,19 @@ type Sort = "newest" | "oldest" | "largest" | "smallest" | "name" | "random" | "
 type LayoutMode = "comfortable" | "compact" | "list";
 type FontSize = "small" | "medium" | "large";
 type PageSize = 20 | 50 | 100;
+type StoryboardView = { time: number; url: string };
+type StoryboardCacheRecord = { key: string; size: number; lastAccess: number };
+type HealthIssue = { video: VideoItem; kind: "unavailable" | "changed" | "empty" | "preview"; detail: string };
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg"]);
-const DB_NAME = "framebase-local-v1";
 const DB_STORE = "cache";
 const TAGS_KEY = "framebase-custom-tags";
 const DEFAULT_TAG_COLOR = "#7f9f39";
+const STORYBOARD_CACHE_PREFIX = "storyboard-v2:";
+const STORYBOARD_CACHE_INDEX = `${STORYBOARD_CACHE_PREFIX}index`;
+const STORYBOARD_CACHE_MAX_ITEMS = 50;
+const STORYBOARD_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+let storyboardCacheQueue: Promise<void> = Promise.resolve();
 
 function resolutionTier(video: Pick<VideoItem, "width" | "height">): Exclude<ResolutionFilter, "all"> {
   if (!video.width || !video.height) return "unknown";
@@ -107,7 +119,7 @@ function TagIcon() {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(accountDbName(), 1);
     request.onupgradeneeded = () => request.result.createObjectStore(DB_STORE);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -160,10 +172,42 @@ async function dbDeletePrefix(prefix: string) {
   });
 }
 
+function updateStoryboardCacheIndex(key: string, size: number) {
+  const update = async () => {
+    const saved = await dbGet<StoryboardCacheRecord[]>(STORYBOARD_CACHE_INDEX).catch(() => undefined);
+    const entries = (Array.isArray(saved) ? saved : []).filter(entry => entry?.key && entry.key !== key);
+    entries.push({ key, size, lastAccess: Date.now() });
+    entries.sort((a, b) => a.lastAccess - b.lastAccess);
+    let totalBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
+    while (entries.length > STORYBOARD_CACHE_MAX_ITEMS || totalBytes > STORYBOARD_CACHE_MAX_BYTES) {
+      const expired = entries.shift();
+      if (!expired) break;
+      totalBytes -= expired.size;
+      await dbDelete(expired.key);
+    }
+    await dbSet(STORYBOARD_CACHE_INDEX, entries);
+  };
+  const queued = storyboardCacheQueue.then(update, update);
+  storyboardCacheQueue = queued.catch(() => undefined);
+  return queued;
+}
+
+async function readStoryboardCache(key: string) {
+  const frames = await dbGet<StoryboardFrame[]>(key).catch(() => undefined);
+  if (!frames || frames.length !== STORYBOARD_FRAME_COUNT) return undefined;
+  await updateStoryboardCacheIndex(key, frames.reduce((sum, frame) => sum + frame.blob.size, 0));
+  return frames;
+}
+
+async function saveStoryboardCache(key: string, frames: StoryboardFrame[]) {
+  await dbSet(key, frames);
+  await updateStoryboardCacheIndex(key, frames.reduce((sum, frame) => sum + frame.blob.size, 0));
+}
+
 function marksKey(sourceId: string) { return `framebase-marks:${sourceId}`; }
 function readMarks(sourceId: string, legacyName?: string): Record<string, VideoMarks> {
   try {
-    return JSON.parse(localStorage.getItem(marksKey(sourceId)) || (legacyName ? localStorage.getItem(marksKey(legacyName)) : null) || "{}");
+    return JSON.parse(localStorage.getItem(accountKey(marksKey(sourceId))) || (legacyName ? localStorage.getItem(accountKey(marksKey(legacyName))) : null) || "{}");
   } catch { return {}; }
 }
 
@@ -330,7 +374,6 @@ function HoverPreview({ item, onOpen }: { item: VideoItem; onOpen: (extend?: boo
   return (
     <div className="thumb real-thumb" onMouseEnter={start} onMouseLeave={stop} onClick={event => onOpen(event.shiftKey)} role="button" tabIndex={0} onKeyDown={event => event.key === "Enter" && onOpen(event.shiftKey)}>
       {/* Blob URLs are local cache entries and cannot be optimized by next/image. */}
-      {/* eslint-disable-next-line @next/next/no-img-element */}
       {item.thumb ? <img src={item.thumb} alt="" /> : <div className="thumb-placeholder"><span>{item.ext.toUpperCase()}</span></div>}
       <video ref={videoRef} className={hovering ? "hover-video visible" : "hover-video"} muted playsInline preload="none" />
       <span className="play">▶</span>
@@ -342,7 +385,12 @@ function HoverPreview({ item, onOpen }: { item: VideoItem; onOpen: (extend?: boo
 }
 
 export default function Home() {
+  return <AccountGate>{username => username === "admin" ? <AdminDashboard /> : <Library key={username} username={username} />}</AccountGate>;
+}
+
+function Library({ username }: { username: string }) {
   const [sources, setSources] = useState<SourceFolder[]>([]);
+  const [libraryReady, setLibraryReady] = useState(false);
   const [sourceFilter, setSourceFilter] = useState("all");
   const [videos, setVideos] = useState<VideoItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -391,6 +439,17 @@ export default function Home() {
   const [playerFeedback, setPlayerFeedback] = useState("");
   const [playerTime, setPlayerTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
+  const [storyboard, setStoryboard] = useState<StoryboardView[]>([]);
+  const [storyboardLoading, setStoryboardLoading] = useState(false);
+  const [storyboardError, setStoryboardError] = useState("");
+  const [storyboardHover, setStoryboardHover] = useState<{ ratio: number; index: number } | null>(null);
+  const storyboardUrlsRef = useRef<string[]>([]);
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [healthIssues, setHealthIssues] = useState<HealthIssue[]>([]);
+  const [healthRunning, setHealthRunning] = useState(false);
+  const [healthProgress, setHealthProgress] = useState(0);
+  const healthAbortRef = useRef<AbortController | null>(null);
+  const [drawCard, setDrawCard] = useState<VideoItem | null>(null);
   const [sourceDetails, setSourceDetails] = useState<string | null>(null);
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -411,16 +470,21 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const savedLayout = localStorage.getItem("framebase-layout");
-    const savedFontSize = localStorage.getItem("framebase-font-size");
-    const savedPageSize = Number(localStorage.getItem("framebase-page-size"));
+    if (localStorage.getItem(accountKey("framebase-storyboard-v2-migrated")) === "1") return;
+    void dbDeletePrefix("storyboard:").then(() => localStorage.setItem(accountKey("framebase-storyboard-v2-migrated"), "1"));
+  }, []);
+
+  useEffect(() => {
+    const savedLayout = localStorage.getItem(accountKey("framebase-layout"));
+    const savedFontSize = localStorage.getItem(accountKey("framebase-font-size"));
+    const savedPageSize = Number(localStorage.getItem(accountKey("framebase-page-size")));
     let savedTags: CustomTag[] = [];
     try {
-      const parsed = JSON.parse(localStorage.getItem(TAGS_KEY) || "[]") as CustomTag[];
+      const parsed = JSON.parse(localStorage.getItem(accountKey(TAGS_KEY)) || "[]") as CustomTag[];
       if (Array.isArray(parsed)) savedTags = parsed.filter(tag => tag && typeof tag.id === "string" && typeof tag.name === "string" && typeof tag.color === "string");
     } catch { /* Invalid saved tags are ignored. */ }
     try {
-      const savedVolume = JSON.parse(localStorage.getItem("framebase-player-volume") || "null") as { volume?: number; muted?: boolean } | null;
+      const savedVolume = JSON.parse(localStorage.getItem(accountKey("framebase-player-volume")) || "null") as { volume?: number; muted?: boolean } | null;
       if (savedVolume && typeof savedVolume.volume === "number") savedVolumeRef.current = { volume: Math.min(1, Math.max(0, savedVolume.volume)), muted: Boolean(savedVolume.muted) };
     } catch { /* Invalid old preferences fall back to the browser default. */ }
     queueMicrotask(() => {
@@ -432,9 +496,9 @@ export default function Home() {
     });
   }, []);
 
-  useEffect(() => { if (preferencesReady) { document.documentElement.dataset.fontSize = fontSize; localStorage.setItem("framebase-font-size", fontSize); } }, [fontSize, preferencesReady]);
-  useEffect(() => { if (preferencesReady) localStorage.setItem("framebase-layout", layout); }, [layout, preferencesReady]);
-  useEffect(() => { if (preferencesReady) localStorage.setItem("framebase-page-size", String(pageSize)); }, [pageSize, preferencesReady]);
+  useEffect(() => { if (preferencesReady) { document.documentElement.dataset.fontSize = fontSize; localStorage.setItem(accountKey("framebase-font-size"), fontSize); } }, [fontSize, preferencesReady]);
+  useEffect(() => { if (preferencesReady) localStorage.setItem(accountKey("framebase-layout"), layout); }, [layout, preferencesReady]);
+  useEffect(() => { if (preferencesReady) localStorage.setItem(accountKey("framebase-page-size"), String(pageSize)); }, [pageSize, preferencesReady]);
 
   const dismissPlayer = useCallback(() => {
     playRequestRef.current += 1;
@@ -447,6 +511,17 @@ export default function Home() {
     setPlayerFeedback("");
     setPlayerTime(0);
     setPlayerDuration(0);
+    storyboardUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+    storyboardUrlsRef.current = [];
+    setStoryboard([]);
+    setStoryboardHover(null);
+    setStoryboardError("");
+    setStoryboardLoading(false);
+  }, []);
+
+  useEffect(() => () => {
+    storyboardUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+    healthAbortRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -471,7 +546,7 @@ export default function Home() {
       next.filter(video => video.sourceId === source.id).forEach(video => {
         if (video.liked || video.cleanup || video.clicks || video.tagIds.length) marks[video.path] = { liked: video.liked, cleanup: video.cleanup, tagIds: video.tagIds, clicks: video.clicks };
       });
-      localStorage.setItem(marksKey(source.id), JSON.stringify(marks));
+      localStorage.setItem(accountKey(marksKey(source.id)), JSON.stringify(marks));
     });
   }, [sources]);
 
@@ -591,6 +666,7 @@ export default function Home() {
       }
       if (cancelled) return;
       setSources(savedSources);
+      setLibraryReady(true);
       const cachedLibraries = await Promise.all(savedSources.map(source => dbGet<StoredVideo[]>(`library:${source.id}`).catch(() => undefined)));
       const restored = cachedLibraries.flatMap((records, index) => {
         const source = savedSources[index];
@@ -608,6 +684,14 @@ export default function Home() {
     })();
     return () => { cancelled = true; };
   }, [hydrateCachedPreviews, loadSource]);
+
+  useEffect(() => {
+    if (!libraryReady) return;
+    const timeout = setTimeout(() => {
+      void fetch("/api/account/summary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sources: sources.map(source => ({ name: source.name, videoCount: source.videoCount, totalSize: source.totalSize })) }) });
+    }, 300);
+    return () => clearTimeout(timeout);
+  }, [sources, libraryReady]);
 
   async function chooseFolder() {
     if (scanControlRef.current) { setNotice("请先完成或取消当前扫描任务。"); return; }
@@ -652,7 +736,7 @@ export default function Home() {
       return current.filter(video => video.sourceId !== source.id);
     });
     await dbDelete(`library:${source.id}`);
-    localStorage.removeItem(marksKey(source.id));
+    localStorage.removeItem(accountKey(marksKey(source.id)));
     if (sourceFilter === source.id) setSourceFilter("all");
     if (sourceDetails === source.id) setSourceDetails(null);
     setNotice(`已从视频库移除“${source.name}”，源文件没有被删除。`);
@@ -668,7 +752,7 @@ export default function Home() {
 
   function saveCustomTags(next: CustomTag[]) {
     setCustomTags(next);
-    localStorage.setItem(TAGS_KEY, JSON.stringify(next));
+    localStorage.setItem(accountKey(TAGS_KEY), JSON.stringify(next));
   }
 
   function createTag() {
@@ -742,6 +826,32 @@ export default function Home() {
     feedbackTimerRef.current = setTimeout(() => setPlayerFeedback(""), 1800);
   }
 
+  async function prepareStoryboard(item: VideoItem, requestId: number) {
+    storyboardUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+    storyboardUrlsRef.current = [];
+    setStoryboard([]);
+    setStoryboardHover(null);
+    setStoryboardError("");
+    setStoryboardLoading(true);
+    try {
+      const cacheKey = `${STORYBOARD_CACHE_PREFIX}${item.sourceId}:${item.path}:${item.size}:${item.modified}`;
+      let frames = await readStoryboardCache(cacheKey);
+      if (!frames) {
+        const file = await item.handle.getFile();
+        frames = await buildStoryboard(file, STORYBOARD_FRAME_COUNT);
+        await saveStoryboardCache(cacheKey, frames);
+      }
+      if (requestId !== playRequestRef.current || !playerOpenRef.current) return;
+      const urls = frames.map(frame => URL.createObjectURL(frame.blob));
+      storyboardUrlsRef.current = urls;
+      setStoryboard(frames.map((frame, index) => ({ time: frame.time, url: urls[index] })));
+    } catch (reason) {
+      if (requestId === playRequestRef.current) setStoryboardError(reason instanceof Error ? reason.message : "故事板生成失败");
+    } finally {
+      if (requestId === playRequestRef.current) setStoryboardLoading(false);
+    }
+  }
+
   async function openPlayer(item: VideoItem, switching = false, queue: string[] = []) {
     if (switchingVideo) return;
     const requestId = ++playRequestRef.current;
@@ -769,6 +879,7 @@ export default function Home() {
       setPlayerFeedback("");
       setPlayerDuration(item.duration || 0);
       setPlayer(openedItem); setPlayerUrl(url);
+      void prepareStoryboard(item, requestId);
     } catch {
       if (requestId !== playRequestRef.current) return;
       if (switching) { setPlayerFeedback(`无法打开“${item.name}”，请重新授权来源文件夹。`); return; }
@@ -791,7 +902,7 @@ export default function Home() {
   function savePlayerVolume(video: HTMLVideoElement) {
     const preference = { volume: video.volume, muted: video.muted };
     savedVolumeRef.current = preference;
-    localStorage.setItem("framebase-player-volume", JSON.stringify(preference));
+    localStorage.setItem(accountKey("framebase-player-volume"), JSON.stringify(preference));
   }
 
   function shuffleVideos() {
@@ -861,6 +972,50 @@ export default function Home() {
   const detailedSourceCacheSize = detailedSourceVideos.reduce((sum, video) => sum + video.cacheSize, 0);
   const detailedSourceCachedCount = detailedSourceVideos.filter(video => video.cacheSize > 0).length;
 
+  function drawRandomCard() {
+    if (!filtered.length) { setNotice("当前筛选结果中没有可抽取的视频。"); return; }
+    const pool = filtered.length > 1 && drawCard ? filtered.filter(video => video.id !== drawCard.id) : filtered;
+    const random = crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32;
+    setDrawCard(pool[Math.floor(random * pool.length)] || filtered[0]);
+  }
+
+  async function runHealthCheck() {
+    if (healthRunning || !videos.length) return;
+    const controller = new AbortController();
+    healthAbortRef.current = controller;
+    setHealthOpen(true); setHealthRunning(true); setHealthIssues([]); setHealthProgress(0);
+    const issues: HealthIssue[] = [];
+    try {
+      for (let index = 0; index < videos.length; index++) {
+        if (controller.signal.aborted) throw new DOMException("任务已取消", "AbortError");
+        const video = videos[index];
+        try {
+          const file = await video.handle.getFile();
+          if (file.size === 0) issues.push({ video, kind: "empty", detail: "文件大小为 0 B" });
+          else if (file.size !== video.size || file.lastModified !== video.modified) issues.push({ video, kind: "changed", detail: "文件在上次扫描后已发生变化" });
+          else if (previewFailures.has(video.id) || video.duration == null) issues.push({ video, kind: "preview", detail: "预览或视频元数据尚不可用" });
+        } catch {
+          issues.push({ video, kind: "unavailable", detail: "文件不存在，或浏览器权限已失效" });
+        }
+        setHealthProgress(index + 1);
+        if (index % 20 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      setHealthIssues(issues);
+    } catch (reason) {
+      if ((reason as DOMException)?.name !== "AbortError") setError("目录健康检查未能完成。");
+    } finally {
+      if (healthAbortRef.current === controller) healthAbortRef.current = null;
+      setHealthRunning(false);
+    }
+  }
+
+  function selectHealthIssues() {
+    setSelected(new Set(healthIssues.map(issue => issue.video.id)));
+    setSelecting(true);
+    setHealthOpen(false);
+    setNotice(`已选择 ${healthIssues.length} 个问题项目。不可访问的旧索引建议通过“扫描全部来源”清理。`);
+  }
+
   function toggleSelection(id: string, extend = false) {
     const anchor = selectionAnchor.current;
     setSelected(current => selectRange(current, filtered.map(video => video.id), anchor, id, extend));
@@ -911,6 +1066,8 @@ export default function Home() {
   async function clearCache() {
     if (scanControlRef.current) { setNotice("请先完成或取消扫描再清除缓存。"); return; }
     await dbDeletePrefix("media:");
+    await dbDeletePrefix("storyboard:");
+    await dbDeletePrefix(STORYBOARD_CACHE_PREFIX);
     videos.forEach(video => video.thumb && URL.revokeObjectURL(video.thumb));
     setVideos(current => current.map(video => ({ ...video, thumb: null, cacheSize: 0 })));
     setNotice("预览缓存已清除，源文件夹和解析清单仍然保留。重新扫描可再次构建预览。");
@@ -922,7 +1079,9 @@ export default function Home() {
         <span className="brand"><span className="brand-mark">F</span> Framebase</span>
         <label className="search"><span>⌕</span><input value={query} onChange={event => { setQuery(event.target.value); setCurrentPage(1); }} placeholder="搜索名称或路径…" aria-label="搜索视频" /></label>
         <div className="header-actions">
+          <a className="lan-link" href="/icloud" title="管理当前用户的 iCloud 本地备份">iCloud 备份</a>
           <a className="lan-link" href="/lan" title="设置手机局域网只读访问">局域网</a>
+          <span className="account-name">{username}</span><button className="account-logout" onClick={() => void signOut()}>退出</button>
           <button className="shortcut-toggle" onClick={() => setShortcutHelp(value => !value)} aria-expanded={shortcutHelp}>快捷键</button><span className="local-badge">仅本机</span>
           <div className="font-controls" aria-label="字体大小">
             <button className={fontSize === "small" ? "active" : ""} onClick={() => setFontSize("small")} title="较小字号" aria-label="较小字号">A−</button>
@@ -1006,6 +1165,14 @@ export default function Home() {
             <div className="cache"><span>预览缓存</span><strong><i style={{ background: `linear-gradient(90deg,#9bc834 ${cachePercent}%,#e5e7df ${cachePercent}%)` }} /> {cachePercent}%</strong><small>{videos.length > cachedCount + failedPreviews.length ? `${scanTask && !scanTask.active ? "预览待处理" : "正在加载预览"} · ${videos.length - cachedCount - failedPreviews.length} 个剩余` : failedPreviews.length ? "预览处理完成" : "缩略图与基础信息已就绪"}{failedPreviews.length > 0 && <> · {failedPreviews.length} 个失败 <button disabled={Boolean(scanTask?.active)} onClick={() => void retryPreviews()}>{retryingPreviews ? "重试中…" : "重试失败项"}</button></>}</small></div>
           </section>
 
+          <section className="insight-tools" aria-label="视频库工具">
+            <div><span>✦</span><p><strong>视频库工具</strong><small>检测、抽取与检查都只在本机进行</small></p></div>
+            <div className="insight-actions">
+              <button className="draw-button" onClick={drawRandomCard} disabled={!filtered.length}>✦ 随机抽卡</button>
+              <button onClick={() => void runHealthCheck()} disabled={healthRunning || Boolean(scanTask?.active)}>◎ 健康检查{healthIssues.length ? ` · ${healthIssues.length} 项` : ""}</button>
+            </div>
+          </section>
+
           <section className="toolbar">
             <div className="tabs"><button className={tab === "all" ? "active" : ""} onClick={() => { setTab("all"); setCurrentPage(1); }}>全部 <b>{videos.length}</b></button><button className={tab === "liked" ? "active" : ""} onClick={() => { setTab("liked"); setCurrentPage(1); }}>已点赞 <b>{videos.filter(v => v.liked).length}</b></button><button className={tab === "cleanup" ? "active" : ""} onClick={() => { setTab("cleanup"); setCurrentPage(1); }}>待清理 <b>{videos.filter(v => v.cleanup).length}</b></button></div>
             <div className="filters">
@@ -1084,6 +1251,27 @@ export default function Home() {
 
       <footer className="footer"><span><i /> 本地模式 · 文件不会上传</span><span>预览缓存在浏览器中 <button onClick={clearCache}>清除缓存</button></span></footer>
 
+      {drawCard && <div className="modal-backdrop">
+        <section className="draw-modal" role="dialog" aria-modal="true" aria-label="随机抽卡结果">
+          <button className="modal-close" onClick={() => setDrawCard(null)} aria-label="关闭随机抽卡">×</button>
+          <p className="eyebrow">从当前 {filtered.length.toLocaleString()} 个筛选结果中抽取</p>
+          <div className="draw-art">{drawCard.thumb ? <img src={drawCard.thumb} alt="" /> : <span>{drawCard.ext.toUpperCase()}</span>}<i>✦</i></div>
+          <div className="draw-copy"><span>今日手气</span><h2 title={drawCard.path}>{drawCard.name}</h2><p>{drawCard.sourceName} · {formatDuration(drawCard.duration)} · {formatBytes(drawCard.size)} · {resolutionLabel(drawCard) || "分辨率未知"}</p></div>
+          <div className="draw-actions"><button className="secondary" onClick={drawRandomCard}>↻ 再抽一次</button><button className="primary" onClick={() => { const picked = drawCard; setDrawCard(null); void openPlayer(picked, false, filtered.map(video => video.id)); }}>▶ 立即播放</button></div>
+        </section>
+      </div>}
+
+      {healthOpen && <div className="modal-backdrop">
+        <section className="insight-modal" role="dialog" aria-modal="true" aria-labelledby="health-title">
+          <header><div><p className="eyebrow">文件与索引验证</p><h2 id="health-title">目录健康检查</h2></div><button className="modal-close" onClick={() => { healthAbortRef.current?.abort(); setHealthOpen(false); }} aria-label="关闭目录健康检查">×</button></header>
+          {healthRunning ? <div className="insight-running"><span className="spinner" /><strong>正在逐个验证文件</strong><p>{healthProgress} / {videos.length}</p><progress value={healthProgress} max={Math.max(1, videos.length)} /><small>检查文件是否可访问、是否变化、是否为空，以及预览和元数据状态。</small><button className="secondary" onClick={() => healthAbortRef.current?.abort()}>取消检查</button></div> : healthIssues.length ? <>
+            <div className="health-summary">{(["unavailable", "changed", "empty", "preview"] as const).map(kind => <div key={kind}><strong>{healthIssues.filter(issue => issue.kind === kind).length}</strong><span>{kind === "unavailable" ? "不可访问" : kind === "changed" ? "扫描后有变化" : kind === "empty" ? "空文件" : "预览异常"}</span></div>)}</div>
+            <div className="health-list">{healthIssues.map(issue => <div key={`${issue.kind}:${issue.video.id}`}><span className={`health-mark ${issue.kind}`}>{issue.kind === "unavailable" ? "!" : issue.kind === "changed" ? "↻" : issue.kind === "empty" ? "0" : "◇"}</span><div><strong>{issue.video.name}</strong><small>{issue.video.sourceName} / {issue.video.path}</small></div><p>{issue.detail}</p></div>)}</div>
+            <footer><p>重新扫描可清理已移动或删除的旧索引；预览异常可单独重试，不会修改源文件。</p><button className="secondary" onClick={() => { setHealthOpen(false); void rescanAllSources(); }}>扫描全部来源</button>{healthIssues.some(issue => issue.kind === "preview") && <button className="secondary" onClick={() => { setHealthOpen(false); void retryPreviews(); }}>重试预览</button>}<button className="primary" onClick={selectHealthIssues}>在列表中选择</button></footer>
+          </> : <div className="insight-empty"><span>✓</span><strong>目录状态良好</strong><p>{videos.length} 个视频均可访问，文件状态与索引一致，且预览元数据完整。</p><button className="secondary" onClick={() => setHealthOpen(false)}>完成</button></div>}
+        </section>
+      </div>}
+
       {player && playerUrl && <div className="modal-backdrop player-backdrop" role="presentation">
         <section className="player-modal" role="dialog" aria-modal="true" aria-label={`播放 ${player.name}`}>
           <aside className="player-sidebar">
@@ -1107,6 +1295,7 @@ export default function Home() {
             </div>
             <section className="play-queue" aria-label="播放队列"><header><strong>播放队列 · {queuePosition + 1} / {availableQueue.length}</strong><button onClick={() => setShortcutHelp(true)}>快捷键</button></header><div className="queue-controls"><select aria-label="播放模式" value={queueMode} onChange={event => changeQueueMode(event.target.value as typeof queueMode)}><option value="sequence">顺序播放</option><option value="random">随机播放</option><option value="repeat">单条循环</option></select>{queueMode === "random" && <button onClick={() => changeQueueMode("random")}>重新打乱</button>}<label><input type="checkbox" checked={autoAdvance} onChange={event => setAutoAdvance(event.target.checked)} /> 自动连播</label></div><input className="queue-search" value={queueQuery} onChange={event => setQueueQuery(event.target.value)} placeholder="在队列中查找…" aria-label="搜索播放队列" /><ol>{availableQueue.map((id, index) => ({ item: videoById.get(id)!, index })).filter(({ item }) => item.name.toLowerCase().includes(queueQuery.toLowerCase())).map(({ item, index }) => <li key={item.id}><button disabled={switchingVideo} aria-current={player.id === item.id ? "true" : undefined} onClick={() => void openPlayer(item, true)} title={`${item.sourceName} / ${item.path}`}><span>{player.id === item.id ? "▶" : index + 1}</span><span><strong>{item.name}</strong><small>{item.sourceName} · {formatDuration(item.duration)}</small></span></button></li>)}</ol></section>
             <section className="player-tags" aria-label="视频标签"><span>视频标签</span>{customTags.length ? <div>{customTags.map(tag => <button className={player.tagIds.includes(tag.id) ? "custom-tag selected" : "custom-tag"} style={{ "--tag-color": tag.color } as CSSProperties} onClick={() => toggleVideoTag(player.id, tag.id)} aria-pressed={player.tagIds.includes(tag.id)} key={tag.id}><i />{tag.name}</button>)}</div> : <button className="player-create-tag" onClick={() => { requestClosePlayer(); setTagManagerOpen(true); }}>＋ 创建第一个标签</button>}</section>
+            <section className="storyboard-status"><span>故事板预览</span><p>{storyboardLoading ? "正在生成首个故事板…" : storyboard.length ? `${storyboard.length} 帧已就绪 · 将鼠标移到时间轴查看` : storyboardError || "准备中"}</p></section>
             <span className={playerFeedback ? "player-feedback visible" : "player-feedback"}>✓ {playerFeedback}</span>
             <p className="player-local-note"><i /> 本地播放 · 视频不会上传</p>
           </aside>
@@ -1117,7 +1306,10 @@ export default function Home() {
             <video ref={playerVideoRef} src={playerUrl} controls autoPlay playsInline preload="auto" loop={queueMode === "repeat"} onEnded={() => { if (autoAdvance && nextVideo) void openPlayer(nextVideo, true); }} onLoadedMetadata={event => { applySavedVolume(event.currentTarget); setPlayerDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0); }} onTimeUpdate={event => setPlayerTime(event.currentTarget.currentTime)} onDurationChange={event => setPlayerDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)} onVolumeChange={event => savePlayerVolume(event.currentTarget)} aria-label={`正在播放 ${player.name}`} aria-keyshortcuts="ArrowLeft ArrowRight" />
             <div className="player-progress">
               <span>{formatDuration(playerTime)}</span>
-              <input type="range" min={0} max={playerDuration || 1} step={0.1} value={Math.min(playerTime, playerDuration || 1)} onPointerDown={event => { if (!playerDuration) return; const bounds = event.currentTarget.getBoundingClientRect(); const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)); const time = ratio * playerDuration; if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} onChange={event => { const time = Number(event.target.value); if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} style={{ "--progress": `${playerDuration ? playerTime / playerDuration * 100 : 0}%` } as CSSProperties} aria-label="视频播放进度" aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Space" />
+              <div className="storyboard-timeline" onPointerMove={event => { if (!storyboard.length || !playerDuration) return; const bounds = event.currentTarget.getBoundingClientRect(); const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)); setStoryboardHover({ ratio, index: Math.min(storyboard.length - 1, Math.floor(ratio * storyboard.length)) }); }} onPointerLeave={() => setStoryboardHover(null)}>
+                {storyboardHover && storyboard[storyboardHover.index] && <figure className="storyboard-popover" style={{ left: `clamp(126px, ${storyboardHover.ratio * 100}%, calc(100% - 126px))` }}><img src={storyboard[storyboardHover.index].url} alt="" /><figcaption>{formatDuration(storyboardHover.ratio * playerDuration)}</figcaption></figure>}
+                <input type="range" min={0} max={playerDuration || 1} step={0.1} value={Math.min(playerTime, playerDuration || 1)} onPointerDown={event => { if (!playerDuration) return; const bounds = event.currentTarget.getBoundingClientRect(); const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)); const time = ratio * playerDuration; if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} onChange={event => { const time = Number(event.target.value); if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} style={{ "--progress": `${playerDuration ? playerTime / playerDuration * 100 : 0}%` } as CSSProperties} aria-label="视频播放进度（悬停可查看故事板）" aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Space" />
+              </div>
               <span>{formatDuration(playerDuration)}</span>
             </div>
           </div>

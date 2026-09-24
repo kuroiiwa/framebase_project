@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import ThemeSelector from "../theme-selector";
 import PowerPanel from "../power-panel";
+import AccountGate, { signOut } from "../account-gate";
+import { accountDbName, accountKey } from "../account-storage";
 import styles from "./lan.module.css";
 import extra from "./lan-extra.module.css";
 import fontStyles from "./lan-font.module.css";
@@ -16,12 +18,11 @@ type CachedVideo = { path: string; size: number; modified: number };
 type CachedPreview = { thumb?: Blob };
 type LanFontSize = "small" | "medium" | "large";
 
-const CACHE_DB_NAME = "framebase-local-v1";
 const CACHE_STORE = "cache";
 
 function openCacheDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(CACHE_DB_NAME, 1);
+    const request = indexedDB.open(accountDbName(), 1);
     request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains(CACHE_STORE)) request.result.createObjectStore(CACHE_STORE); };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -77,6 +78,10 @@ async function syncCachedThumbnails(videoIndex: LanVideoIndex[]) {
 }
 
 export default function LanSettings() {
+  return <AccountGate>{username => <LanSettingsContent key={username} username={username} />}</AccountGate>;
+}
+
+function LanSettingsContent({ username }: { username: string }) {
   const [config, setConfig] = useState<LanConfig | null>(null);
   const [cachedSources, setCachedSources] = useState<CachedSource[]>([]);
   const [folderPath, setFolderPath] = useState("");
@@ -109,13 +114,13 @@ export default function LanSettings() {
   useEffect(() => { queueMicrotask(() => {
     void loadConfig();
     void readCachedSources().then(setCachedSources);
-    const savedFontSize = localStorage.getItem("framebase-lan-font-size");
+    const savedFontSize = localStorage.getItem(accountKey("framebase-lan-font-size"));
     if (savedFontSize === "small" || savedFontSize === "large") setFontSize(savedFontSize);
   }); }, [loadConfig]);
 
   function updateFontSize(value: LanFontSize) {
     setFontSize(value);
-    localStorage.setItem("framebase-lan-font-size", value);
+    localStorage.setItem(accountKey("framebase-lan-font-size"), value);
   }
 
   async function addFolderPath(path: string) {
@@ -211,7 +216,7 @@ export default function LanSettings() {
 
   return <main className={`${styles.page} ${fontStyles[fontSize]}`}>
     <div className="route-theme"><ThemeSelector /></div>
-    <header className={styles.topbar}><Link href="/"><span>F</span>Framebase</Link><div className={fontStyles.topActions}><b>电脑端设置</b><div className={fontStyles.fontControls} aria-label="页面字体大小"><button className={fontSize === "small" ? fontStyles.active : ""} onClick={() => updateFontSize("small")} title="较小字体" aria-label="较小字体">A−</button><button className={fontSize === "medium" ? fontStyles.active : ""} onClick={() => updateFontSize("medium")} title="标准字体" aria-label="标准字体">A</button><button className={fontSize === "large" ? fontStyles.active : ""} onClick={() => updateFontSize("large")} title="大字体" aria-label="大字体">A＋</button></div></div></header>
+    <header className={styles.topbar}><Link href="/"><span>F</span>Framebase</Link><div className={fontStyles.topActions}><button className={styles.backLink} onClick={() => window.location.assign("/")}>← 返回视频库</button><b>{username} · 电脑端设置</b><button className={styles.signOut} onClick={() => void signOut()}>退出</button><div className={fontStyles.fontControls} aria-label="页面字体大小"><button className={fontSize === "small" ? fontStyles.active : ""} onClick={() => updateFontSize("small")} title="较小字体" aria-label="较小字体">A−</button><button className={fontSize === "medium" ? fontStyles.active : ""} onClick={() => updateFontSize("medium")} title="标准字体" aria-label="标准字体">A</button><button className={fontSize === "large" ? fontStyles.active : ""} onClick={() => updateFontSize("large")} title="大字体" aria-label="大字体">A＋</button></div></div></header>
     <section className={styles.hero}><p>局域网共享</p><h1>让手机只读访问<br />这台电脑的视频</h1><span>手机只能浏览和播放，不能删除文件或修改共享目录。</span></section>
 
     {error && <div className={styles.error}>{error}<button onClick={() => setError("")}>×</button></div>}
@@ -233,7 +238,7 @@ export default function LanSettings() {
 
     <section className={styles.panel}>
       <header><div><small>02</small><strong>手机访问链接</strong></div><span>同一 Wi-Fi / 局域网</span></header>
-      <p>手机使用固定地址访问。首次打开时输入下面的六位验证码，验证成功后这台手机会自动保持配对。</p>
+      <p>手机使用固定地址访问，输入当前用户的六位验证码。电脑端退出此账户后，手机配对立即失效。</p>
       <div className={extra.pairing}><div><span>当前配对验证码</span><strong data-pairing-code>{config?.pairingCode?.split("").join(" ") || "— — — — — —"}</strong></div><button onClick={regenerateCode} disabled={saving}>生成新验证码</button></div>
       {config?.accessUrls.length ? <div className={styles.linkList}>{config.accessUrls.map(url => <article key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a><button onClick={() => copyLink(url)}>复制</button></article>)}</div> : <div className={styles.empty}>没有检测到可用的局域网 IPv4 地址。请确认电脑已连接 Wi-Fi 或网线。</div>}
       <ol><li>电脑和手机连接到同一个局域网。</li><li>保持 Framebase 启动窗口打开。</li><li>如果手机无法连接，请允许 Windows 防火墙中的专用网络访问。</li></ol>
