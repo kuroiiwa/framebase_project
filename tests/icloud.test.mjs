@@ -98,8 +98,9 @@ test("capacity release plan requires a completed backup and fresh local SHA-256 
 });
 
 test("iCloud backup center remains a separate authenticated route", async () => {
-  const [page, lanPage, server] = await Promise.all([
+  const [page, styles, lanPage, server] = await Promise.all([
     readFile(new URL("../app/icloud/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/icloud/icloud.module.css", import.meta.url), "utf8"),
     readFile(new URL("../app/lan/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../server/framebase-lan-server.mjs", import.meta.url), "utf8"),
   ]);
@@ -129,6 +130,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /自动删除保持锁定/);
   assert.match(page, /视频库与独立图片库按格式隔离管理/);
   assert.match(page, /← 返回视频库/);
+  assert.match(styles, /\.topbar \.backLink\{[^}]*display:inline-flex;align-items:center;justify-content:center/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
   assert.match(server, /icloud\.configureBackupDirectory\(current\.username/);
