@@ -80,9 +80,10 @@ function publicAuthState(job) {
   return { status: job.status, message: job.message, startedAt: job.startedAt };
 }
 
-export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive }) {
+export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive, hashFile = sha256File, verificationConcurrency = 2 }) {
   const authJobs = new Map();
   const sessionSecrets = new Map();
+  const safeVerificationConcurrency = Math.min(4, Math.max(1, Math.floor(Number(verificationConcurrency) || 2)));
 
   function runWithRuntimePassword(args, password, timeout = 120_000, signal, processOptions = {}) {
     return new Promise((resolve, reject) => {
@@ -323,7 +324,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             extension: item.extension,
             mediaType: videoExtensions.has(item.extension) ? "video" : "photo",
             size: info.size,
-            sha256: await sha256File(item.absolutePath),
+            sha256: await hashFile(item.absolutePath),
           });
         } catch { /* A missing or empty file fails local verification and is not reported as safe. */ }
       }
@@ -453,13 +454,23 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         }
         for (const item of rangeVerificationByPath.values()) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
         const verificationPlan = [...rangeVerificationByPath.values()];
-        for (let index = 0; index < verificationPlan.length; index += 1) {
+        for (let batchStart = 0; batchStart < verificationPlan.length; batchStart += safeVerificationConcurrency) {
           if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
-          const item = verificationPlan[index];
-          try {
-            const fileInfo = await stat(item.absolutePath);
-            if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
-            const sha256 = await sha256File(item.absolutePath);
+          const batch = verificationPlan.slice(batchStart, batchStart + safeVerificationConcurrency);
+          const results = await Promise.all(batch.map(async item => {
+            try {
+              const fileInfo = await stat(item.absolutePath);
+              if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
+              if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+              return { item, fileInfo, sha256: await hashFile(item.absolutePath) };
+            } catch (error) {
+              if (error?.name === "AbortError") throw error;
+              return { item, error };
+            }
+          }));
+          for (const result of results) {
+            if (result.error) { failed += 1; continue; }
+            const { item, fileInfo, sha256 } = result;
             const previous = previousByPath.get(item.relativePath);
             if (previous?.size === fileInfo.size && previous?.sha256 === sha256) skipped += 1;
             const existing = filesByPath.get(item.relativePath);
@@ -471,9 +482,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             };
             filesByPath.set(item.relativePath, verifiedFile);
             verifiedBytes += fileInfo.size;
-          } catch { failed += 1; }
-          if (index % 10 === 0 || index === verificationPlan.length - 1) {
-            await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${index + 1}/${verificationPlan.length}）…` });
+          }
+          const processed = batchStart + batch.length;
+          if (processed % 10 === 0 || processed === verificationPlan.length) {
+            await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, downloaded: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在使用 ${safeVerificationConcurrency} 路并行校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${processed}/${verificationPlan.length}）…` });
           }
         }
         completedRanges.push(range.key);

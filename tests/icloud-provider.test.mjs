@@ -324,6 +324,50 @@ test("selected backup ranges are planned, downloaded, and verified one at a time
   }
 });
 
+test("full backup verifies local files with a bounded two-worker pool", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-parallel-verification-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const mediaDirectory = join(backupDirectory, "2025", "06");
+  const mediaPaths = Array.from({ length: 5 }, (_, index) => join(mediaDirectory, `IMG_${index}.JPG`));
+  let activeHashes = 0;
+  let peakHashes = 0;
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      hashFile: async path => {
+        activeHashes += 1;
+        peakHashes = Math.max(peakHashes, activeHashes);
+        await new Promise(resolve => setTimeout(resolve, 15));
+        activeHashes -= 1;
+        return createHash("sha256").update(path).digest("hex");
+      },
+      runCommand: async (_executable, args) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "", stderr: "" };
+        if (args.includes("--only-print-filenames")) return { stdout: `${mediaPaths.join("\n")}\n`, stderr: "" };
+        await mkdir(mediaDirectory, { recursive: true });
+        await Promise.all(mediaPaths.map((path, index) => writeFile(path, `photo-${index}`)));
+        return { stdout: "", stderr: "" };
+      },
+    });
+    const progress = [];
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
+      ranges: [{ key: "2025-06", label: "2025 年 6 月", start: "2025-06-01T00:00:00", end: "2025-06-30T23:59:59" }],
+      onProgress: update => progress.push(update),
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.files.length, 5);
+    assert.equal(peakHashes, 2);
+    assert.ok(result.files.every(item => /^[a-f0-9]{64}$/.test(item.sha256)));
+    assert.ok(progress.some(item => item.phase === "verifying" && item.message.includes("2 路并行校验")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("provider builds exact year, quarter, and month summaries from read-only inventory metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-timeline-"));
   const executablePath = join(root, "icloudpd.exe");
