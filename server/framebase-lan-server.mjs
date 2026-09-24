@@ -9,12 +9,16 @@ import { execFile, spawn } from "node:child_process";
 import { createPowerManager, isLocalAdmin, validatePowerRequest } from "./framebase-power.mjs";
 import { createAccounts } from "./framebase-accounts.mjs";
 import { createIcloudManager } from "./framebase-icloud.mjs";
+import { createIcloudPdProvider } from "./icloud-providers/icloudpd-provider.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const configPath = join(projectRoot, ".framebase-lan.json");
 const thumbnailDirectory = join(projectRoot, ".framebase-thumbnails");
 const accounts = createAccounts(join(projectRoot, ".framebase-accounts.json"));
 const icloud = createIcloudManager({ projectRoot });
+const icloudProvider = createIcloudPdProvider({
+  executablePath: resolve(process.env.FRAMEBASE_ICLOUDPD_PATH || join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe")),
+});
 const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
 const appPort = Number(process.env.FRAMEBASE_APP_PORT || 3001);
@@ -382,7 +386,8 @@ async function handleIcloud(request, response, url) {
   const current = requirePc(request, response);
   if (!current) return;
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    return json(response, 200, await icloud.read(current.username));
+    const [config, providerInfo] = await Promise.all([icloud.read(current.username), icloudProvider.info()]);
+    return json(response, 200, { ...config, providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version } });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/pick-folder") {
     if (process.platform !== "win32") return json(response, 501, { error: "自动选择文件夹目前仅支持 Windows。" });
@@ -393,6 +398,43 @@ async function handleIcloud(request, response, url) {
   if (request.method === "POST" && url.pathname === "/api/icloud/config") {
     const body = await readJsonBody(request);
     return json(response, 200, await icloud.configureBackupDirectory(current.username, body.path));
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/connection") {
+    const body = await readJsonBody(request);
+    const [config, providerInfo] = await Promise.all([
+      icloud.configureConnection(current.username, body),
+      icloudProvider.info(),
+    ]);
+    return json(response, 200, { ...config, providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version } });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/verify") {
+    const context = await icloud.connectionContext(current.username);
+    const verification = await icloudProvider.verifyExistingSession(context);
+    const config = await icloud.recordConnectionCheck(current.username, verification);
+    return json(response, 200, {
+      ...config,
+      providerInfo: { id: verification.providerInfo.id, available: verification.providerInfo.available, version: verification.providerInfo.version },
+      verification: { status: verification.status, message: verification.message },
+    });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
+    const context = await icloud.connectionContext(current.username);
+    return json(response, 200, await icloudProvider.startAuthentication(current.username, context));
+  }
+  if (request.method === "GET" && url.pathname === "/api/icloud/auth/status") {
+    const auth = icloudProvider.authenticationStatus(current.username);
+    if (auth.status === "connected") {
+      const config = await icloud.read(current.username);
+      if (config.connectionStatus !== "connected") await icloud.recordConnectionCheck(current.username, { status: "connected", message: auth.message });
+    }
+    return json(response, 200, auth);
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/auth/input") {
+    const body = await readJsonBody(request);
+    return json(response, 200, icloudProvider.submitAuthenticationInput(current.username, body.type, body.value));
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/auth/cancel") {
+    return json(response, 200, icloudProvider.cancelAuthentication(current.username));
   }
   return json(response, 405, { error: "不支持的操作。" });
 }
@@ -580,7 +622,7 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
     if (url.pathname.startsWith("/api/account/")) return await handleAccount(request, response, url);
-    if (url.pathname === "/api/icloud/config" || url.pathname === "/api/icloud/pick-folder") return await handleIcloud(request, response, url);
+    if (url.pathname.startsWith("/api/icloud/")) return await handleIcloud(request, response, url);
     if (url.pathname === "/api/lan/power" || url.pathname.startsWith("/api/lan/power/")) return await handlePower(request, response, url);
     if (url.pathname === "/api/lan/config" || url.pathname === "/api/lan/rescan" || url.pathname === "/api/lan/pairing-code") return await handleConfig(request, response, url);
     if (url.pathname === "/api/lan/pick-folder") return await handleFolderPicker(request, response);

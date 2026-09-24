@@ -22,6 +22,13 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     assert.equal((await manager.read("alice")).backupDirectory, alice.backupDirectory);
     assert.equal((await manager.read("bob")).backupDirectory, null);
 
+    const connectedGabri = await manager.configureConnection("gabri", { appleAccount: "GABRI@example.com", icloudDomain: "cn" });
+    const connectedAlice = await manager.configureConnection("alice", { appleAccount: "alice@example.com", icloudDomain: "com" });
+    assert.equal(connectedGabri.appleAccount, "gabri@example.com");
+    assert.equal(connectedGabri.icloudDomain, "cn");
+    assert.equal(connectedAlice.icloudDomain, "com");
+    assert.notEqual((await manager.connectionContext("gabri")).sessionDirectory, (await manager.connectionContext("alice")).sessionDirectory);
+
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));
     assert.equal(gabriFile.backupDirectory, gabri.backupDirectory);
@@ -42,9 +49,14 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /iCloud 备份中心/);
   assert.match(page, /<AccountGate>/);
   assert.match(page, /\/api\/icloud\/pick-folder/);
+  assert.match(page, /\/api\/icloud\/connection/);
+  assert.match(page, /验证已有会话/);
+  assert.match(page, /开始 Apple 登录/);
   assert.match(page, /← 返回视频库/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
   assert.match(server, /icloud\.configureBackupDirectory\(current\.username/);
+  assert.match(server, /icloudProvider\.verifyExistingSession/);
+  assert.match(server, /icloudProvider\.startAuthentication/);
   assert.match(server, /ShowDialog\(\$owner\)/);
 });
