@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { networkInterfaces } from "node:os";
@@ -16,8 +16,13 @@ const configPath = join(projectRoot, ".framebase-lan.json");
 const thumbnailDirectory = join(projectRoot, ".framebase-thumbnails");
 const accounts = createAccounts(join(projectRoot, ".framebase-accounts.json"));
 const icloud = createIcloudManager({ projectRoot });
+const bundledIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe");
+const compatibleIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-compatible.exe");
 const icloudProvider = createIcloudPdProvider({
-  executablePath: resolve(process.env.FRAMEBASE_ICLOUDPD_PATH || join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe")),
+  executablePath: resolve(
+    process.env.FRAMEBASE_ICLOUDPD_PATH
+      || (existsSync(compatibleIcloudPdPath) ? compatibleIcloudPdPath : bundledIcloudPdPath),
+  ),
 });
 const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
@@ -387,11 +392,8 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
     const [config, scan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloudProvider.info()]);
-    const runtimeReady = icloudProvider.hasRuntimeCredential(current.username);
     return json(response, 200, {
       ...config,
-      connectionStatus: config.connectionStatus === "connected" && !runtimeReady ? "expired" : config.connectionStatus,
-      lastConnectionMessage: config.connectionStatus === "connected" && !runtimeReady ? "为保护密码，FrameBase 重启后需要重新登录 Apple ID。" : config.lastConnectionMessage,
       scan,
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });

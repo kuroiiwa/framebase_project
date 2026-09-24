@@ -129,7 +129,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       if (!(await stat(executablePath)).isFile()) throw new Error("not-file");
       const { stdout, stderr } = await runCommand(executablePath, ["--version"], { timeout: 15_000 });
       const versionOutput = `${stdout || ""}\n${stderr || ""}`.trim().split(/\r?\n/).find(Boolean) || "icloudpd";
-      const version = /version[:\s]+([^,\s]+)/i.exec(versionOutput)?.[1] || versionOutput;
+      const parsedVersion = /version[:\s]+([^,\s]+)/i.exec(versionOutput)?.[1] || versionOutput;
+      const version = basename(executablePath).includes("framebase-compatible")
+        ? "1.32.3 · FrameBase 兼容版"
+        : parsedVersion;
       return { id: "icloudpd", available: true, version, executablePath };
     } catch {
       return { id: "icloudpd", available: false, version: null, executablePath };
@@ -187,18 +190,17 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", providerInfo };
     const safeLimit = Math.max(1, Math.min(25, Number(limit) || 10));
+    const password = sessionSecrets.get(jobKey);
     const baseArgs = [
       "--log-level", "error",
       "--no-progress-bar",
       "--domain", domain,
-      "--password-provider", "console",
+      "--password-provider", password ? "console" : "parameter",
       "--mfa-provider", "console",
       "--cookie-directory", sessionDirectory,
       "--directory", backupDirectory,
       "--username", appleAccount,
     ];
-    const password = sessionSecrets.get(jobKey);
-    if (!password) return { status: "needs_auth", message: "为保护密码，FrameBase 重启后需要重新登录 Apple ID。", samples: [], requestedLimit: safeLimit, providerInfo };
     try {
       const cleanOutput = value => String(value || "").replace(/i?cloud password for [^:\r\n]+:/gi, "");
       const parseSamples = value => cleanOutput(value).split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => {
@@ -207,15 +209,18 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         const mediaType = videoExtensions.has(extension) ? "video" : photoExtensions.has(extension) ? "photo" : null;
         return { name, extension, mediaType };
       }).filter(item => item.mediaType);
+      const runReadOnly = args => password
+        ? runWithRuntimePassword(args, password)
+        : runCommand(executablePath, args, { timeout: 120_000 });
       const scanLibrary = async library => {
         const libraryArgs = library ? ["--library", library] : [];
-        const { stdout } = await runWithRuntimePassword([...baseArgs, ...libraryArgs, "--recent", String(safeLimit), "--only-print-filenames"], password);
+        const { stdout } = await runReadOnly([...baseArgs, ...libraryArgs, "--recent", String(safeLimit), "--only-print-filenames"]);
         return parseSamples(stdout);
       };
       let samples = await scanLibrary(null);
       let librariesChecked = 1;
       if (samples.length === 0) {
-        const { stdout } = await runWithRuntimePassword([...baseArgs, "--list-libraries"], password);
+        const { stdout } = await runReadOnly([...baseArgs, "--list-libraries"]);
         const libraries = [...new Set(cleanOutput(stdout).split(/\r?\n/).map(line => line.trim()).filter(Boolean))].slice(0, 8);
         for (const library of libraries) {
           samples = [...samples, ...await scanLibrary(library)];

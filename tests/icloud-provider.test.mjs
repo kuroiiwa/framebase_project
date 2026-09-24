@@ -115,6 +115,39 @@ test("icloudpd provider scans a bounded recent sample without download or delete
   }
 });
 
+test("icloudpd provider reuses a trusted session after FrameBase restarts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-session-scan-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const calls = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => {
+        calls.push(args);
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        return { stdout: "2026/09/IMG_7100.PNG\n", stderr: "" };
+      },
+      spawnProcess: () => { throw new Error("trusted session scans must not open an interactive login"); },
+    });
+    const result = await provider.scanRecent({
+      jobKey: "alice",
+      appleAccount: "alice@example.com",
+      domain: "cn",
+      sessionDirectory: join(root, "session"),
+      backupDirectory: join(root, "backup"),
+      limit: 10,
+    });
+    assert.equal(result.status, "ready");
+    assert.deepEqual(result.samples.map(item => item.name), ["IMG_7100.PNG"]);
+    const scanArgs = calls.at(-1);
+    assert.equal(scanArgs[scanArgs.indexOf("--password-provider") + 1], "parameter");
+    assert.equal(scanArgs.includes("--password"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("icloudpd provider passes password and MFA only through the temporary pseudo-terminal", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-login-"));
   const executablePath = join(root, "icloudpd.exe");
