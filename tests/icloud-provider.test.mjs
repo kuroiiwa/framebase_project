@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -188,6 +189,56 @@ test("icloudpd provider safely backs up at most three recent originals and verif
     assert.equal(downloadArgs.includes("--auto-delete"), false);
     assert.equal(downloadArgs.includes("--delete-after-download"), false);
     assert.equal(downloadArgs.includes("--keep-icloud-recent-days"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("icloudpd provider incrementally backs up and hashes photos, videos, Live Photos, and RAW files without delete flags", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-full-backup-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const photoPath = join(backupDirectory, "2026", "09", "IMG_7100.HEIC");
+  const liveVideoPath = join(backupDirectory, "2026", "09", "IMG_7100.MOV");
+  const rawPath = join(backupDirectory, "2026", "09", "IMG_7101.DNG");
+  const calls = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => {
+        calls.push(args);
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "SharedSync\n", stderr: "" };
+        if (args.includes("--only-print-filenames")) return args.includes("SharedSync")
+          ? { stdout: `${photoPath}\n${liveVideoPath}\n${rawPath}\n`, stderr: "" }
+          : { stdout: "", stderr: "" };
+        await mkdir(join(backupDirectory, "2026", "09"), { recursive: true });
+        await writeFile(photoPath, "photo");
+        await writeFile(liveVideoPath, "live-video");
+        await writeFile(rawPath, "raw");
+        return { stdout: "", stderr: "" };
+      },
+    });
+    const photoHash = createHash("sha256").update("photo").digest("hex");
+    const progress = [];
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
+      previousFiles: [{ relativePath: "2026/09/IMG_7100.HEIC", size: 5, sha256: photoHash }],
+      onProgress: update => progress.push(update),
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.files.length, 3);
+    assert.deepEqual(result.files.map(item => item.mediaType), ["photo", "video", "photo"]);
+    assert.equal(result.skipped, 1);
+    assert.ok(result.files.every(item => /^[a-f0-9]{64}$/.test(item.sha256)));
+    assert.ok(progress.some(item => item.phase === "planning"));
+    assert.ok(progress.some(item => item.phase === "downloading"));
+    assert.ok(progress.some(item => item.phase === "verifying"));
+    const downloadArgs = calls.find(args => args.includes("--library") && !args.includes("--only-print-filenames"));
+    assert.equal(downloadArgs[downloadArgs.indexOf("--size") + 1], "original");
+    assert.equal(downloadArgs[downloadArgs.indexOf("--live-photo-size") + 1], "original");
+    assert.equal(downloadArgs.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

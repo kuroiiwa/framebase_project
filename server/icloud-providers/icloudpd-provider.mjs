@@ -84,7 +84,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
   const authJobs = new Map();
   const sessionSecrets = new Map();
 
-  function runWithRuntimePassword(args, password, timeout = 120_000) {
+  function runWithRuntimePassword(args, password, timeout = 120_000, signal) {
     return new Promise((resolve, reject) => {
       let child;
       try { child = spawnProcess(executablePath, args); }
@@ -92,6 +92,13 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       let output = "";
       let settled = false;
       let passwordSent = false;
+      const abort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.kill();
+        reject(Object.assign(new Error("backup aborted"), { name: "AbortError" }));
+      };
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -99,6 +106,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         reject(Object.assign(new Error("timed out"), { stderr: output }));
       }, timeout);
       timer.unref?.();
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
       const observe = chunk => {
         output = stripTerminalCodes(`${output}${String(chunk)}`).slice(-64_000);
         if (!passwordSent && /icloud password|password for/i.test(output)) {
@@ -122,6 +131,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
         if (code === 0) resolve({ stdout: output, stderr: "" });
         else reject(Object.assign(new Error(`icloudpd exited with code ${code}`), { stderr: output }));
       };
@@ -131,6 +141,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
           reject(error);
         });
         child.once("close", close);
@@ -325,6 +336,102 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
+  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], signal, onProgress = () => undefined }) {
+    const providerInfo = await info();
+    if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", files: [], providerInfo };
+    const password = sessionSecrets.get(jobKey);
+    const baseArgs = [
+      "--log-level", "error",
+      "--no-progress-bar",
+      "--domain", domain,
+      "--password-provider", password ? "console" : "parameter",
+      "--mfa-provider", "console",
+      "--cookie-directory", sessionDirectory,
+      "--directory", backupDirectory,
+      "--username", appleAccount,
+    ];
+    const mediaArgs = [
+      ...baseArgs,
+      "--size", "original",
+      "--live-photo-size", "original",
+    ];
+    const run = (args, timeout, maxBuffer = 64 * 1024 * 1024) => password
+      ? runWithRuntimePassword(args, password, timeout, signal)
+      : runCommand(executablePath, args, { timeout, maxBuffer, signal });
+    const cleanLines = value => String(value || "").replace(/i?cloud password for [^:\r\n]+:/gi, "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const parsePaths = (value, library) => cleanLines(value).map(line => {
+      const extension = extname(line).slice(1).toLowerCase();
+      if (!photoExtensions.has(extension) && !videoExtensions.has(extension)) return null;
+      const absolutePath = isAbsolute(line) ? resolve(line) : resolve(backupDirectory, line);
+      const pathWithinBackup = relative(resolve(backupDirectory), absolutePath);
+      if (!pathWithinBackup || pathWithinBackup.startsWith("..") || isAbsolute(pathWithinBackup)) return null;
+      return { absolutePath, relativePath: pathWithinBackup.split("\\").join("/"), extension, library };
+    }).filter(Boolean);
+    const previousByPath = new Map(previousFiles.map(item => [item.relativePath, item]));
+    try {
+      await mkdir(backupDirectory, { recursive: true });
+      await onProgress({ status: "planning", phase: "planning", message: "正在读取 iCloud 图库清单…" });
+      const libraryResult = await run([...baseArgs, "--list-libraries"], 180_000);
+      const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
+      const libraries = [null, ...namedLibraries];
+      const planByPath = new Map();
+      const activeLibraries = [];
+      for (const library of libraries) {
+        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+        const libraryArgs = library ? ["--library", library] : [];
+        const result = await run([...mediaArgs, ...libraryArgs, "--only-print-filenames"], 30 * 60_000);
+        const items = parsePaths(result.stdout, library);
+        if (items.length > 0) activeLibraries.push(library);
+        for (const item of items) if (!planByPath.has(item.relativePath)) planByPath.set(item.relativePath, item);
+        await onProgress({ status: "planning", phase: "planning", currentLibrary: library || "主图库", planned: planByPath.size, message: `已规划 ${planByPath.size} 个媒体文件。` });
+      }
+      const plan = [...planByPath.values()];
+      if (plan.length === 0) return { status: "empty", message: "iCloud 图库中没有找到可备份的图片或视频。", files: [], planned: 0, providerInfo };
+      let completedLibraries = 0;
+      for (const library of activeLibraries) {
+        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+        const libraryArgs = library ? ["--library", library] : [];
+        const downloadArgs = [...mediaArgs, ...libraryArgs];
+        if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
+        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, message: `正在增量备份${library ? `图库“${library}”` : "主图库"}…` });
+        await run(downloadArgs, 24 * 60 * 60_000, 8 * 1024 * 1024);
+        completedLibraries += 1;
+        await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", planned: plan.length, downloaded: Math.round(plan.length * completedLibraries / activeLibraries.length), message: "当前图库下载阶段已完成。" });
+      }
+      const files = [];
+      let skipped = 0;
+      let failed = 0;
+      let verifiedBytes = 0;
+      for (let index = 0; index < plan.length; index += 1) {
+        if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
+        const item = plan[index];
+        try {
+          const fileInfo = await stat(item.absolutePath);
+          if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
+          const sha256 = await sha256File(item.absolutePath);
+          const previous = previousByPath.get(item.relativePath);
+          if (previous?.size === fileInfo.size && previous?.sha256 === sha256) skipped += 1;
+          verifiedBytes += fileInfo.size;
+          files.push({
+            name: basename(item.absolutePath), relativePath: item.relativePath, extension: item.extension,
+            mediaType: videoExtensions.has(item.extension) ? "video" : "photo", size: fileInfo.size,
+            sha256, library: item.library, verifiedAt: new Date().toISOString(),
+          });
+        } catch { failed += 1; }
+        if (index % 10 === 0 || index === plan.length - 1) {
+          await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, planned: plan.length, downloaded: plan.length, verified: files.length, skipped, failed, verifiedBytes, message: `正在校验本地文件 ${index + 1}/${plan.length}…` });
+        }
+      }
+      const photoCount = files.filter(item => item.mediaType === "photo").length;
+      const videoCount = files.length - photoCount;
+      if (failed > 0) return { status: "verification_failed", message: `${files.length}/${plan.length} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: plan.length, skipped, failed, photoCount, videoCount, verifiedBytes, providerInfo };
+      return { status: "completed", message: `完整增量备份已验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: plan.length, skipped, failed: 0, photoCount, videoCount, verifiedBytes, providerInfo };
+    } catch (error) {
+      if (error?.name === "AbortError" || signal?.aborted) return { status: "aborted", message: "备份任务已安全停止，可稍后从本地已有文件继续。", files: [], providerInfo };
+      return { ...safeMessage(error), files: [], providerInfo };
+    }
+  }
+
   async function startAuthentication(jobKey, { appleAccount, domain, sessionDirectory, backupDirectory }) {
     const existing = authJobs.get(jobKey);
     if (existing && runningAuthStates.has(existing.status)) return publicAuthState(existing);
@@ -440,5 +547,5 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     return publicAuthState(job);
   }
 
-  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, backupRecent, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
+  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, backupRecent, backupAll, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
 }

@@ -46,6 +46,96 @@ export function createIcloudManager({ projectRoot }) {
     return join(userDirectory(username), "last-backup.json");
   }
 
+  function fullBackupPath(username) {
+    return join(userDirectory(username), "full-backup.json");
+  }
+
+  function fullManifestPath(username) {
+    return join(userDirectory(username), "full-manifest.json");
+  }
+
+  async function atomicJson(username, destination, value) {
+    const directory = userDirectory(username);
+    const temporary = `${destination}.tmp`;
+    const task = writes.then(async () => {
+      await mkdir(directory, { recursive: true });
+      await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, destination);
+    });
+    writes = task.catch(() => undefined);
+    await task;
+  }
+
+  function cleanFullFiles(files) {
+    return Array.isArray(files) ? files.map(item => ({
+      name: String(item?.name || ""),
+      relativePath: String(item?.relativePath || item?.name || ""),
+      extension: String(item?.extension || "").toLowerCase(),
+      mediaType: item?.mediaType === "video" ? "video" : "photo",
+      size: Math.max(0, Number(item?.size) || 0),
+      sha256: /^[a-f0-9]{64}$/.test(String(item?.sha256 || "")) ? item.sha256 : null,
+      library: typeof item?.library === "string" ? item.library : null,
+      verifiedAt: typeof item?.verifiedAt === "string" ? item.verifiedAt : null,
+    })).filter(item => item.name && item.relativePath && item.size > 0 && item.sha256) : [];
+  }
+
+  async function readFullBackup(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(fullBackupPath(username), "utf8"));
+      const allowed = new Set(["idle", "planning", "downloading", "verifying", "paused", "cancelled", "completed", "failed"]);
+      return {
+        status: allowed.has(parsed.status) ? parsed.status : "idle",
+        message: typeof parsed.message === "string" ? parsed.message : "尚未开始完整备份。",
+        startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
+        updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : null,
+        completedAt: typeof parsed.completedAt === "string" ? parsed.completedAt : null,
+        phase: typeof parsed.phase === "string" ? parsed.phase : "idle",
+        currentLibrary: typeof parsed.currentLibrary === "string" ? parsed.currentLibrary : null,
+        planned: Math.max(0, Number(parsed.planned) || 0),
+        downloaded: Math.max(0, Number(parsed.downloaded) || 0),
+        verified: Math.max(0, Number(parsed.verified) || 0),
+        skipped: Math.max(0, Number(parsed.skipped) || 0),
+        failed: Math.max(0, Number(parsed.failed) || 0),
+        photoCount: Math.max(0, Number(parsed.photoCount) || 0),
+        videoCount: Math.max(0, Number(parsed.videoCount) || 0),
+        verifiedBytes: Math.max(0, Number(parsed.verifiedBytes) || 0),
+        manifestFileCount: Math.max(0, Number(parsed.manifestFileCount) || 0),
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") return { status: "idle", message: "尚未开始完整备份。", startedAt: null, updatedAt: null, completedAt: null, phase: "idle", currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, manifestFileCount: 0 };
+      throw error;
+    }
+  }
+
+  async function readFullManifest(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(fullManifestPath(username), "utf8"));
+      return { updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : null, files: cleanFullFiles(parsed.files) };
+    } catch (error) {
+      if (error.code === "ENOENT") return { updatedAt: null, files: [] };
+      throw error;
+    }
+  }
+
+  async function writeFullBackup(username, update) {
+    const current = await readFullBackup(username);
+    const next = { ...current, ...update, updatedAt: new Date().toISOString() };
+    await atomicJson(username, fullBackupPath(username), { version: 1, ...next });
+    return next;
+  }
+
+  async function writeFullManifest(username, files) {
+    const previous = await readFullManifest(username);
+    const byPath = new Map(previous.files.map(item => [item.relativePath, item]));
+    for (const item of cleanFullFiles(files)) byPath.set(item.relativePath, item);
+    const updatedAt = new Date().toISOString();
+    const merged = [...byPath.values()].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    await atomicJson(username, fullManifestPath(username), { version: 1, updatedAt, fileCount: merged.length, files: merged });
+    return { updatedAt, files: merged };
+  }
+
   async function readScan(username) {
     validateUsername(username);
     try {
@@ -245,5 +335,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, writeFullBackup, writeFullManifest, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

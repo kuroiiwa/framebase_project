@@ -25,6 +25,7 @@ const icloudProvider = createIcloudPdProvider({
   ),
 });
 const icloudBackupUsers = new Set();
+const icloudFullBackupJobs = new Map();
 const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
 const appPort = Number(process.env.FRAMEBASE_APP_PORT || 3001);
@@ -393,11 +394,17 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, backup, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloudProvider.info()]);
+    const [config, scan, backup, fullBackupStored, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloudProvider.info()]);
+    let fullBackup = fullBackupStored;
+    if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
+      fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
+    }
     return json(response, 200, {
       ...config,
       scan,
       backup,
+      fullBackup,
+      fullManifest: { updatedAt: fullBackup.updatedAt, fileCount: fullBackup.manifestFileCount },
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });
   }
@@ -456,6 +463,64 @@ async function handleIcloud(request, response, url) {
     } finally {
       icloudBackupUsers.delete(current.username);
     }
+  }
+  if (request.method === "POST" && (url.pathname === "/api/icloud/backup/full/start" || url.pathname === "/api/icloud/backup/full/resume")) {
+    if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "当前用户已有 iCloud 备份任务正在运行。" });
+    const context = await icloud.connectionContext(current.username);
+    const config = await icloud.read(current.username);
+    if (config.connectionStatus !== "connected") return json(response, 409, { error: "请先验证 iCloud 登录会话。" });
+    const previousManifest = await icloud.readFullManifest(current.username);
+    const previousState = await icloud.readFullBackup(current.username);
+    const controller = new AbortController();
+    const job = { controller, stopAs: "paused" };
+    icloudFullBackupJobs.set(current.username, job);
+    icloudBackupUsers.add(current.username);
+    const startedAt = url.pathname.endsWith("/resume") && previousState.startedAt ? previousState.startedAt : new Date().toISOString();
+    const initial = await icloud.writeFullBackup(current.username, {
+      status: "planning", phase: "planning", message: previousManifest.files.length ? "正在检查增量变化并准备继续…" : "正在读取完整 iCloud 图库清单…",
+      startedAt, completedAt: null, currentLibrary: null, planned: 0, downloaded: 0, verified: 0, skipped: 0, failed: 0,
+      photoCount: 0, videoCount: 0, verifiedBytes: 0,
+    });
+    void (async () => {
+      try {
+        const result = await icloudProvider.backupAll({
+          ...context, jobKey: current.username, previousFiles: previousManifest.files, signal: controller.signal,
+          onProgress: update => icloud.writeFullBackup(current.username, update),
+        });
+        if (result.status === "aborted") {
+          await icloud.writeFullBackup(current.username, { status: job.stopAs, phase: job.stopAs, message: job.stopAs === "cancelled" ? "完整备份已取消；已下载的本地文件会保留。" : result.message });
+          return;
+        }
+        const savedManifest = result.files?.length ? await icloud.writeFullManifest(current.username, result.files) : previousManifest;
+        const completed = result.status === "completed";
+        await icloud.writeFullBackup(current.username, {
+          status: completed ? "completed" : "failed", phase: completed ? "completed" : "failed", message: result.message,
+          completedAt: completed ? new Date().toISOString() : null, currentLibrary: null,
+          planned: result.planned || 0, downloaded: result.planned || 0, verified: result.files?.length || 0,
+          skipped: result.skipped || 0, failed: result.failed || 0, photoCount: result.photoCount || 0,
+          videoCount: result.videoCount || 0, verifiedBytes: result.verifiedBytes || 0, manifestFileCount: savedManifest.files.length,
+        });
+        if (result.status === "needs_auth") await icloud.recordConnectionCheck(current.username, result);
+      } catch {
+        await icloud.writeFullBackup(current.username, { status: "failed", phase: "failed", message: "完整备份任务意外停止，可点击重试继续。" });
+      } finally {
+        icloudFullBackupJobs.delete(current.username);
+        icloudBackupUsers.delete(current.username);
+      }
+    })();
+    return json(response, 202, { fullBackup: initial });
+  }
+  if (request.method === "POST" && (url.pathname === "/api/icloud/backup/full/pause" || url.pathname === "/api/icloud/backup/full/cancel")) {
+    const job = icloudFullBackupJobs.get(current.username);
+    const stopAs = url.pathname.endsWith("/cancel") ? "cancelled" : "paused";
+    if (!job) {
+      const currentState = await icloud.readFullBackup(current.username);
+      if (!["planning", "downloading", "verifying"].includes(currentState.status)) return json(response, 409, { error: "当前没有正在运行的完整备份任务。" });
+      return json(response, 200, { fullBackup: await icloud.writeFullBackup(current.username, { status: stopAs, phase: stopAs, message: stopAs === "cancelled" ? "完整备份已取消。" : "完整备份已暂停，可稍后继续。" }) });
+    }
+    job.stopAs = stopAs;
+    job.controller.abort();
+    return json(response, 202, { fullBackup: await icloud.writeFullBackup(current.username, { message: stopAs === "cancelled" ? "正在安全取消…" : "正在安全暂停…" }) });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
     const context = await icloud.connectionContext(current.username);

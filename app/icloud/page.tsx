@@ -21,6 +21,14 @@ type IcloudConfig = {
   updatedAt: string | null;
   scan?: { scannedAt: string | null; sampleCount: number; samples: Array<{ name: string; extension: string; mediaType: "photo" | "video" }> };
   backup?: { completedAt: string | null; fileCount: number; files: Array<{ name: string; relativePath: string; extension: string; mediaType: "photo" | "video"; size: number; sha256: string | null }> };
+  fullBackup?: FullBackupState;
+  fullManifest?: { updatedAt: string | null; fileCount: number };
+};
+
+type FullBackupState = {
+  status: "idle" | "planning" | "downloading" | "verifying" | "paused" | "cancelled" | "completed" | "failed";
+  message: string; startedAt: string | null; updatedAt: string | null; completedAt: string | null; phase: string; currentLibrary: string | null;
+  planned: number; downloaded: number; verified: number; skipped: number; failed: number; photoCount: number; videoCount: number; verifiedBytes: number; manifestFileCount: number;
 };
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
@@ -38,7 +46,7 @@ function IcloudCenter({ username }: { username: string }) {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | null>(null);
+  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -77,6 +85,18 @@ function IcloudCenter({ username }: { username: string }) {
     }, 1000);
     return () => clearInterval(timer);
   }, [auth]);
+
+  const fullBackupActive = Boolean(config?.fullBackup && ["planning", "downloading", "verifying"].includes(config.fullBackup.status));
+  useEffect(() => {
+    if (!fullBackupActive) return;
+    const timer = setInterval(() => {
+      void fetch("/api/icloud/config", { cache: "no-store" })
+        .then(response => response.json() as Promise<IcloudConfig>)
+        .then(data => setConfig(data))
+        .catch(() => undefined);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [fullBackupActive]);
 
   async function chooseFolder() {
     setBusy("folder"); setError(""); setMessage("");
@@ -187,10 +207,25 @@ function IcloudCenter({ username }: { username: string }) {
     finally { setBusy(null); }
   }
 
+  async function controlFullBackup(action: "start" | "resume" | "pause" | "cancel") {
+    if (action === "start" && !window.confirm("将开始备份当前用户 iCloud 中的全部图片和视频原文件。任务不会删除或移动任何云端内容；可以暂停并稍后继续。是否开始？")) return;
+    if (action === "cancel" && !window.confirm("取消任务会停止当前下载，但保留已下载文件和已验证清单。是否取消？")) return;
+    setBusy("full"); setError(""); setMessage("");
+    try {
+      const response = await fetch(`/api/icloud/backup/full/${action}`, { method: "POST" });
+      const data = await response.json() as { fullBackup?: FullBackupState; error?: string };
+      if (!response.ok) throw new Error(data.error || "无法更新完整备份任务");
+      if (data.fullBackup) setConfig(current => current ? { ...current, fullBackup: data.fullBackup } : current);
+      setMessage(action === "pause" ? "正在安全暂停任务…" : action === "cancel" ? "正在安全取消任务…" : "完整增量备份已进入后台运行。可留在此页查看进度。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法更新完整备份任务"); }
+    finally { setBusy(null); }
+  }
+
   function formatBytes(bytes: number) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+    return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
   }
 
   const readyForConnection = Boolean(config?.backupDirectory);
@@ -251,6 +286,24 @@ function IcloudCenter({ username }: { username: string }) {
           <div><strong>已验证的安全备份清单</strong><span>{config.backup.fileCount} 个项目 · {new Date(config.backup.completedAt).toLocaleString("zh-CN")}</span></div>
           {config.backup.files.length > 0 && <ul>{config.backup.files.map((item, index) => <li key={`${item.relativePath}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong title={`${item.relativePath}${item.sha256 ? ` · SHA-256 ${item.sha256}` : ""}`}>{item.name} · {formatBytes(item.size)} · {item.sha256 ? "SHA-256 已记录" : "基础校验"}</strong></li>)}</ul>}
         </div>}
+      </article>
+
+      <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
+        <div className={styles.cardHead}><span>4</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；再次运行只补充变化，并复核本地 SHA-256。</p></div></div>
+        <div className={styles.safetyBanner}><strong>安全边界</strong><span>此任务不带任何云端删除参数。暂停或取消只会停止本机任务，已下载文件会保留。</span></div>
+        <div className={styles.fullStatus}>
+          <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? "任务运行中" : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>
+          {config?.fullBackup && <dl><div><dt>计划</dt><dd>{config.fullBackup.planned}</dd></div><div><dt>已验证</dt><dd>{config.fullBackup.verified}</dd></div><div><dt>增量跳过</dt><dd>{config.fullBackup.skipped}</dd></div><div><dt>失败</dt><dd>{config.fullBackup.failed}</dd></div><div><dt>图片</dt><dd>{config.fullBackup.photoCount}</dd></div><div><dt>视频</dt><dd>{config.fullBackup.videoCount}</dd></div></dl>}
+          {config?.fullBackup?.planned ? <div className={styles.progress} aria-label="完整备份进度"><i style={{ width: `${Math.min(100, Math.round(config.fullBackup.verified / config.fullBackup.planned * 100))}%` }} /></div> : null}
+          {config?.fullBackup?.verifiedBytes ? <small>已通过完整性校验：{formatBytes(config.fullBackup.verifiedBytes)} · 清单共 {config.fullManifest?.fileCount || config.fullBackup.verified} 个文件</small> : null}
+        </div>
+        <div className={styles.actions}>
+          {(!config?.fullBackup || ["idle", "cancelled"].includes(config.fullBackup.status)) && <button className={styles.primary} onClick={() => void controlFullBackup("start")} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "full" ? "正在启动…" : "开始完整备份"}</button>}
+          {config?.fullBackup && ["paused", "failed"].includes(config.fullBackup.status) && <button className={styles.primary} onClick={() => void controlFullBackup("resume")} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "full" ? "正在恢复…" : "继续 / 重试"}</button>}
+          {config?.fullBackup?.status === "completed" && <button className={styles.primary} onClick={() => void controlFullBackup("resume")} disabled={busy !== null || config?.connectionStatus !== "connected"}>检查新增项目</button>}
+          {fullBackupActive && <button onClick={() => void controlFullBackup("pause")} disabled={busy !== null}>暂停</button>}
+          {fullBackupActive && <button className={styles.danger} onClick={() => void controlFullBackup("cancel")} disabled={busy !== null}>取消任务</button>}
+        </div>
       </article>
     </section>
 
