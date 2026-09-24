@@ -394,7 +394,7 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, backup, fullBackupStored, timeline, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readTimeline(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
+    const [config, scan, backup, fullBackupStored, backupCoverage, timeline, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
     if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
       fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
@@ -405,7 +405,7 @@ async function handleIcloud(request, response, url) {
       backup,
       timeline,
       fullBackup,
-      fullManifest: { updatedAt: fullBackup.updatedAt, fileCount: fullBackup.manifestFileCount },
+      fullManifest: { updatedAt: backupCoverage.updatedAt, fileCount: backupCoverage.fileCount, coverage: { years: backupCoverage.years, quarters: backupCoverage.quarters, months: backupCoverage.months } },
       releasePlan,
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });

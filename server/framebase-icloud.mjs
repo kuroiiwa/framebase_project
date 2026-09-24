@@ -144,6 +144,31 @@ export function createIcloudManager({ projectRoot }) {
     }
   }
 
+  async function readBackupCoverage(username) {
+    const manifest = await readFullManifest(username);
+    const years = new Map(); const quarters = new Map(); const months = new Map();
+    const increment = (map, key, item) => {
+      const bucket = map.get(key) || { key, verifiedCount: 0, verifiedBytes: 0, photoCount: 0, videoCount: 0 };
+      bucket.verifiedCount += 1;
+      bucket.verifiedBytes += item.size;
+      if (item.mediaType === "video") bucket.videoCount += 1; else bucket.photoCount += 1;
+      map.set(key, bucket);
+    };
+    for (const item of manifest.files) {
+      const parts = item.relativePath.replaceAll("\\", "/").split("/").filter(Boolean);
+      const dateIndex = parts.findIndex((part, index) => /^\d{4}$/.test(part) && /^(0[1-9]|1[0-2])$/.test(parts[index + 1] || ""));
+      if (dateIndex < 0) continue;
+      const year = Number(parts[dateIndex]);
+      const month = Number(parts[dateIndex + 1]);
+      if (year < 1900 || year > 2200) continue;
+      increment(years, String(year), item);
+      increment(quarters, `${year}-Q${Math.floor((month - 1) / 3) + 1}`, item);
+      increment(months, `${year}-${String(month).padStart(2, "0")}`, item);
+    }
+    const newestFirst = map => [...map.values()].sort((left, right) => right.key.localeCompare(left.key));
+    return { updatedAt: manifest.updatedAt, fileCount: manifest.files.length, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months) };
+  }
+
   async function writeFullBackup(username, update) {
     const current = await readFullBackup(username);
     const next = { ...current, ...update, updatedAt: new Date().toISOString() };
@@ -468,5 +493,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, readFullBackup, readFullManifest, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

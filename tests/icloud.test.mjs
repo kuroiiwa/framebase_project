@@ -48,6 +48,11 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     assert.equal((await manager.readFullBackup("gabri")).status, "verifying");
     assert.equal((await manager.readFullManifest("gabri")).files.length, 2);
     assert.equal((await manager.readFullManifest("alice")).files.length, 0);
+    const coverage = await manager.readBackupCoverage("gabri");
+    assert.deepEqual(coverage.years.map(item => [item.key, item.verifiedCount, item.verifiedBytes]), [["2026", 2, 6144]]);
+    assert.deepEqual(coverage.quarters.map(item => item.key), ["2026-Q3"]);
+    assert.deepEqual(coverage.months.map(item => [item.key, item.photoCount, item.videoCount]), [["2026-09", 1, 1]]);
+    assert.equal((await manager.readBackupCoverage("alice")).fileCount, 0);
     await manager.recordTimeline("gabri", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }, years: [{ key: "2026", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }], quarters: [{ key: "2026-Q3", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }], months: [{ key: "2026-09", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }] });
     assert.equal((await manager.readTimeline("gabri")).months[0].key, "2026-09");
     assert.equal((await manager.readTimeline("alice")).years.length, 0);
@@ -111,6 +116,9 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /按时间统计与选择/);
   assert.match(page, /每 3 个月/);
   assert.match(page, /备份所选范围/);
+  assert.match(page, /备份状态/);
+  assert.match(page, /部分备份/);
+  assert.match(server, /readBackupCoverage/);
   assert.match(page, /生成只读释放计划/);
   assert.match(page, /自动删除保持锁定/);
   assert.match(page, /视频库与独立图片库按格式隔离管理/);
