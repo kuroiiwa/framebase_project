@@ -3,8 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("photo library remains isolated from the existing video library", async () => {
-  const [photos, videos] = await Promise.all([
+  const [photos, photoStyles, icloud, videos] = await Promise.all([
     readFile(new URL("../app/photos/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/photos/photos.module.css", import.meta.url), "utf8"),
+    readFile(new URL("../app/icloud/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
   ]);
   assert.match(photos, /photo-source-folders-v1/);
@@ -18,6 +20,10 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(photos, /<a href="\/">视频库<\/a>/);
   assert.match(photos, /<a href="\/icloud">iCloud 备份<\/a>/);
   assert.match(photos, /<a href="\/lan">局域网<\/a>/);
+  assert.match(photos, /手机比例 9:16/);
+  assert.match(photos, /styles\.cardActions/);
+  assert.match(photoStyles, /\.phoneRatio \.thumb\{aspect-ratio:9\/16\}/);
+  assert.match(icloud, /href="\/photos">返回图片库/);
   assert.doesNotMatch(photos, /removeEntry\(/);
   assert.match(videos, /href="\/photos"/);
   assert.match(videos, /VIDEO_EXTENSIONS/);
