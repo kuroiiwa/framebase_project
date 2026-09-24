@@ -23,7 +23,11 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(photos, /手机比例 9:16/);
   assert.match(photos, /styles\.cardActions/);
   assert.match(photoStyles, /\.phoneRatio \.thumb\{aspect-ratio:9\/16\}/);
-  assert.match(icloud, /href="\/photos">返回图片库/);
+  assert.match(icloud, /<a className=\{styles\.backLink\} href="\/">← 返回视频库<\/a>/);
+  assert.match(icloud, /<a className=\{styles\.backLink\} href="\/photos">返回图片库<\/a>/);
+  assert.match(photos, /import\("heic2any"\)/);
+  assert.match(photos, /HEIC 预览生成失败/);
+  assert.doesNotMatch(photos, /createWritable\(/);
   assert.doesNotMatch(photos, /removeEntry\(/);
   assert.match(videos, /href="\/photos"/);
   assert.match(videos, /VIDEO_EXTENSIONS/);

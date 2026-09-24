@@ -40,6 +40,7 @@ type PreviewRatio = "standard" | "phone";
 
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "heic", "heif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
 const BROWSER_PREVIEW_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]);
+const HEIC_PREVIEW_EXTENSIONS = new Set(["heic", "heif"]);
 const SOURCES_KEY = "photo-source-folders-v1";
 const PAGE_SIZE = 48;
 
@@ -131,22 +132,39 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
   return found;
 }
 
+async function createPreviewObjectUrl(item: PhotoItem) {
+  const file = await item.handle.getFile();
+  if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
+    const { default: heic2any } = await import("heic2any");
+    const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.86 });
+    return URL.createObjectURL(Array.isArray(converted) ? converted[0] : converted);
+  }
+  if (BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) return URL.createObjectURL(file);
+  return null;
+}
+
+function previewStatus(extension: string, failed: boolean) {
+  if (failed) return HEIC_PREVIEW_EXTENSIONS.has(extension) ? "HEIC 预览生成失败" : "预览读取失败";
+  if (HEIC_PREVIEW_EXTENSIONS.has(extension)) return "正在生成 HEIC 预览";
+  if (BROWSER_PREVIEW_EXTENSIONS.has(extension)) return "正在读取预览";
+  return "浏览器暂不支持预览";
+}
+
 function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
     let objectUrl = "";
-    if (!BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) return;
-    void item.handle.getFile().then(file => {
-      if (cancelled) return;
-      objectUrl = URL.createObjectURL(file);
-      setUrl(objectUrl);
-    }).catch(() => setFailed(true));
+    void createPreviewObjectUrl(item).then(createdUrl => {
+      if (!createdUrl) return;
+      if (cancelled) URL.revokeObjectURL(createdUrl);
+      else { objectUrl = createdUrl; setUrl(createdUrl); }
+    }).catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [item]);
   return <button className={styles.thumb} onClick={onOpen} aria-label={`查看 ${item.name}`}>
-    {url && !failed ? <img src={url} alt="" loading="lazy" onError={() => setFailed(true)} /> : <span><b>{item.extension.toUpperCase()}</b><small>{BROWSER_PREVIEW_EXTENSIONS.has(item.extension) ? "正在读取预览" : "浏览器暂不支持预览"}</small></span>}
+    {url && !failed ? <img src={url} alt="" loading="lazy" onError={() => setFailed(true)} /> : <span><b>{item.extension.toUpperCase()}</b><small>{previewStatus(item.extension, failed)}</small></span>}
   </button>;
 }
 
@@ -154,11 +172,14 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
+    let cancelled = false;
     let objectUrl = "";
-    if (BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) void item.handle.getFile().then(file => {
-      objectUrl = URL.createObjectURL(file); setUrl(objectUrl);
-    }).catch(() => setFailed(true));
-    return () => { if (objectUrl) URL.revokeObjectURL(objectUrl); };
+    void createPreviewObjectUrl(item).then(createdUrl => {
+      if (!createdUrl) return;
+      if (cancelled) URL.revokeObjectURL(createdUrl);
+      else { objectUrl = createdUrl; setUrl(createdUrl); }
+    }).catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [item]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
@@ -172,7 +193,7 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   return <div className={styles.viewer} role="dialog" aria-modal="true" aria-label={item.name}>
     <button className={styles.viewerClose} onClick={onClose} aria-label="关闭">×</button>
     <button className={styles.viewerPrevious} onClick={previous} aria-label="上一张">‹</button>
-    <figure>{url && !failed ? <img src={url} alt={item.name} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>浏览器无法直接显示此原始格式，但文件仍已纳入图片库。</span></div>}<figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</span></figcaption></figure>
+    <figure>{url && !failed ? <img src={url} alt={item.name} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}<figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</span></figcaption></figure>
     <button className={styles.viewerNext} onClick={next} aria-label="下一张">›</button>
   </div>;
 }

@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-html-link-for-pages -- hard navigation is required by the Vinext compatibility router. */
+
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
@@ -314,7 +316,7 @@ function IcloudCenter({ username }: { username: string }) {
   return <main className={styles.page}>
     <header className={styles.topbar}>
       <Link href="/"><span>F</span>Framebase</Link>
-      <div><Link className={styles.backLink} href="/">← 返回视频库</Link><Link className={styles.backLink} href="/photos">返回图片库</Link><b>{username} · iCloud 备份中心</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></div>
+      <div><a className={styles.backLink} href="/">← 返回视频库</a><a className={styles.backLink} href="/photos">返回图片库</a><b>{username} · iCloud 备份中心</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></div>
     </header>
 
     <section className={styles.hero}>
@@ -411,6 +413,6 @@ function IcloudCenter({ username }: { username: string }) {
       </article>
     </section>
 
-    <footer><span>配置只保存在这台电脑，并按 FrameBase 用户隔离</span><Link href="/">返回视频库 →</Link></footer>
+    <footer><span>配置只保存在这台电脑，并按 FrameBase 用户隔离</span><a href="/">返回视频库 →</a></footer>
   </main>;
 }
