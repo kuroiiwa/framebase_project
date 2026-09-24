@@ -485,7 +485,7 @@ async function handleIcloud(request, response, url) {
     const previousState = await icloud.readFullBackup(current.username);
     const body = await readJsonBody(request);
     const submittedRanges = Array.isArray(body.ranges) ? body.ranges.filter(item => item && typeof item.key === "string" && typeof item.label === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.start) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.end)).slice(0, 60) : [];
-    const ranges = url.pathname.endsWith("/resume") && submittedRanges.length === 0 ? previousState.ranges : submittedRanges;
+    const ranges = url.pathname.endsWith("/resume") && submittedRanges.length === 0 && ["paused", "failed"].includes(previousState.status) ? previousState.ranges : submittedRanges;
     const controller = new AbortController();
     const job = { controller, stopAs: "paused" };
     icloudFullBackupJobs.set(current.username, job);
