@@ -394,7 +394,7 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, backup, fullBackupStored, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloudProvider.info()]);
+    const [config, scan, backup, fullBackupStored, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
     if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
       fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
@@ -405,6 +405,7 @@ async function handleIcloud(request, response, url) {
       backup,
       fullBackup,
       fullManifest: { updatedAt: fullBackup.updatedAt, fileCount: fullBackup.manifestFileCount },
+      releasePlan,
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });
   }
@@ -521,6 +522,14 @@ async function handleIcloud(request, response, url) {
     job.stopAs = stopAs;
     job.controller.abort();
     return json(response, 202, { fullBackup: await icloud.writeFullBackup(current.username, { message: stopAs === "cancelled" ? "正在安全取消…" : "正在安全暂停…" }) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/release/plan") {
+    if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "备份任务运行时不能生成释放计划。" });
+    return json(response, 200, { releasePlan: await icloud.createReleasePlan(current.username) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/release/confirm") {
+    const body = await readJsonBody(request);
+    return json(response, 200, { releasePlan: await icloud.confirmReleasePlan(current.username, body.planId, body.confirmation) });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
     const context = await icloud.connectionContext(current.username);

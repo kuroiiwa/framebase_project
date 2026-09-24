@@ -23,7 +23,10 @@ type IcloudConfig = {
   backup?: { completedAt: string | null; fileCount: number; files: Array<{ name: string; relativePath: string; extension: string; mediaType: "photo" | "video"; size: number; sha256: string | null }> };
   fullBackup?: FullBackupState;
   fullManifest?: { updatedAt: string | null; fileCount: number };
+  releasePlan?: ReleasePlan | null;
 };
+
+type ReleasePlan = { id: string | null; status: "ready" | "blocked" | "confirmed"; message: string; createdAt: string | null; confirmedAt: string | null; eligibleCount: number; eligibleBytes: number; failedCount: number; files: Array<{ name: string; relativePath: string; mediaType: "photo" | "video"; size: number }> };
 
 type FullBackupState = {
   status: "idle" | "planning" | "downloading" | "verifying" | "paused" | "cancelled" | "completed" | "failed";
@@ -46,7 +49,8 @@ function IcloudCenter({ username }: { username: string }) {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | null>(null);
+  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | "release" | null>(null);
+  const [releaseConfirmation, setReleaseConfirmation] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -221,6 +225,33 @@ function IcloudCenter({ username }: { username: string }) {
     finally { setBusy(null); }
   }
 
+  async function createReleasePlan() {
+    if (!window.confirm("FrameBase 将重新读取并计算完整备份中每个文件的 SHA-256。只有全部通过后才会生成释放计划；此步骤不会修改 iCloud。是否继续？")) return;
+    setBusy("release"); setError(""); setMessage("");
+    try {
+      const response = await fetch("/api/icloud/release/plan", { method: "POST" });
+      const data = await response.json() as { releasePlan?: ReleasePlan; error?: string };
+      if (!response.ok || !data.releasePlan) throw new Error(data.error || "无法生成释放计划");
+      setConfig(current => current ? { ...current, releasePlan: data.releasePlan } : current);
+      if (data.releasePlan.status === "ready") setMessage(data.releasePlan.message); else setError(data.releasePlan.message);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法生成释放计划"); }
+    finally { setBusy(null); }
+  }
+
+  async function confirmReleasePlan(event: React.FormEvent) {
+    event.preventDefault();
+    if (!config?.releasePlan?.id) return;
+    setBusy("release"); setError(""); setMessage("");
+    try {
+      const response = await fetch("/api/icloud/release/confirm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: config.releasePlan.id, confirmation: releaseConfirmation }) });
+      const data = await response.json() as { releasePlan?: ReleasePlan; error?: string };
+      if (!response.ok || !data.releasePlan) throw new Error(data.error || "无法确认释放计划");
+      setConfig(current => current ? { ...current, releasePlan: data.releasePlan } : current); setReleaseConfirmation("");
+      setMessage(data.releasePlan.message);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法确认释放计划"); }
+    finally { setBusy(null); }
+  }
+
   function formatBytes(bytes: number) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -304,6 +335,19 @@ function IcloudCenter({ username }: { username: string }) {
           {fullBackupActive && <button onClick={() => void controlFullBackup("pause")} disabled={busy !== null}>暂停</button>}
           {fullBackupActive && <button className={styles.danger} onClick={() => void controlFullBackup("cancel")} disabled={busy !== null}>取消任务</button>}
         </div>
+      </article>
+
+      <article className={`${styles.card} ${config?.fullBackup?.status !== "completed" ? styles.disabled : ""}`}>
+        <div className={styles.cardHead}><span>5</span><div><h2>iCloud 容量释放</h2><p>先重新复核本地清单，再进入独立确认；任何云端删除都不与备份按钮绑定。</p></div></div>
+        <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>icloudpd 不能按 SHA-256 清单精确指定云端对象，因此自动删除保持锁定，避免误删刚上传但尚未备份的新项目。</span></div>
+        {config?.releasePlan ? <div className={styles.fullStatus}>
+          <div><strong>{config.releasePlan.status === "confirmed" ? "本地副本已确认" : config.releasePlan.status === "ready" ? "释放计划待确认" : "释放计划被阻止"}</strong><span>{config.releasePlan.message}</span></div>
+          <dl><div><dt>可释放项目</dt><dd>{config.releasePlan.eligibleCount}</dd></div><div><dt>本地已验证</dt><dd>{formatBytes(config.releasePlan.eligibleBytes)}</dd></div><div><dt>校验失败</dt><dd>{config.releasePlan.failedCount}</dd></div></dl>
+          {config.releasePlan.files.length > 0 && <ul className={styles.releaseFiles}>{config.releasePlan.files.slice(0, 5).map(item => <li key={item.relativePath}><span>{item.mediaType === "video" ? "视频" : "图片"}</span><strong>{item.name}</strong><small>{formatBytes(item.size)}</small></li>)}</ul>}
+        </div> : <p className={styles.releaseIntro}>完整备份完成后，可生成只读释放计划。生成计划会再次校验全部文件，不会访问删除接口。</p>}
+        <div className={styles.actions}><button onClick={() => void createReleasePlan()} disabled={busy !== null || config?.fullBackup?.status !== "completed"}>{busy === "release" ? "正在复核本地文件…" : config?.releasePlan ? "重新生成释放计划" : "生成只读释放计划"}</button></div>
+        {config?.releasePlan?.status === "ready" && <form className={styles.confirmRelease} onSubmit={confirmReleasePlan}><label>输入“确认本地备份完整”以完成本地确认<input value={releaseConfirmation} onChange={event => setReleaseConfirmation(event.target.value)} /></label><button className={styles.primary} disabled={busy !== null || releaseConfirmation !== "确认本地备份完整"}>确认本地副本</button></form>}
+        {config?.releasePlan?.status === "confirmed" && <div className={styles.manualRelease}><strong>下一步仍需人工操作</strong><span>请在 iCloud 照片中核对并删除对应项目，再到“最近删除”中决定是否彻底清空。自动删除将在支持精确对象匹配后再开放。</span><a href={config.icloudDomain === "cn" ? "https://www.icloud.com.cn/photos/" : "https://www.icloud.com/photos/"} target="_blank" rel="noreferrer">打开 iCloud 照片</a></div>}
       </article>
     </section>
 

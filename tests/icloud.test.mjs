@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -59,6 +60,35 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
   }
 });
 
+test("capacity release plan requires a completed backup and fresh local SHA-256 verification", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "framebase-release-project-"));
+  const selectedRoot = await mkdtemp(join(tmpdir(), "framebase-release-backup-"));
+  try {
+    const manager = createIcloudManager({ projectRoot });
+    const config = await manager.configureBackupDirectory("alice", selectedRoot);
+    const relativePath = "2026/09/IMG_0001.HEIC";
+    const localPath = join(config.backupDirectory, "2026", "09", "IMG_0001.HEIC");
+    await mkdir(join(config.backupDirectory, "2026", "09"), { recursive: true });
+    await writeFile(localPath, "verified-original");
+    const sha256 = createHash("sha256").update("verified-original").digest("hex");
+    await manager.writeFullManifest("alice", [{ name: "IMG_0001.HEIC", relativePath, extension: "heic", mediaType: "photo", size: 17, sha256, verifiedAt: new Date().toISOString() }]);
+    await manager.writeFullBackup("alice", { status: "completed", phase: "completed", message: "done", completedAt: new Date().toISOString(), manifestFileCount: 1 });
+    const ready = await manager.createReleasePlan("alice");
+    assert.equal(ready.status, "ready");
+    assert.equal(ready.eligibleCount, 1);
+    await assert.rejects(manager.confirmReleasePlan("alice", ready.id, "错误文字"), { status: 400 });
+    const confirmed = await manager.confirmReleasePlan("alice", ready.id, "确认本地备份完整");
+    assert.equal(confirmed.status, "confirmed");
+    await writeFile(localPath, "tampered-original");
+    const blocked = await manager.createReleasePlan("alice");
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.failedCount, 1);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(selectedRoot, { recursive: true, force: true });
+  }
+});
+
 test("iCloud backup center remains a separate authenticated route", async () => {
   const [page, lanPage, server] = await Promise.all([
     readFile(new URL("../app/icloud/page.tsx", import.meta.url), "utf8"),
@@ -75,6 +105,8 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /安全备份最近 3 个/);
   assert.match(page, /完整增量备份/);
   assert.match(page, /开始完整备份/);
+  assert.match(page, /生成只读释放计划/);
+  assert.match(page, /自动删除保持锁定/);
   assert.match(page, /视频库与独立图片库按格式隔离管理/);
   assert.match(page, /← 返回视频库/);
   assert.match(lanPage, /← 返回视频库/);
@@ -87,5 +119,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /\/api\/icloud\/backup\/test/);
   assert.match(server, /icloudProvider\.backupAll/);
   assert.match(server, /\/api\/icloud\/backup\/full\/pause/);
+  assert.match(server, /\/api\/icloud\/release\/plan/);
+  assert.match(server, /icloud\.confirmReleasePlan/);
   assert.match(server, /ShowDialog\(\$owner\)/);
 });

@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -52,6 +54,20 @@ export function createIcloudManager({ projectRoot }) {
 
   function fullManifestPath(username) {
     return join(userDirectory(username), "full-manifest.json");
+  }
+
+  function releasePlanPath(username) {
+    return join(userDirectory(username), "release-plan.json");
+  }
+
+  function sha256File(path) {
+    return new Promise((resolvePromise, reject) => {
+      const hash = createHash("sha256");
+      const stream = createReadStream(path);
+      stream.on("error", reject);
+      stream.on("data", chunk => hash.update(chunk));
+      stream.on("end", () => resolvePromise(hash.digest("hex")));
+    });
   }
 
   async function atomicJson(username, destination, value) {
@@ -134,6 +150,80 @@ export function createIcloudManager({ projectRoot }) {
     const merged = [...byPath.values()].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     await atomicJson(username, fullManifestPath(username), { version: 1, updatedAt, fileCount: merged.length, files: merged });
     return { updatedAt, files: merged };
+  }
+
+  async function readReleasePlan(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(releasePlanPath(username), "utf8"));
+      const allowed = new Set(["ready", "blocked", "confirmed"]);
+      return {
+        id: typeof parsed.id === "string" ? parsed.id : null,
+        status: allowed.has(parsed.status) ? parsed.status : "blocked",
+        message: typeof parsed.message === "string" ? parsed.message : "释放计划不可用。",
+        createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : null,
+        confirmedAt: typeof parsed.confirmedAt === "string" ? parsed.confirmedAt : null,
+        manifestUpdatedAt: typeof parsed.manifestUpdatedAt === "string" ? parsed.manifestUpdatedAt : null,
+        eligibleCount: Math.max(0, Number(parsed.eligibleCount) || 0),
+        eligibleBytes: Math.max(0, Number(parsed.eligibleBytes) || 0),
+        failedCount: Math.max(0, Number(parsed.failedCount) || 0),
+        files: cleanFullFiles(parsed.files).slice(0, 100),
+        failures: Array.isArray(parsed.failures) ? parsed.failures.filter(item => item && typeof item.relativePath === "string").slice(0, 100) : [],
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async function createReleasePlan(username) {
+    const [config, fullBackup, manifest] = await Promise.all([read(username), readFullBackup(username), readFullManifest(username)]);
+    if (!config.backupDirectory || fullBackup.status !== "completed" || !manifest.updatedAt || manifest.files.length === 0) {
+      throw Object.assign(new Error("请先完成一次完整增量备份和 SHA-256 校验。"), { status: 409 });
+    }
+    const backupRoot = await realpath(config.backupDirectory);
+    const eligible = [];
+    const failures = [];
+    for (const item of manifest.files) {
+      try {
+        const requested = resolve(backupRoot, item.relativePath);
+        const lexical = relative(backupRoot, requested);
+        if (!lexical || lexical.startsWith("..") || isAbsolute(lexical)) throw new Error("路径超出备份目录");
+        const actual = await realpath(requested);
+        const actualRelative = relative(backupRoot, actual);
+        if (actualRelative.startsWith("..") || isAbsolute(actualRelative)) throw new Error("文件链接超出备份目录");
+        const info = await stat(actual);
+        if (!info.isFile() || info.size !== item.size || info.size <= 0) throw new Error("文件大小不一致");
+        const sha256 = await sha256File(actual);
+        if (sha256 !== item.sha256) throw new Error("SHA-256 不一致");
+        eligible.push({ ...item, verifiedAt: new Date().toISOString() });
+      } catch (error) {
+        failures.push({ relativePath: item.relativePath, reason: error instanceof Error ? error.message : "校验失败" });
+      }
+    }
+    const createdAt = new Date().toISOString();
+    const ready = failures.length === 0 && eligible.length === manifest.files.length;
+    const plan = {
+      version: 1, id: randomUUID(), status: ready ? "ready" : "blocked",
+      message: ready ? `已重新校验 ${eligible.length} 个本地文件；可以进入人工释放确认。` : `${failures.length} 个本地文件未通过复核，禁止释放 iCloud 内容。`,
+      createdAt, confirmedAt: null, manifestUpdatedAt: manifest.updatedAt,
+      eligibleCount: eligible.length, eligibleBytes: eligible.reduce((sum, item) => sum + item.size, 0),
+      failedCount: failures.length, files: eligible, failures,
+    };
+    await atomicJson(username, releasePlanPath(username), plan);
+    return readReleasePlan(username);
+  }
+
+  async function confirmReleasePlan(username, planId, confirmation) {
+    const plan = await readReleasePlan(username);
+    const manifest = await readFullManifest(username);
+    if (!plan || plan.status !== "ready" || plan.id !== planId || plan.manifestUpdatedAt !== manifest.updatedAt) {
+      throw Object.assign(new Error("释放计划已失效，请重新生成并校验。"), { status: 409 });
+    }
+    if (confirmation !== "确认本地备份完整") throw Object.assign(new Error("确认文字不正确。"), { status: 400 });
+    const confirmed = { ...JSON.parse(await readFile(releasePlanPath(username), "utf8")), status: "confirmed", confirmedAt: new Date().toISOString(), message: "本地副本已确认完整；自动云端删除仍保持锁定。" };
+    await atomicJson(username, releasePlanPath(username), confirmed);
+    return readReleasePlan(username);
   }
 
   async function readScan(username) {
@@ -335,5 +425,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, readFullBackup, readFullManifest, writeFullBackup, writeFullManifest, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, writeFullBackup, writeFullManifest, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }
