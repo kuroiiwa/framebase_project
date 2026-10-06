@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, type ReactNode } from "react";
-import { migrateGabriLibrary, setStorageUser } from "./account-storage";
+import { accountKey, migrateGabriLibrary, setStorageUser } from "./account-storage";
 
 export async function signOut() {
   await fetch("/api/account/logout", { method: "POST" });
@@ -36,6 +36,18 @@ export default function AccountGate({ children }: { children: (username: string)
         if (data.user) {
           setStorageUser(data.user);
           if (data.user === "gabri") await migrateGabriLibrary();
+          const currentUrl = new URL(window.location.href);
+          const libraryPreferenceKey = accountKey("framebase-last-library");
+          if (currentUrl.pathname === "/photos") localStorage.setItem(libraryPreferenceKey, "photos");
+          if (currentUrl.pathname === "/" && data.user !== "admin") {
+            if (currentUrl.searchParams.get("library") === "video") {
+              localStorage.setItem(libraryPreferenceKey, "video");
+              window.history.replaceState(window.history.state, "", "/");
+            } else if (localStorage.getItem(libraryPreferenceKey) === "photos") {
+              window.location.replace("/photos");
+              return;
+            } else localStorage.setItem(libraryPreferenceKey, "video");
+          }
           setUsername(data.user);
         }
       } catch (reason) { setError(reason instanceof Error ? reason.message : "无法连接账户服务。请使用 npm run lan 启动 Framebase。"); }
@@ -77,7 +89,7 @@ export default function AccountGate({ children }: { children: (username: string)
   if (username) return <>{children(username)}</>;
   return <main className="account-screen"><section className="account-card">
     <div className="account-logo">F</div><h1>Framebase</h1>
-    <p>{needsSetup ? "首次使用，请为 admin 设置密码。" : mode === "register" ? "输入用户名，创建你的个人视频库" : adminLogin ? "输入管理员密码" : "输入用户名，进入你的视频库"}</p>
+    <p>{needsSetup ? "首次使用，请为 admin 设置密码。" : mode === "register" ? "输入用户名，创建你的个人媒体库" : adminLogin ? "输入管理员密码" : "输入用户名，进入你的媒体库"}</p>
     <form onSubmit={submit}>
       <label>用户名<input value={needsSetup ? "admin" : name} onChange={event => setName(event.target.value)} disabled={needsSetup || busy} autoComplete="username" required minLength={3} maxLength={32} /></label>
       {adminLogin && <label>管理员密码<input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete={needsSetup ? "new-password" : "current-password"} required minLength={8} maxLength={128} disabled={busy} /></label>}

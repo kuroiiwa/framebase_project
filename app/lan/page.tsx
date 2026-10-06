@@ -216,7 +216,7 @@ function LanSettingsContent({ username }: { username: string }) {
 
   return <main className={`${styles.page} ${fontStyles[fontSize]}`}>
     <div className="route-theme"><ThemeSelector /></div>
-    <header className={styles.topbar}><Link href="/"><span>F</span>Framebase</Link><div className={fontStyles.topActions}><button className={styles.backLink} onClick={() => window.location.assign("/")}>← 返回视频库</button><b>{username} · 电脑端设置</b><button className={styles.signOut} onClick={() => void signOut()}>退出</button><div className={fontStyles.fontControls} aria-label="页面字体大小"><button className={fontSize === "small" ? fontStyles.active : ""} onClick={() => updateFontSize("small")} title="较小字体" aria-label="较小字体">A−</button><button className={fontSize === "medium" ? fontStyles.active : ""} onClick={() => updateFontSize("medium")} title="标准字体" aria-label="标准字体">A</button><button className={fontSize === "large" ? fontStyles.active : ""} onClick={() => updateFontSize("large")} title="大字体" aria-label="大字体">A＋</button></div></div></header>
+    <header className={styles.topbar}><Link href="/?library=video"><span>F</span>Framebase</Link><div className={fontStyles.topActions}><button className={styles.backLink} onClick={() => window.location.assign("/?library=video")}>← 返回视频库</button><b>{username} · 电脑端设置</b><button className={styles.signOut} onClick={() => void signOut()}>退出</button><div className={fontStyles.fontControls} aria-label="页面字体大小"><button className={fontSize === "small" ? fontStyles.active : ""} onClick={() => updateFontSize("small")} title="较小字体" aria-label="较小字体">A−</button><button className={fontSize === "medium" ? fontStyles.active : ""} onClick={() => updateFontSize("medium")} title="标准字体" aria-label="标准字体">A</button><button className={fontSize === "large" ? fontStyles.active : ""} onClick={() => updateFontSize("large")} title="大字体" aria-label="大字体">A＋</button></div></div></header>
     <section className={styles.hero}><p>局域网共享</p><h1>让手机只读访问<br />这台电脑的视频</h1><span>手机只能浏览和播放，不能删除文件或修改共享目录。</span></section>
 
     {error && <div className={styles.error}>{error}<button onClick={() => setError("")}>×</button></div>}
@@ -244,6 +244,6 @@ function LanSettingsContent({ username }: { username: string }) {
       <ol><li>电脑和手机连接到同一个局域网。</li><li>保持 Framebase 启动窗口打开。</li><li>如果手机无法连接，请允许 Windows 防火墙中的专用网络访问。</li></ol>
     </section>
     <PowerPanel admin />
-    <footer><span>设置仅保存在这台电脑</span><Link href="/">返回电脑端视频库 →</Link></footer>
+    <footer><span>设置仅保存在这台电脑</span><Link href="/?library=video">返回电脑端视频库 →</Link></footer>
   </main>;
 }

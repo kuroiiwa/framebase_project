@@ -461,6 +461,8 @@ function Library({ username }: { username: string }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => { localStorage.setItem(accountKey("framebase-last-library"), "video"); }, []);
+
   useEffect(() => {
     if (window.location.hostname === "127.0.0.1") {
       const originalStorageUrl = new URL(window.location.href);

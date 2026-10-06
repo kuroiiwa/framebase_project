@@ -37,11 +37,13 @@ type PhotoMarks = Record<string, { liked?: boolean; cleanup?: boolean }>;
 type Tab = "all" | "liked" | "cleanup";
 type Sort = "newest" | "oldest" | "largest" | "smallest" | "name";
 type PreviewRatio = "standard" | "phone";
+type PhotoPreferences = { compact: boolean; previewRatio: PreviewRatio; sort: Sort };
 
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "heic", "heif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
 const BROWSER_PREVIEW_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]);
 const HEIC_PREVIEW_EXTENSIONS = new Set(["heic", "heif"]);
 const SOURCES_KEY = "photo-source-folders-v1";
+const PHOTO_PREFERENCES_KEY = "framebase-photo-view";
 const PAGE_SIZE = 48;
 const THUMBNAIL_WIDTH = 640;
 const thumbnailQueue: Array<() => void> = [];
@@ -278,11 +280,35 @@ function PhotoLibrary({ username }: { username: string }) {
   const [sort, setSort] = useState<Sort>("newest");
   const [compact, setCompact] = useState(false);
   const [previewRatio, setPreviewRatio] = useState<PreviewRatio>("standard");
+  const [preferencesReady, setPreferencesReady] = useState(false);
   const [page, setPage] = useState(1);
   const [viewerId, setViewerId] = useState<string | null>(null);
   const [icloudBackupDirectory, setIcloudBackupDirectory] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+
+  useEffect(() => { localStorage.setItem(accountKey("framebase-last-library"), "photos"); }, []);
+
+  useEffect(() => {
+    let saved: Partial<PhotoPreferences> = {};
+    try {
+      const parsed = JSON.parse(localStorage.getItem(accountKey(PHOTO_PREFERENCES_KEY)) || "{}");
+      if (parsed && typeof parsed === "object") saved = parsed as Partial<PhotoPreferences>;
+    }
+    catch { /* Invalid preferences fall back to the defaults. */ }
+    queueMicrotask(() => {
+      if (typeof saved.compact === "boolean") setCompact(saved.compact);
+      if (saved.previewRatio === "standard" || saved.previewRatio === "phone") setPreviewRatio(saved.previewRatio);
+      if (["newest", "oldest", "largest", "smallest", "name"].includes(saved.sort || "")) setSort(saved.sort as Sort);
+      setPreferencesReady(true);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!preferencesReady) return;
+    const preferences: PhotoPreferences = { compact, previewRatio, sort };
+    localStorage.setItem(accountKey(PHOTO_PREFERENCES_KEY), JSON.stringify(preferences));
+  }, [compact, preferencesReady, previewRatio, sort]);
 
   useEffect(() => {
     let cancelled = false;
@@ -395,9 +421,9 @@ function PhotoLibrary({ username }: { username: string }) {
 
   return <main className={styles.page}>
     <header className={styles.topbar}>
-      <a href="/"><span>F</span>Framebase</a>
+      <a href="/?library=video"><span>F</span>Framebase</a>
       <label><span>⌕</span><input value={query} onChange={event => { setQuery(event.target.value); setPage(1); }} placeholder="搜索图片名称或路径…" aria-label="搜索图片" /></label>
-      <nav><a href="/">视频库</a><a href="/icloud">iCloud 备份</a><a href="/lan">局域网</a><b>{username}</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></nav>
+      <nav><a href="/?library=video">视频库</a><a href="/icloud">iCloud 备份</a><a href="/lan">局域网</a><b>{username}</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></nav>
     </header>
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {notice && <div className={styles.notice} role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
@@ -413,7 +439,7 @@ function PhotoLibrary({ username }: { username: string }) {
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
     {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} /><nav className={styles.cardActions}><button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>)}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
-    <footer><span>图片库只读取用户明确授权的本地文件夹</span><a href="/">返回视频库 →</a></footer>
+    <footer><span>图片库只读取用户明确授权的本地文件夹</span><a href="/?library=video">返回视频库 →</a></footer>
     {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} />}
   </main>;
 }
