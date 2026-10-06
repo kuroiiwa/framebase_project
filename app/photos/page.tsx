@@ -45,27 +45,52 @@ const HEIC_PREVIEW_EXTENSIONS = new Set(["heic", "heif"]);
 const SOURCES_KEY = "photo-source-folders-v1";
 const PHOTO_PREFERENCES_KEY = "framebase-photo-view";
 const PAGE_SIZE = 48;
-const THUMBNAIL_WIDTH = 640;
-const thumbnailQueue: Array<() => void> = [];
-let activeThumbnailJobs = 0;
+const THUMBNAIL_WIDTH = 512;
+const THUMBNAIL_CACHE_LIMIT = 160;
+type PreviewJob = { cancelled: () => boolean; start: () => Promise<void>; skip: () => void };
+type PreviewQueue = { pending: PreviewJob[]; active: number; limit: number };
+const regularPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 3 };
+const heicPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 1 };
+const thumbnailBlobCache = new Map<string, Blob>();
 
-function drainThumbnailQueue() {
-  while (activeThumbnailJobs < 1 && thumbnailQueue.length) {
-    activeThumbnailJobs += 1;
-    thumbnailQueue.shift()?.();
+function drainPreviewQueue(queue: PreviewQueue) {
+  while (queue.pending.length && queue.active < queue.limit) {
+    const job = queue.pending.shift()!;
+    if (job.cancelled()) { job.skip(); continue; }
+    queue.active += 1;
+    void job.start().finally(() => { queue.active -= 1; drainPreviewQueue(queue); });
   }
 }
 
-function scheduleThumbnail<T>(task: () => Promise<T>) {
-  return new Promise<T>((resolve, reject) => {
-    thumbnailQueue.push(() => {
-      void task().then(resolve, reject).finally(() => {
-        activeThumbnailJobs -= 1;
-        drainThumbnailQueue();
-      });
-    });
-    drainThumbnailQueue();
+function schedulePreview<T>(queue: PreviewQueue, task: () => Promise<T>, cancelled: () => boolean, priority = false) {
+  return new Promise<T | null>((resolve, reject) => {
+    const job: PreviewJob = {
+      cancelled,
+      skip: () => resolve(null),
+      start: async () => {
+        try {
+          const result = await task();
+          resolve(cancelled() ? null : result);
+        } catch (error) { if (cancelled()) resolve(null); else reject(error); }
+      },
+    };
+    if (priority) queue.pending.unshift(job); else queue.pending.push(job);
+    drainPreviewQueue(queue);
   });
+}
+
+function thumbnailCacheKey(item: PhotoItem) { return `${item.id}:${item.modified}:${item.size}`; }
+function readThumbnailCache(item: PhotoItem) {
+  const key = thumbnailCacheKey(item);
+  const cached = thumbnailBlobCache.get(key) || null;
+  if (cached) { thumbnailBlobCache.delete(key); thumbnailBlobCache.set(key, cached); }
+  return cached;
+}
+function writeThumbnailCache(item: PhotoItem, blob: Blob) {
+  const key = thumbnailCacheKey(item);
+  thumbnailBlobCache.delete(key);
+  thumbnailBlobCache.set(key, blob);
+  while (thumbnailBlobCache.size > THUMBNAIL_CACHE_LIMIT) thumbnailBlobCache.delete(thumbnailBlobCache.keys().next().value!);
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -167,27 +192,43 @@ async function createPreviewBlob(item: PhotoItem) {
   return null;
 }
 
-async function createPreviewObjectUrl(item: PhotoItem) {
-  const blob = await createPreviewBlob(item);
+async function createPreviewObjectUrl(item: PhotoItem, cancelled: () => boolean) {
+  const blob = HEIC_PREVIEW_EXTENSIONS.has(item.extension)
+    ? await schedulePreview(heicPreviewQueue, () => createPreviewBlob(item), cancelled, true)
+    : await createPreviewBlob(item);
   return blob ? URL.createObjectURL(blob) : null;
 }
 
-async function createThumbnailObjectUrl(item: PhotoItem) {
-  return scheduleThumbnail(async () => {
+async function createThumbnailBlob(item: PhotoItem) {
     const blob = await createPreviewBlob(item);
     if (!blob) return null;
-    const bitmap = await createImageBitmap(blob, { resizeWidth: THUMBNAIL_WIDTH, resizeQuality: "high" });
+    const bitmap = await createImageBitmap(blob, { resizeWidth: THUMBNAIL_WIDTH, resizeQuality: "medium" });
     try {
+      if (typeof OffscreenCanvas !== "undefined") {
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+        return await canvas.convertToBlob({ type: "image/webp", quality: 0.8 });
+      }
       const canvas = document.createElement("canvas");
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
       canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
-      const thumbnail = await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("thumbnail_failed")), "image/webp", 0.82));
-      return URL.createObjectURL(thumbnail);
+      return await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("thumbnail_failed")), "image/webp", 0.8));
     } finally {
       bitmap.close();
     }
-  });
+}
+
+async function createThumbnailObjectUrl(item: PhotoItem, cancelled: () => boolean) {
+  const cached = readThumbnailCache(item);
+  if (cached) return URL.createObjectURL(cached);
+  const queue = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? heicPreviewQueue : regularPreviewQueue;
+  const thumbnail = await schedulePreview(queue, async () => {
+    const created = await createThumbnailBlob(item);
+    if (created) writeThumbnailCache(item, created);
+    return created;
+  }, cancelled);
+  return thumbnail ? URL.createObjectURL(thumbnail) : null;
 }
 
 function previewStatus(extension: string, failed: boolean) {
@@ -213,7 +254,7 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
       if (!entries.some(entry => entry.isIntersecting)) return;
       setNearViewport(true);
       observer.disconnect();
-    }, { rootMargin: "500px 0px" });
+    }, { rootMargin: "600px 0px" });
     observer.observe(button);
     return () => observer.disconnect();
   }, []);
@@ -221,7 +262,7 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
     if (!nearViewport) return;
     let cancelled = false;
     let objectUrl = "";
-    void createThumbnailObjectUrl(item).then(createdUrl => {
+    void createThumbnailObjectUrl(item, () => cancelled).then(createdUrl => {
       if (!createdUrl) return;
       if (cancelled) URL.revokeObjectURL(createdUrl);
       else { objectUrl = createdUrl; setUrl(createdUrl); }
@@ -234,18 +275,26 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
 }
 
 function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void }) {
-  const [url, setUrl] = useState<string | null>(null);
+  const [initialUrl] = useState<string | null>(() => {
+    const thumbnail = readThumbnailCache(item);
+    return thumbnail ? URL.createObjectURL(thumbnail) : null;
+  });
+  const [url, setUrl] = useState<string | null>(initialUrl);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
     let objectUrl = "";
-    void createPreviewObjectUrl(item).then(createdUrl => {
+    void createPreviewObjectUrl(item, () => cancelled).then(createdUrl => {
       if (!createdUrl) return;
       if (cancelled) URL.revokeObjectURL(createdUrl);
-      else { objectUrl = createdUrl; setUrl(createdUrl); }
+      else {
+        objectUrl = createdUrl;
+        if (initialUrl) URL.revokeObjectURL(initialUrl);
+        setUrl(createdUrl);
+      }
     }).catch(() => { if (!cancelled) setFailed(true); });
-    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [item]);
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); if (initialUrl) URL.revokeObjectURL(initialUrl); };
+  }, [initialUrl, item]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();

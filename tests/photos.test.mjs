@@ -42,7 +42,10 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(globalStyles, /height:34px;min-height:34px/);
   assert.match(photos, /IntersectionObserver/);
   assert.match(photos, /createImageBitmap/);
-  assert.match(photos, /activeThumbnailJobs < 1/);
+  assert.match(photos, /regularPreviewQueue: PreviewQueue = \{ pending: \[\], active: 0, limit: 3 \}/);
+  assert.match(photos, /heicPreviewQueue: PreviewQueue = \{ pending: \[\], active: 0, limit: 1 \}/);
+  assert.match(photos, /if \(job\.cancelled\(\)\) \{ job\.skip\(\); continue; \}/);
+  assert.match(photos, /thumbnailBlobCache/);
   assert.match(photoStyles, /content-visibility:auto/);
   assert.doesNotMatch(photos, /createWritable\(/);
   assert.doesNotMatch(photos, /removeEntry\(/);
