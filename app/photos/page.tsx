@@ -423,7 +423,7 @@ function PhotoLibrary({ username }: { username: string }) {
     <header className={styles.topbar}>
       <a href="/?library=video"><span>F</span>Framebase</a>
       <label><span>⌕</span><input value={query} onChange={event => { setQuery(event.target.value); setPage(1); }} placeholder="搜索图片名称或路径…" aria-label="搜索图片" /></label>
-      <nav><a href="/?library=video">视频库</a><a href="/icloud">iCloud 备份</a><a href="/lan">局域网</a><b>{username}</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></nav>
+      <nav className="media-header-actions"><a className="media-header-button" href="/?library=video">视频库</a><a className="media-header-button" href="/icloud">iCloud 备份</a><a className="media-header-button" href="/lan">局域网</a><b className="media-account">{username}</b><button className="media-logout" onClick={() => void signOut()}>退出</button><ThemeSelector /></nav>
     </header>
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {notice && <div className={styles.notice} role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}

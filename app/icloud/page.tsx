@@ -324,7 +324,7 @@ function IcloudCenter({ username }: { username: string }) {
   return <main className={styles.page}>
     <header className={styles.topbar}>
       <Link href="/?library=video"><span>F</span>Framebase</Link>
-      <div><a className={styles.backLink} href="/?library=video">← 返回视频库</a><a className={styles.backLink} href="/photos">返回图片库</a><b>{username} · iCloud 备份中心</b><button onClick={() => void signOut()}>退出</button><ThemeSelector /></div>
+      <div className="media-header-actions"><a className={`${styles.backLink} media-header-button`} href="/?library=video">← 返回视频库</a><a className={`${styles.backLink} media-header-button`} href="/photos">返回图片库</a><b className="media-account">{username} · iCloud 备份中心</b><button className="media-logout" onClick={() => void signOut()}>退出</button><ThemeSelector /></div>
     </header>
 
     <section className={styles.hero}>

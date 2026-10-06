@@ -1080,12 +1080,12 @@ function Library({ username }: { username: string }) {
       <header className="topbar">
         <span className="brand"><span className="brand-mark">F</span> Framebase</span>
         <label className="search"><span>⌕</span><input value={query} onChange={event => { setQuery(event.target.value); setCurrentPage(1); }} placeholder="搜索名称或路径…" aria-label="搜索视频" /></label>
-        <div className="header-actions">
-          <a className="lan-link" href="/photos" title="打开独立图片库">图片库</a>
-          <a className="lan-link" href="/icloud" title="管理当前用户的 iCloud 本地备份">iCloud 备份</a>
-          <a className="lan-link" href="/lan" title="设置手机局域网只读访问">局域网</a>
-          <span className="account-name">{username}</span><button className="account-logout" onClick={() => void signOut()}>退出</button>
-          <button className="shortcut-toggle" onClick={() => setShortcutHelp(value => !value)} aria-expanded={shortcutHelp}>快捷键</button><span className="local-badge">仅本机</span>
+        <div className="header-actions media-header-actions">
+          <a className="lan-link media-header-button" href="/photos" title="打开独立图片库">图片库</a>
+          <a className="lan-link media-header-button" href="/icloud" title="管理当前用户的 iCloud 本地备份">iCloud 备份</a>
+          <a className="lan-link media-header-button" href="/lan" title="设置手机局域网只读访问">局域网</a>
+          <span className="account-name media-account">{username}</span><button className="account-logout media-logout" onClick={() => void signOut()}>退出</button>
+          <button className="shortcut-toggle media-header-button" onClick={() => setShortcutHelp(value => !value)} aria-expanded={shortcutHelp}>快捷键</button><span className="local-badge">仅本机</span>
           <div className="font-controls" aria-label="字体大小">
             <button className={fontSize === "small" ? "active" : ""} onClick={() => setFontSize("small")} title="较小字号" aria-label="较小字号">A−</button>
             <button className={fontSize === "medium" ? "active" : ""} onClick={() => setFontSize("medium")} title="标准字号" aria-label="标准字号">A</button>

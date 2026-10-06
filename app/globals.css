@@ -251,3 +251,15 @@ html[data-theme="dark"] .insight-tools{background:linear-gradient(105deg,#26301c
 .header-actions > :is(.lan-link,.account-logout,.shortcut-toggle,.local-badge){display:inline-flex;align-items:center;justify-content:center;padding:0 10px;font-size:12px;line-height:1;white-space:nowrap}
 .header-actions .font-controls button{height:32px}
 .header-actions .theme-selector{font-size:12px}
+
+/* Shared desktop media header controls: video, photo and iCloud routes. */
+.media-header-actions{justify-self:end;min-width:0;display:flex;align-items:center;gap:8px}
+.media-header-actions .media-header-button,.media-header-actions .media-logout{height:34px;min-height:34px;display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--white);color:var(--muted);font-size:12px;font-weight:750;line-height:1;white-space:nowrap;text-decoration:none;cursor:pointer;transition:border-color .15s,background .15s,color .15s}
+.media-header-actions .media-header-button:hover,.media-header-actions .media-logout:hover{border-color:#aabc73;background:color-mix(in srgb,var(--white) 86%,var(--lime));color:var(--ink)}
+.media-header-actions .media-header-button:focus-visible,.media-header-actions .media-logout:focus-visible,.media-header-actions .theme-selector:focus-visible{outline:2px solid var(--lime);outline-offset:2px}
+.media-header-actions .media-account{height:34px;min-height:34px;display:inline-flex;align-items:center;flex:0 0 auto;padding:0 10px;border:1px solid transparent;border-radius:8px;background:color-mix(in srgb,var(--white) 76%,var(--paper));color:var(--ink);font-size:12px;font-weight:800;line-height:1;white-space:nowrap}
+.media-header-actions .media-logout{color:var(--ink)}
+.media-header-actions .theme-selector{width:auto;max-width:160px;height:34px;min-height:34px;padding:0 28px 0 10px;border-radius:8px;font-size:12px;line-height:1}
+.media-header-actions .font-controls,.media-header-actions .local-badge{height:34px;min-height:34px;flex:0 0 auto}
+@media(max-width:1000px){.media-header-actions{max-width:100%;overflow-x:auto;padding:2px;scrollbar-width:none}.media-header-actions::-webkit-scrollbar{display:none}}
+@media(max-width:700px){.media-header-actions{gap:6px}.media-header-actions .media-header-button,.media-header-actions .media-logout{height:32px;min-height:32px;padding:0 8px;font-size:10px}.media-header-actions .media-account{display:none}.media-header-actions .theme-selector{height:32px;min-height:32px;max-width:130px;font-size:10px}}
