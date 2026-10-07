@@ -45,13 +45,20 @@ const HEIC_PREVIEW_EXTENSIONS = new Set(["heic", "heif"]);
 const SOURCES_KEY = "photo-source-folders-v1";
 const PHOTO_PREFERENCES_KEY = "framebase-photo-view";
 const PAGE_SIZE = 48;
-const THUMBNAIL_WIDTH = 512;
+const THUMBNAIL_WIDTH = 384;
+const THUMBNAIL_WEBP_QUALITY = 0.72;
 const THUMBNAIL_CACHE_LIMIT = 160;
+const PERSISTENT_THUMBNAIL_CACHE_BYTES = 48 * 1024 * 1024;
+const PERSISTENT_THUMBNAIL_CACHE_ENTRIES = 800;
+const PERSISTENT_THUMBNAIL_MANIFEST_KEY = "photo-thumbnail-manifest-v1";
+const PERSISTENT_THUMBNAIL_PREFIX = "photo-thumbnail-v1:";
 type PreviewJob = { cancelled: () => boolean; start: () => Promise<void>; skip: () => void };
 type PreviewQueue = { pending: PreviewJob[]; active: number; limit: number };
+type ThumbnailManifest = { entries: Array<{ key: string; size: number }>; totalSize: number };
 const regularPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 3 };
 const heicPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 1 };
 const thumbnailBlobCache = new Map<string, Blob>();
+let thumbnailPersistence = Promise.resolve();
 
 function drainPreviewQueue(queue: PreviewQueue) {
   while (queue.pending.length && queue.active < queue.limit) {
@@ -80,13 +87,14 @@ function schedulePreview<T>(queue: PreviewQueue, task: () => Promise<T>, cancell
 }
 
 function thumbnailCacheKey(item: PhotoItem) { return `${item.id}:${item.modified}:${item.size}`; }
+function persistentThumbnailKey(item: PhotoItem) { return `${PERSISTENT_THUMBNAIL_PREFIX}${thumbnailCacheKey(item)}`; }
 function readThumbnailCache(item: PhotoItem) {
   const key = thumbnailCacheKey(item);
   const cached = thumbnailBlobCache.get(key) || null;
   if (cached) { thumbnailBlobCache.delete(key); thumbnailBlobCache.set(key, cached); }
   return cached;
 }
-function writeThumbnailCache(item: PhotoItem, blob: Blob) {
+function rememberThumbnail(item: PhotoItem, blob: Blob) {
   const key = thumbnailCacheKey(item);
   thumbnailBlobCache.delete(key);
   thumbnailBlobCache.set(key, blob);
@@ -129,6 +137,37 @@ async function dbDelete(key: string) {
     transaction.oncomplete = () => { db.close(); resolve(); };
     transaction.onerror = () => { db.close(); reject(transaction.error); };
   });
+}
+
+async function readPersistentThumbnail(item: PhotoItem) {
+  const blob = await dbGet<Blob>(persistentThumbnailKey(item)).catch(() => undefined);
+  if (!(blob instanceof Blob)) return null;
+  rememberThumbnail(item, blob);
+  return blob;
+}
+
+function persistThumbnail(item: PhotoItem, blob: Blob) {
+  const key = persistentThumbnailKey(item);
+  thumbnailPersistence = thumbnailPersistence.catch(() => undefined).then(async () => {
+    const saved = await dbGet<ThumbnailManifest>(PERSISTENT_THUMBNAIL_MANIFEST_KEY).catch(() => undefined);
+    const entries = Array.isArray(saved?.entries) ? saved.entries.filter(entry => entry.key !== key) : [];
+    let totalSize = entries.reduce((sum, entry) => sum + entry.size, 0);
+    entries.push({ key, size: blob.size });
+    totalSize += blob.size;
+    await dbSet(key, blob);
+    while (entries.length > PERSISTENT_THUMBNAIL_CACHE_ENTRIES || totalSize > PERSISTENT_THUMBNAIL_CACHE_BYTES) {
+      const expired = entries.shift();
+      if (!expired) break;
+      totalSize -= expired.size;
+      await dbDelete(expired.key);
+    }
+    await dbSet(PERSISTENT_THUMBNAIL_MANIFEST_KEY, { entries, totalSize } satisfies ThumbnailManifest);
+  }).catch(() => undefined);
+}
+
+function writeThumbnailCache(item: PhotoItem, blob: Blob) {
+  rememberThumbnail(item, blob);
+  if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) persistThumbnail(item, blob);
 }
 
 function marksKey(sourceId: string) { return accountKey(`framebase-photo-marks:${sourceId}`); }
@@ -207,20 +246,21 @@ async function createThumbnailBlob(item: PhotoItem) {
       if (typeof OffscreenCanvas !== "undefined") {
         const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
         canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
-        return await canvas.convertToBlob({ type: "image/webp", quality: 0.8 });
+        return await canvas.convertToBlob({ type: "image/webp", quality: THUMBNAIL_WEBP_QUALITY });
       }
       const canvas = document.createElement("canvas");
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
       canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
-      return await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("thumbnail_failed")), "image/webp", 0.8));
+      return await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("thumbnail_failed")), "image/webp", THUMBNAIL_WEBP_QUALITY));
     } finally {
       bitmap.close();
     }
 }
 
 async function createThumbnailObjectUrl(item: PhotoItem, cancelled: () => boolean) {
-  const cached = readThumbnailCache(item);
+  const cached = readThumbnailCache(item)
+    || (HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? await readPersistentThumbnail(item) : null);
   if (cached) return URL.createObjectURL(cached);
   const queue = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? heicPreviewQueue : regularPreviewQueue;
   const thumbnail = await schedulePreview(queue, async () => {

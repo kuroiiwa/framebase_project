@@ -46,6 +46,11 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(photos, /heicPreviewQueue: PreviewQueue = \{ pending: \[\], active: 0, limit: 1 \}/);
   assert.match(photos, /if \(job\.cancelled\(\)\) \{ job\.skip\(\); continue; \}/);
   assert.match(photos, /thumbnailBlobCache/);
+  assert.match(photos, /PERSISTENT_THUMBNAIL_CACHE_BYTES = 48 \* 1024 \* 1024/);
+  assert.match(photos, /PERSISTENT_THUMBNAIL_PREFIX = "photo-thumbnail-v1:"/);
+  assert.match(photos, /readPersistentThumbnail\(item\)/);
+  assert.match(photos, /THUMBNAIL_WEBP_QUALITY = 0\.72/);
+  assert.match(photos, /if \(HEIC_PREVIEW_EXTENSIONS\.has\(item\.extension\)\) persistThumbnail\(item, blob\)/);
   assert.match(photoStyles, /content-visibility:auto/);
   assert.doesNotMatch(photos, /createWritable\(/);
   assert.doesNotMatch(photos, /removeEntry\(/);
