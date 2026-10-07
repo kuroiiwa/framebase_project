@@ -1,6 +1,6 @@
 "use client";
 
-/* eslint-disable @next/next/no-img-element, @next/next/no-html-link-for-pages -- previews use local Blob URLs; hard navigation avoids losing File System Access state in the compatibility router. */
+/* eslint-disable @next/next/no-img-element, @next/next/no-html-link-for-pages, jsx-a11y/media-has-caption -- previews use local Blob URLs; Live Photo MOV files contain no caption track; hard navigation avoids losing File System Access state. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
@@ -19,6 +19,7 @@ type DirectoryHandle = {
   isSameEntry?(other: DirectoryHandle): Promise<boolean>;
 };
 type PickerWindow = Window & { showDirectoryPicker?: (options?: { mode: "read" }) => Promise<DirectoryHandle> };
+type LivePhotoVideo = { name: string; path: string; extension: "mov"; handle: FileHandle };
 type PhotoItem = {
   id: string;
   sourceId: string;
@@ -29,12 +30,13 @@ type PhotoItem = {
   size: number;
   modified: number;
   handle: FileHandle;
+  liveVideo?: LivePhotoVideo | null;
   liked: boolean;
   cleanup: boolean;
 };
 type SourceFolder = { id: string; name: string; handle: DirectoryHandle; lastScan: number; photoCount: number; totalSize: number };
 type PhotoMarks = Record<string, { liked?: boolean; cleanup?: boolean }>;
-type Tab = "all" | "liked" | "cleanup";
+type Tab = "all" | "live" | "liked" | "cleanup";
 type Sort = "newest" | "oldest" | "largest" | "smallest" | "name";
 type PreviewRatio = "standard" | "phone";
 type PhotoPreferences = { compact: boolean; previewRatio: PreviewRatio; sort: Sort };
@@ -42,6 +44,7 @@ type PhotoPreferences = { compact: boolean; previewRatio: PreviewRatio; sort: So
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "heic", "heif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
 const BROWSER_PREVIEW_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]);
 const HEIC_PREVIEW_EXTENSIONS = new Set(["heic", "heif"]);
+const LIVE_PHOTO_IMAGE_EXTENSIONS = new Set(["heic", "heif", "jpg", "jpeg"]);
 const SOURCES_KEY = "photo-source-folders-v1";
 const PHOTO_PREFERENCES_KEY = "framebase-photo-view";
 const PAGE_SIZE = 48;
@@ -191,29 +194,34 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
   const marks = readMarks(source.id);
   const found: PhotoItem[] = [];
   async function walk(directory: DirectoryHandle, parts: string[]) {
-    for await (const entry of directory.values()) {
-      if (entry.kind === "directory") await walk(entry, [...parts, entry.name]);
-      else {
-        const extension = entry.name.split(".").pop()?.toLowerCase() || "";
-        if (!PHOTO_EXTENSIONS.has(extension)) continue;
-        const file = await entry.getFile();
-        const path = [...parts, entry.name].join("/");
-        found.push({
-          id: `${source.id}:${path}`,
-          sourceId: source.id,
-          sourceName: source.name,
-          name: entry.name,
-          path,
-          extension,
-          size: file.size,
-          modified: file.lastModified,
-          handle: entry,
-          liked: Boolean(marks[path]?.liked),
-          cleanup: Boolean(marks[path]?.cleanup),
-        });
-        if (found.length % 25 === 0) progress(found.length);
-      }
+    const entries: Array<FileHandle | DirectoryHandle> = [];
+    for await (const entry of directory.values()) entries.push(entry);
+    const files = entries.filter((entry): entry is FileHandle => entry.kind === "file");
+    const liveVideos = new Map(files.filter(entry => entry.name.split(".").pop()?.toLowerCase() === "mov").map(entry => [entry.name.replace(/\.[^.]+$/, "").toLocaleLowerCase(), entry]));
+    for (const entry of files) {
+      const extension = entry.name.split(".").pop()?.toLowerCase() || "";
+      if (!PHOTO_EXTENSIONS.has(extension)) continue;
+      const file = await entry.getFile();
+      const path = [...parts, entry.name].join("/");
+      const stem = entry.name.replace(/\.[^.]+$/, "").toLocaleLowerCase();
+      const companion = LIVE_PHOTO_IMAGE_EXTENSIONS.has(extension) ? liveVideos.get(stem) : undefined;
+      found.push({
+        id: `${source.id}:${path}`,
+        sourceId: source.id,
+        sourceName: source.name,
+        name: entry.name,
+        path,
+        extension,
+        size: file.size,
+        modified: file.lastModified,
+        handle: entry,
+        liveVideo: companion ? { name: companion.name, path: [...parts, companion.name].join("/"), extension: "mov", handle: companion } : null,
+        liked: Boolean(marks[path]?.liked),
+        cleanup: Boolean(marks[path]?.cleanup),
+      });
+      if (found.length % 25 === 0) progress(found.length);
     }
+    for (const entry of entries) if (entry.kind === "directory") await walk(entry, [...parts, entry.name]);
   }
   await walk(source.handle, []);
   progress(found.length);
@@ -321,6 +329,9 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   });
   const [url, setUrl] = useState<string | null>(initialUrl);
   const [failed, setFailed] = useState(false);
+  const [playingLive, setPlayingLive] = useState(false);
+  const [liveUrl, setLiveUrl] = useState<string | null>(null);
+  const [liveFailed, setLiveFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
     let objectUrl = "";
@@ -336,6 +347,18 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); if (initialUrl) URL.revokeObjectURL(initialUrl); };
   }, [initialUrl, item]);
   useEffect(() => {
+    if (!playingLive || !item.liveVideo || liveUrl) return;
+    let cancelled = false;
+    let objectUrl = "";
+    void item.liveVideo.handle.getFile().then(file => {
+      objectUrl = URL.createObjectURL(file);
+      if (cancelled) URL.revokeObjectURL(objectUrl);
+      else setLiveUrl(objectUrl);
+    }).catch(() => { if (!cancelled) { setLiveFailed(true); setPlayingLive(false); } });
+    return () => { cancelled = true; };
+  }, [item.liveVideo, liveUrl, playingLive]);
+  useEffect(() => () => { if (liveUrl) URL.revokeObjectURL(liveUrl); }, [liveUrl]);
+  useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
       if (event.key === "ArrowLeft") previous();
@@ -347,7 +370,7 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   return <div className={styles.viewer} role="dialog" aria-modal="true" aria-label={item.name}>
     <button className={styles.viewerClose} onClick={onClose} aria-label="关闭">×</button>
     <button className={styles.viewerPrevious} onClick={previous} aria-label="上一张">‹</button>
-    <figure>{url && !failed ? <img src={url} alt={item.name} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}<figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</span></figcaption></figure>
+    <figure><div className={styles.viewerMedia}>{playingLive && liveUrl ? <video src={liveUrl} controls autoPlay playsInline preload="metadata" aria-label={`${item.name} 实况视频`} onError={() => { setLiveFailed(true); setPlayingLive(false); }} onEnded={() => setPlayingLive(false)} /> : url && !failed ? <img src={url} alt={item.name} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}{item.liveVideo && <button className={styles.liveToggle} onClick={() => { setLiveFailed(false); setPlayingLive(value => !value); }}>{playingLive ? liveUrl ? "显示照片" : "正在读取实况…" : "▶ 播放实况"}</button>}{liveFailed && <span className={styles.liveError}>实况视频无法播放，请检查 Windows HEVC 解码支持。</span>}</div><figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}{item.liveVideo ? ` · 实况 ${item.liveVideo.name}` : ""}</span></figcaption></figure>
     <button className={styles.viewerNext} onClick={next} aria-label="下一张">›</button>
   </div>;
 }
@@ -491,6 +514,7 @@ function PhotoLibrary({ username }: { username: string }) {
     const result = photos.filter(item => {
       if (sourceFilter !== "all" && item.sourceId !== sourceFilter) return false;
       if (formatFilter !== "all" && item.extension !== formatFilter) return false;
+      if (tab === "live" && !item.liveVideo) return false;
       if (tab === "liked" && !item.liked) return false;
       if (tab === "cleanup" && !item.cleanup) return false;
       return !normalized || `${item.name} ${item.path}`.toLocaleLowerCase("zh-CN").includes(normalized);
@@ -523,11 +547,11 @@ function PhotoLibrary({ username }: { username: string }) {
       {sources.length === 0 && ready ? <p>尚未添加图片文件夹。这里不会读取视频库已经选择的目录。</p> : sources.map(source => <article key={source.id}><button onClick={() => { setSourceFilter(source.id); setPage(1); }} className={sourceFilter === source.id ? styles.activeSource : ""}><strong>{source.name}</strong><span>{source.photoCount} 张 · {formatBytes(source.totalSize)}</span></button><button onClick={() => void loadSource(source)} disabled={loading}>重扫</button><button onClick={() => void removeSource(source)} disabled={loading}>移除</button></article>)}
     </section>
     <section className={styles.toolbar}>
-      <div><button className={tab === "all" ? styles.active : ""} onClick={() => { setTab("all"); setPage(1); }}>全部</button><button className={tab === "liked" ? styles.active : ""} onClick={() => { setTab("liked"); setPage(1); }}>收藏</button><button className={tab === "cleanup" ? styles.active : ""} onClick={() => { setTab("cleanup"); setPage(1); }}>待整理</button></div>
+      <div><button className={tab === "all" ? styles.active : ""} onClick={() => { setTab("all"); setPage(1); }}>全部</button><button className={tab === "live" ? styles.active : ""} onClick={() => { setTab("live"); setPage(1); }}>实况</button><button className={tab === "liked" ? styles.active : ""} onClick={() => { setTab("liked"); setPage(1); }}>收藏</button><button className={tab === "cleanup" ? styles.active : ""} onClick={() => { setTab("cleanup"); setPage(1); }}>待整理</button></div>
       <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
-    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} /><nav className={styles.cardActions}><button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>)}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<nav className={styles.cardActions}><button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>)}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
     <footer><span>图片库只读取用户明确授权的本地文件夹</span><a href="/?library=video">返回视频库 →</a></footer>
     {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} />}
   </main>;
