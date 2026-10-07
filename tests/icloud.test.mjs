@@ -62,6 +62,9 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     assert.equal((await manager.readBackupHistory("alice")).completedRanges.length, 0);
     await manager.recordTimeline("gabri", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 1024 }, years: [{ key: "2027", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 1024 }], quarters: [], months: [] });
     assert.deepEqual((await manager.readBackupHistory("gabri")).completedRanges.map(item => item.key), ["2025-Q4", "2026"]);
+    const previousTimeline = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "timeline.previous.json"), "utf8"));
+    assert.equal(previousTimeline.total.itemCount, 2);
+    assert.equal(previousTimeline.years[0].key, "2026");
 
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));

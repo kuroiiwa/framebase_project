@@ -575,6 +575,33 @@ test("provider refuses to replace a timeline when both inventory directions rema
   }
 });
 
+test("provider rejects empty command output unless the inventory explicitly confirms a zero total", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-empty-timeline-"));
+  const executablePath = join(root, "icloudpd.exe");
+  try {
+    await writeFile(executablePath, "test");
+    let confirmedEmpty = false;
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "", stderr: "" };
+        return { stdout: confirmedEmpty ? 'FRAMEBASE_INVENTORY_TOTAL {"count":0,"library":"default"}\n' : "", stderr: "" };
+      },
+    });
+    const context = { jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") };
+    const missingMarker = await provider.scanTimeline(context);
+    assert.equal(missingMarker.status, "incomplete");
+    assert.match(missingMarker.message, /没有返回有效的图库总数/);
+    confirmedEmpty = true;
+    const emptyLibrary = await provider.scanTimeline(context);
+    assert.equal(emptyLibrary.status, "ready");
+    assert.equal(emptyLibrary.total.itemCount, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("provider deletes only exact asset ids through the protected FrameBase adapter request", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-delete-"));
   const executablePath = join(root, "icloudpd.exe");

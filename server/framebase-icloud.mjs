@@ -64,6 +64,10 @@ export function createIcloudManager({ projectRoot }) {
     return join(userDirectory(username), "timeline.json");
   }
 
+  function previousTimelinePath(username) {
+    return join(userDirectory(username), "timeline.previous.json");
+  }
+
   function backupHistoryPath(username) {
     return join(userDirectory(username), "backup-history.json");
   }
@@ -260,6 +264,13 @@ export function createIcloudManager({ projectRoot }) {
   }
 
   async function recordTimeline(username, result) {
+    const previous = await readTimeline(username);
+    if (previous.scannedAt && previous.total?.itemCount > 0) {
+      await atomicJson(username, previousTimelinePath(username), {
+        version: 2, scannedAt: previous.scannedAt, staleAt: previous.staleAt, staleReason: previous.staleReason,
+        total: previous.total, years: previous.years, quarters: previous.quarters, months: previous.months, assets: previous.assets,
+      });
+    }
     const timeline = {
       version: 2, scannedAt: typeof result.scannedAt === "string" ? result.scannedAt : new Date().toISOString(), staleAt: null, staleReason: null,
       total: cleanTimelineBuckets([result.total])[0] || null,

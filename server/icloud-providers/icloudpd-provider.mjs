@@ -660,9 +660,13 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const incompleteLibraries = [];
       const parseInventory = (output, library) => {
         let expectedCount = 0;
+        let sawTotal = false;
         for (const line of String(output || "").split(/\r?\n/)) {
           if (line.startsWith("FRAMEBASE_INVENTORY_TOTAL ")) {
-            try { expectedCount = Math.max(expectedCount, Number(JSON.parse(line.slice("FRAMEBASE_INVENTORY_TOTAL ".length))?.count) || 0); }
+            try {
+              const count = Number(JSON.parse(line.slice("FRAMEBASE_INVENTORY_TOTAL ".length))?.count);
+              if (Number.isFinite(count) && count >= 0) { sawTotal = true; expectedCount = Math.max(expectedCount, Math.floor(count)); }
+            }
             catch { /* Ignore malformed provider totals. */ }
             continue;
           }
@@ -672,7 +676,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, { ...item, library: library || "default" });
           } catch { /* Ignore malformed provider output without exposing it. */ }
         }
-        return expectedCount;
+        return { expectedCount, sawTotal };
       };
       for (let libraryOffset = 0; libraryOffset < targets.length; libraryOffset += 1) {
         const library = targets[libraryOffset];
@@ -685,9 +689,12 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         try { result = await runInventory(inventoryArgs); }
         finally { clearInterval(heartbeat); }
         const libraryKeyPrefix = `${library || "default"}:`;
-        const expectedCount = parseInventory(result.stdout, library);
+        const inventorySummary = parseInventory(result.stdout, library);
+        const expectedCount = inventorySummary.expectedCount;
         const firstPassCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
-        if (expectedCount > firstPassCount) {
+        if (!inventorySummary.sawTotal) {
+          incompleteLibraries.push({ library: libraryLabel, expectedCount: null, completedCount: firstPassCount, missingTotal: true });
+        } else if (expectedCount > firstPassCount) {
           for (const recoveryLimit of inventoryRecoveryLimits(expectedCount, firstPassCount)) {
             const beforeRecovery = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
             const recoveryLabel = recoveryLimit < expectedCount ? `${recoveryLimit} 项` : "完整图库";
@@ -705,7 +712,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       }
       if (incompleteLibraries.length) {
         const missing = incompleteLibraries[0];
-        return { status: "incomplete", message: `Apple 本次只返回了“${missing.library}”的 ${missing.completedCount}/${missing.expectedCount} 项。已保留上次统计，请稍后重试。`, years: [], quarters: [], months: [], assets: [], providerInfo };
+        const message = missing.missingTotal
+          ? `“${missing.library}”没有返回有效的图库总数，可能是 Apple 连接或兼容工具异常。已保留上次统计。`
+          : `Apple 本次只返回了“${missing.library}”的 ${missing.completedCount}/${missing.expectedCount} 项。已保留上次统计，请稍后重试。`;
+        return { status: "incomplete", message, years: [], quarters: [], months: [], assets: [], providerInfo };
       }
       report({ phase: "aggregating", message: `正在汇总 ${itemsById.size} 个项目的时间信息…`, libraryIndex: targets.length, libraryCount: targets.length, itemCount: itemsById.size });
       const years = new Map(); const quarters = new Map(); const months = new Map();
