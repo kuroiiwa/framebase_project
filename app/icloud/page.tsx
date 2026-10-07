@@ -395,7 +395,7 @@ function IcloudCenter({ username }: { username: string }) {
       </article>
 
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>5</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；再次运行只补充变化，并复核本地 SHA-256。</p></div></div>
+        <div className={styles.cardHead}><span>5</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；未变文件复用本地校验清单，仅对新增或变化文件重算 SHA-256。</p></div></div>
         <div className={styles.safetyBanner}><strong>安全边界</strong><span>此任务不带任何云端删除参数。暂停或取消只会停止本机任务，已下载文件会保留。</span></div>
         <div className={styles.fullStatus}>
           <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? "任务运行中" : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>

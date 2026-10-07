@@ -97,6 +97,7 @@ export function createIcloudManager({ projectRoot }) {
       extension: String(item?.extension || "").toLowerCase(),
       mediaType: item?.mediaType === "video" ? "video" : "photo",
       size: Math.max(0, Number(item?.size) || 0),
+      modifiedMs: Math.max(0, Number(item?.modifiedMs) || 0),
       sha256: /^[a-f0-9]{64}$/.test(String(item?.sha256 || "")) ? item.sha256 : null,
       library: typeof item?.library === "string" ? item.library : null,
       verifiedAt: typeof item?.verifiedAt === "string" ? item.verifiedAt : null,

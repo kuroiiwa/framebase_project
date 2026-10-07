@@ -410,6 +410,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       await mkdir(backupDirectory, { recursive: true });
       const completedRanges = [...new Set((Array.isArray(initialCompletedRanges) ? initialCompletedRanges : []).filter(key => requestedRanges.some(range => range.key === key)))];
       await onProgress({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], message: "正在读取 iCloud 图库清单…" });
+      if (completedRanges.length === requestedRanges.length) return { status: "completed", message: `所选 ${completedRanges.length} 个时间范围已由本地完成记录确认，无需重复连接 iCloud、下载或哈希。`, files: [], planned: 0, downloadedBytes: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, completedRanges, providerInfo };
       const libraryResult = await run([...baseArgs, "--list-libraries"], 180_000);
       const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
       const libraries = [null, ...namedLibraries];
@@ -470,6 +471,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         const range = requestedRanges[rangeOffset];
         const rangeIndex = rangeOffset + 1;
         const currentRange = range.label || range.key;
+        if (completedRanges.includes(range.key)) {
+          await onProgress({ status: "planning", phase: "planning", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), message: `${currentRange} 已有本地完成记录，继续任务直接跳过。` });
+          continue;
+        }
         const rangePlan = new Map();
         const activeOperations = [];
         await onProgress({ status: "planning", phase: "planning", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, message: `正在规划 ${rangeIndex}/${requestedRanges.length}：${currentRange}…` });
@@ -526,7 +531,12 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
               const fileInfo = await stat(item.absolutePath);
               if (!fileInfo.isFile() || fileInfo.size <= 0) throw new Error("empty file");
               if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
-              return { item, fileInfo, sha256: await hashFile(item.absolutePath) };
+              const previous = previousByPath.get(item.relativePath);
+              const unchanged = previous?.size === fileInfo.size
+                && Number(previous?.modifiedMs) > 0
+                && Math.trunc(Number(previous.modifiedMs)) === Math.trunc(fileInfo.mtimeMs)
+                && /^[a-f0-9]{64}$/.test(String(previous.sha256 || ""));
+              return { item, fileInfo, sha256: unchanged ? previous.sha256 : await hashFile(item.absolutePath), reusedHash: unchanged };
             } catch (error) {
               if (error?.name === "AbortError") throw error;
               return { item, error };
@@ -534,7 +544,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           }));
           for (const result of results) {
             if (result.error) { failed += 1; continue; }
-            const { item, fileInfo, sha256 } = result;
+            const { item, fileInfo, sha256, reusedHash } = result;
             const previous = previousByPath.get(item.relativePath);
             if (previous?.size === fileInfo.size && previous?.sha256 === sha256) skipped += 1;
             const existing = filesByPath.get(item.relativePath);
@@ -542,7 +552,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             const verifiedFile = {
               name: basename(item.absolutePath), relativePath: item.relativePath, extension: item.extension,
               mediaType: videoExtensions.has(item.extension) ? "video" : "photo", size: fileInfo.size,
-              sha256, library: item.library, verifiedAt: new Date().toISOString(),
+              modifiedMs: fileInfo.mtimeMs, sha256, library: item.library,
+              verifiedAt: reusedHash && previous?.verifiedAt ? previous.verifiedAt : new Date().toISOString(),
             };
             filesByPath.set(item.relativePath, verifiedFile);
             verifiedBytes += fileInfo.size;
@@ -565,6 +576,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       }
       const files = [...filesByPath.values()];
       const verificationTotal = files.length + failed;
+      if (verificationTotal === 0 && completedRanges.length === requestedRanges.length) return { status: "completed", message: `所选 ${completedRanges.length} 个时间范围已由本地完成记录确认，无需重复规划、下载或哈希。`, files: [], planned: 0, downloadedBytes: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, completedRanges, providerInfo };
       if (verificationTotal === 0) return { status: "empty", message: "所选时间范围内没有找到可备份的图片或视频。", files: [], planned: planByPath.size, completedRanges, providerInfo };
       const photoCount = files.filter(item => item.mediaType === "photo").length;
       const videoCount = files.length - photoCount;

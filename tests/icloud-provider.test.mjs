@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -277,6 +277,39 @@ test("full backup re-verifies existing local media when iCloud has nothing new t
   }
 });
 
+test("full backup reuses a persisted hash when size and modification time are unchanged", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-fast-existing-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const backupDirectory = join(root, "backup");
+  const existingPath = join(backupDirectory, "2025", "IMG_0002.JPG");
+  let hashCalls = 0;
+  try {
+    await writeFile(executablePath, "test");
+    await mkdir(join(backupDirectory, "2025"), { recursive: true });
+    await writeFile(existingPath, "unchanged-photo");
+    const fileInfo = await stat(existingPath);
+    const sha256 = createHash("sha256").update("unchanged-photo").digest("hex");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      hashFile: async () => { hashCalls += 1; return sha256; },
+      runCommand: async (_executable, args) => args.includes("--version")
+        ? { stdout: "version:1.32.3\n", stderr: "" }
+        : { stdout: "", stderr: "" },
+    });
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
+      previousFiles: [{ relativePath: "2025/IMG_0002.JPG", extension: "jpg", mediaType: "photo", size: fileInfo.size, modifiedMs: fileInfo.mtimeMs, sha256, verifiedAt: "2026-01-01T00:00:00.000Z" }],
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(hashCalls, 0);
+    assert.equal(result.skipped, 1);
+    assert.equal(result.files[0].modifiedMs, fileInfo.mtimeMs);
+    assert.equal(result.files[0].verifiedAt, "2026-01-01T00:00:00.000Z");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("selected backup ranges are planned, downloaded, and verified one at a time", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-ranges-in-order-"));
   const executablePath = join(root, "icloudpd.exe");
@@ -317,13 +350,40 @@ test("selected backup ranges are planned, downloaded, and verified one at a time
       onRangeComplete: update => rangeCompletions.push(update),
     });
     assert.equal(result.status, "completed");
-    assert.deepEqual(events, ["plan-2024", "download-2024", "plan-2025", "download-2025"]);
+    assert.deepEqual(events, ["plan-2025", "download-2025"]);
     assert.deepEqual(result.completedRanges, ["2024", "2025"]);
-    assert.equal(result.files.length, 2);
-    assert.deepEqual(rangeCompletions.map(update => update.completedRanges), [["2024"], ["2024", "2025"]]);
-    assert.deepEqual(rangeCompletions.map(update => update.files.length), [1, 1]);
-    assert.ok(progress.some(item => item.currentRange === "2024 年" && item.rangeIndex === 1 && item.phase === "verifying"));
+    assert.equal(result.files.length, 1);
+    assert.deepEqual(rangeCompletions.map(update => update.completedRanges), [["2024", "2025"]]);
+    assert.deepEqual(rangeCompletions.map(update => update.files.length), [1]);
+    assert.ok(progress.some(item => item.currentRange === "2024 年" && item.message.includes("直接跳过")));
     assert.ok(progress.some(item => item.currentRange === "2025 年" && item.rangeIndex === 2 && item.phase === "planning"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resume skips fully completed ranges before querying iCloud", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-completed-range-"));
+  const executablePath = join(root, "icloudpd.exe");
+  let cloudCalls = 0;
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        cloudCalls += 1;
+        return { stdout: "", stderr: "" };
+      },
+    });
+    const result = await provider.backupAll({
+      jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"),
+      ranges: [{ key: "2024", label: "2024 年", start: "2024-01-01T00:00:00", end: "2024-12-31T23:59:59" }],
+      initialCompletedRanges: ["2024"],
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(cloudCalls, 0);
+    assert.deepEqual(result.completedRanges, ["2024"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

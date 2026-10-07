@@ -486,10 +486,13 @@ async function handleIcloud(request, response, url) {
     if (config.connectionStatus !== "connected") return json(response, 409, { error: "请先验证 iCloud 登录会话。" });
     const previousManifest = await icloud.readFullManifest(current.username);
     const previousState = await icloud.readFullBackup(current.username);
+    const backupHistory = await icloud.readBackupHistory(current.username);
     const body = await readJsonBody(request);
     const submittedRanges = Array.isArray(body.ranges) ? body.ranges.filter(item => item && typeof item.key === "string" && typeof item.label === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.start) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.end)).slice(0, 60) : [];
     const resumingExisting = url.pathname.endsWith("/resume") && submittedRanges.length === 0 && ["paused", "failed"].includes(previousState.status);
     const ranges = resumingExisting ? previousState.ranges : submittedRanges;
+    const persistedCompletedRangeKeys = resumingExisting ? ranges.filter(range => backupHistory.completedRanges.some(saved => saved.start <= range.start && saved.end >= range.end)).map(range => range.key) : [];
+    const initialCompletedRanges = [...new Set([...(resumingExisting ? previousState.completedRanges : []), ...persistedCompletedRangeKeys])];
     const controller = new AbortController();
     const job = { controller, stopAs: "paused" };
     icloudFullBackupJobs.set(current.username, job);
@@ -499,7 +502,7 @@ async function handleIcloud(request, response, url) {
       status: "planning", phase: "planning", message: previousManifest.files.length ? "正在检查增量变化并准备继续…" : "正在读取完整 iCloud 图库清单…",
       startedAt, completedAt: null, currentLibrary: null, currentRange: resumingExisting ? previousState.currentRange : null,
       rangeIndex: resumingExisting ? previousState.rangeIndex : 0, rangeCount: ranges.length || 1,
-      completedRanges: resumingExisting ? previousState.completedRanges : [], planned: resumingExisting ? previousState.planned : 0,
+      completedRanges: initialCompletedRanges, planned: resumingExisting ? previousState.planned : 0,
       downloaded: resumingExisting ? previousState.downloaded : 0, verified: resumingExisting ? previousState.verified : 0,
       plannedPhotoCount: resumingExisting ? previousState.plannedPhotoCount : 0, plannedVideoCount: resumingExisting ? previousState.plannedVideoCount : 0,
       syncedPhotoCount: resumingExisting ? previousState.syncedPhotoCount : 0, syncedVideoCount: resumingExisting ? previousState.syncedVideoCount : 0,
@@ -512,7 +515,7 @@ async function handleIcloud(request, response, url) {
       try {
         const result = await icloudProvider.backupAll({
           ...context, jobKey: current.username, previousFiles: previousManifest.files, ranges,
-          initialCompletedRanges: resumingExisting ? previousState.completedRanges : [], signal: controller.signal,
+          initialCompletedRanges, signal: controller.signal,
           onProgress: update => icloud.writeFullBackup(current.username, resumingExisting ? {
             ...update,
             planned: Math.max(previousState.planned, Number(update.planned) || 0),
