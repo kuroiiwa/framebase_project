@@ -109,7 +109,7 @@ FRAMEBASE_INVENTORY {JSON}
 
 JSON 只包含对象 ID、图库、文件名、拍摄时间、图片/视频类型、原始资源大小、Live Photo 视频大小和 RAW 标记。它不会下载文件，也不会调用删除接口。Provider 只解析带此前缀的行，逐项清单按 FrameBase 用户持久化在本机，用于安全释放时的精确匹配；浏览器普通日志不会输出清单。
 
-兼容版还会在清单开始前输出 `FRAMEBASE_INVENTORY_TOTAL`，用于核对 Apple 图库总数。若正向分页得到的对象少于总数，FrameBase 会仅对该图库设置 `FRAMEBASE_INVENTORY_DIRECTION=DESCENDING` 进行一次反向补扫，并按“图库 + 资产 ID”去重。这用于规避 Apple Photos 分页在部分账户上提前结束、导致较早年份被误判为不在云端的问题。没有总数缺口时不会补扫。带运行时密码的伪终端输出缓冲也必须提高到 128 MiB，否则大型图库清单会只保留末尾部分。
+兼容版还会在清单开始前输出 `FRAMEBASE_INVENTORY_TOTAL`，用于核对 Apple 图库总数。若正向分页得到的对象少于总数，FrameBase 会仅对该图库设置 `FRAMEBASE_INVENTORY_DIRECTION=DESCENDING` 进行渐进反向补扫，并按“图库 + 资产 ID”去重。补扫窗口从“缺失数 + 32”的安全余量开始（最低 64 项），不足时才扩大到 256、1,024，最后才回退为完整反向扫描。这用于规避 Apple Photos 分页在部分账户上提前结束、导致较早年份被误判为不在云端的问题，同时避免只缺少少量尾部对象时重读整个图库。没有总数缺口时不会补扫。带运行时密码的伪终端输出缓冲也必须提高到 128 MiB，否则大型图库清单会只保留末尾部分。
 
 重建时还必须运行：
 

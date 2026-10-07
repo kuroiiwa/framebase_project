@@ -43,6 +43,18 @@ const photoExtensions = new Set(["jpg", "jpeg", "heic", "heif", "png", "gif", "t
 const videoExtensions = new Set(["mov", "mp4", "m4v", "avi", "mkv", "mpeg", "mpg", "webm"]);
 const destructiveFlags = new Set(["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"]);
 
+export function inventoryRecoveryLimits(expectedCount, actualCount) {
+  const expected = Math.max(0, Math.floor(Number(expectedCount) || 0));
+  const actual = Math.max(0, Math.floor(Number(actualCount) || 0));
+  if (!expected || actual >= expected) return [];
+  const initial = Math.min(expected, Math.max(64, expected - actual + 32));
+  const limits = [initial];
+  if (initial < 256) limits.push(Math.min(expected, 256));
+  if (initial < 1024) limits.push(Math.min(expected, 1024));
+  limits.push(expected);
+  return [...new Set(limits)].sort((left, right) => left - right);
+}
+
 function sha256File(path) {
   return new Promise((resolvePromise, reject) => {
     const hash = createHash("sha256");
@@ -676,9 +688,16 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         const expectedCount = parseInventory(result.stdout, library);
         const firstPassCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
         if (expectedCount > firstPassCount) {
-          report({ phase: "reading", message: `${libraryLabel} 首轮返回 ${firstPassCount}/${expectedCount} 项，正在反向补全…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
-          const reverseResult = await runInventory(inventoryArgs, "DESCENDING");
-          parseInventory(reverseResult.stdout, library);
+          for (const recoveryLimit of inventoryRecoveryLimits(expectedCount, firstPassCount)) {
+            const beforeRecovery = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+            const recoveryLabel = recoveryLimit < expectedCount ? `${recoveryLimit} 项` : "完整图库";
+            report({ phase: "reading", message: `${libraryLabel} 首轮返回 ${beforeRecovery}/${expectedCount} 项，正在反向补扫 ${recoveryLabel}…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
+            const recoveryArgs = recoveryLimit < expectedCount ? [...inventoryArgs, "--recent", String(recoveryLimit)] : inventoryArgs;
+            const reverseResult = await runInventory(recoveryArgs, "DESCENDING");
+            parseInventory(reverseResult.stdout, library);
+            const recoveredCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+            if (recoveredCount >= expectedCount) break;
+          }
         }
         const completedCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
         if (expectedCount > completedCount) incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount });

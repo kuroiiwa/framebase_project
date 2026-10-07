@@ -4,7 +4,14 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createIcloudPdProvider } from "../server/icloud-providers/icloudpd-provider.mjs";
+import { createIcloudPdProvider, inventoryRecoveryLimits } from "../server/icloud-providers/icloudpd-provider.mjs";
+
+test("timeline recovery starts with a small reverse window and expands only when needed", () => {
+  assert.deepEqual(inventoryRecoveryLimits(4680, 4670), [64, 256, 1024, 4680]);
+  assert.deepEqual(inventoryRecoveryLimits(4680, 3000), [1712, 4680]);
+  assert.deepEqual(inventoryRecoveryLimits(3, 2), [3]);
+  assert.deepEqual(inventoryRecoveryLimits(100, 100), []);
+});
 
 test("icloudpd provider verifies an existing session without placing a password in process arguments", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-"));
@@ -531,7 +538,7 @@ test("provider builds exact year, quarter, and month summaries from read-only in
     assert.equal(result.assets[0].library, "SharedSync");
     assert.ok(progress.some(update => update.phase === "discovering"));
     assert.ok(progress.some(update => update.phase === "reading" && update.libraryIndex === 1 && update.libraryCount === 1));
-    assert.ok(progress.some(update => update.message.includes("正在反向补全")));
+    assert.ok(progress.some(update => update.message.includes("正在反向补扫")));
     assert.ok(progress.some(update => update.phase === "completed" && update.itemCount === 3));
     const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1");
     assert.ok(inventoryCall.args.includes("--only-print-filenames"));
