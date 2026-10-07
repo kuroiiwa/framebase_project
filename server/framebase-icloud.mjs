@@ -201,6 +201,17 @@ export function createIcloudManager({ projectRoot }) {
     return { updatedAt, files: merged };
   }
 
+  async function removeRecycledFromManifest(username, recycleResults) {
+    const recycledPaths = new Set((Array.isArray(recycleResults) ? recycleResults : []).filter(item => item?.status === "recycled" && typeof item.relativePath === "string").map(item => item.relativePath));
+    if (!recycledPaths.size) return readFullManifest(username);
+    const current = await readFullManifest(username);
+    const files = current.files.filter(file => !recycledPaths.has(file.relativePath));
+    const updatedAt = new Date().toISOString();
+    await atomicJson(username, fullManifestPath(username), { version: 1, updatedAt, fileCount: files.length, files });
+    await writeFullBackup(username, { manifestFileCount: files.length });
+    return { updatedAt, files };
+  }
+
   function cleanTimelineBuckets(value) {
     return Array.isArray(value) ? value.map(item => ({
       key: String(item?.key || ""), itemCount: Math.max(0, Number(item?.itemCount) || 0),
@@ -218,6 +229,15 @@ export function createIcloudManager({ projectRoot }) {
       mainBytes: Math.max(0, Number(item?.mainBytes) || 0), livePhotoBytes: Math.max(0, Number(item?.livePhotoBytes) || 0),
       livePhoto: Boolean(item?.livePhoto), raw: Boolean(item?.raw),
     })).filter(item => item.id && item.name && !Number.isNaN(new Date(item.created).getTime()) && item.originalBytes > 0).slice(0, 50_000) : [];
+  }
+
+  function cleanReleaseAssets(value) {
+    const sources = new Map((Array.isArray(value) ? value : []).map(item => [`${String(item?.library || "default")}:${String(item?.id || "")}`, item]));
+    return cleanTimelineAssets(value).map(asset => {
+      const source = sources.get(`${asset.library}:${asset.id}`);
+      const localFiles = Array.isArray(source?.localFiles) ? source.localFiles.filter(path => typeof path === "string" && path && path.length <= 4096).slice(0, 8) : [];
+      return { ...asset, localFiles };
+    });
   }
 
   async function readTimeline(username) {
@@ -298,7 +318,7 @@ export function createIcloudManager({ projectRoot }) {
         eligibleBytes: Math.max(0, Number(parsed.eligibleBytes) || 0),
         failedCount: Math.max(0, Number(parsed.failedCount) || 0),
         files: cleanFullFiles(parsed.files).slice(0, 100),
-        assets: cleanTimelineAssets(parsed.assets).slice(0, 500),
+        assets: cleanReleaseAssets(parsed.assets).slice(0, 500),
         failures: Array.isArray(parsed.failures) ? parsed.failures.filter(item => item && typeof item.relativePath === "string").slice(0, 100) : [],
       };
     } catch (error) {
@@ -340,15 +360,15 @@ export function createIcloudManager({ projectRoot }) {
       candidates.push(file);
       eligibleByName.set(key, candidates);
     }
-    const matchedAssets = timeline.assets.filter(asset => {
+    const matchedAssets = timeline.assets.flatMap(asset => {
       const created = new Date(asset.created);
       const yearMonth = `${created.getFullYear()}/${String(created.getMonth() + 1).padStart(2, "0")}`;
       const mainMatches = (eligibleByName.get(asset.name.toLocaleLowerCase()) || []).filter(file => file.size === asset.mainBytes && file.relativePath.replaceAll("\\", "/").includes(yearMonth));
-      if (mainMatches.length !== 1) return false;
-      if (!asset.livePhoto || asset.livePhotoBytes === 0) return true;
+      if (mainMatches.length !== 1) return [];
+      if (!asset.livePhoto || asset.livePhotoBytes === 0) return [{ ...asset, localFiles: [mainMatches[0].relativePath] }];
       const stem = asset.name.replace(/\.[^.]+$/, "").toLocaleLowerCase();
       const liveMatches = eligible.filter(file => file.extension === "mov" && file.size === asset.livePhotoBytes && file.name.replace(/\.[^.]+$/, "").toLocaleLowerCase() === stem && file.relativePath.replaceAll("\\", "/").includes(yearMonth));
-      return liveMatches.length === 1;
+      return liveMatches.length === 1 ? [{ ...asset, localFiles: [mainMatches[0].relativePath, liveMatches[0].relativePath] }] : [];
     });
     const ready = failures.length === 0 && eligible.length === manifest.files.length;
     const plan = {
@@ -380,14 +400,53 @@ export function createIcloudManager({ projectRoot }) {
     try {
       const parsed = JSON.parse(await readFile(releaseHistoryPath(username), "utf8"));
       const events = Array.isArray(parsed.events) ? parsed.events.filter(item => item && typeof item.completedAt === "string").slice(-500) : [];
-      return { movedCount: Math.max(0, Number(parsed.movedCount) || 0), movedBytes: Math.max(0, Number(parsed.movedBytes) || 0), lastReleasedAt: typeof parsed.lastReleasedAt === "string" ? parsed.lastReleasedAt : null, events };
+      return { movedCount: Math.max(0, Number(parsed.movedCount) || 0), movedBytes: Math.max(0, Number(parsed.movedBytes) || 0), recycledFileCount: Math.max(0, Number(parsed.recycledFileCount) || 0), recycledBytes: Math.max(0, Number(parsed.recycledBytes) || 0), lastReleasedAt: typeof parsed.lastReleasedAt === "string" ? parsed.lastReleasedAt : null, events };
     } catch (error) {
-      if (error.code === "ENOENT") return { movedCount: 0, movedBytes: 0, lastReleasedAt: null, events: [] };
+      if (error.code === "ENOENT") return { movedCount: 0, movedBytes: 0, recycledFileCount: 0, recycledBytes: 0, lastReleasedAt: null, events: [] };
       throw error;
     }
   }
 
-  async function recordReleasedAssets(username, requestedAssets, result) {
+  async function prepareLocalPaths(username, relativePaths) {
+    const [config, manifest] = await Promise.all([read(username), readFullManifest(username)]);
+    if (!config.backupDirectory) throw Object.assign(new Error("尚未设置本地备份目录。"), { status: 409 });
+    const byPath = new Map(manifest.files.map(file => [file.relativePath, file]));
+    const backupRoot = await realpath(config.backupDirectory);
+    const files = [];
+    for (const relativePath of relativePaths) {
+      const manifestFile = byPath.get(relativePath);
+      if (!manifestFile?.sha256) throw Object.assign(new Error(`本地完整性清单缺少 ${relativePath}。`), { status: 409 });
+      const requested = resolve(backupRoot, relativePath);
+      const lexical = relative(backupRoot, requested);
+      if (!lexical || lexical.startsWith("..") || isAbsolute(lexical)) throw Object.assign(new Error("本地文件路径超出备份目录。"), { status: 409 });
+      const actual = await realpath(requested);
+      const actualRelative = relative(backupRoot, actual);
+      if (actualRelative.startsWith("..") || isAbsolute(actualRelative)) throw Object.assign(new Error("本地文件链接超出备份目录。"), { status: 409 });
+      const info = await stat(actual);
+      if (!info.isFile() || info.size !== manifestFile.size || await sha256File(actual) !== manifestFile.sha256) throw Object.assign(new Error(`本地文件 ${relativePath} 未通过 SHA-256 复核。`), { status: 409 });
+      files.push({ path: actual, relativePath, size: manifestFile.size });
+    }
+    return { files, fileCount: files.length, bytes: files.reduce((sum, file) => sum + file.size, 0) };
+  }
+
+  async function prepareLocalRecycle(username, requestedAssets) {
+    const plan = await readReleasePlan(username);
+    if (!plan || plan.status !== "confirmed") throw Object.assign(new Error("释放计划尚未确认。"), { status: 409 });
+    const requestedKeys = new Set(cleanTimelineAssets(requestedAssets).map(asset => `${asset.library}:${asset.id}`));
+    const relativePaths = [...new Set(plan.assets.filter(asset => requestedKeys.has(`${asset.library}:${asset.id}`)).flatMap(asset => asset.localFiles))];
+    if (!relativePaths.length) throw Object.assign(new Error("没有找到与云端项目精确关联的本地原文件。"), { status: 409 });
+    return prepareLocalPaths(username, relativePaths);
+  }
+
+  async function prepareRecycleRetry(username, eventId) {
+    const history = await readReleaseHistory(username);
+    const event = history.events.find(item => item.id === eventId);
+    const failedPaths = Array.isArray(event?.recycleResults) ? event.recycleResults.filter(item => item.status === "failed").map(item => item.relativePath) : [];
+    if (!failedPaths.length) throw Object.assign(new Error("这条记录没有可重试的本地文件。"), { status: 409 });
+    return prepareLocalPaths(username, failedPaths);
+  }
+
+  async function recordReleasedAssets(username, requestedAssets, result, recycleResult = null) {
     const deletedKeys = new Set((result.results || []).filter(item => item.status === "deleted").map(item => `${item.library}:${item.id}`));
     const current = await readReleaseHistory(username);
     const previouslyDeleted = new Set(current.events.flatMap(event => Array.isArray(event.assets) ? event.assets.map(asset => `${asset.library}:${asset.id}`) : []));
@@ -395,11 +454,14 @@ export function createIcloudManager({ projectRoot }) {
     if (!deletedAssets.length) return current;
     const completedAt = new Date().toISOString();
     const movedBytes = deletedAssets.reduce((sum, asset) => sum + asset.originalBytes, 0);
-    const history = { version: 1, movedCount: current.movedCount + deletedAssets.length, movedBytes: current.movedBytes + movedBytes, lastReleasedAt: completedAt, events: [...current.events, { completedAt, count: deletedAssets.length, bytes: movedBytes, assets: deletedAssets.map(asset => ({ id: asset.id, library: asset.library, name: asset.name })) }].slice(-500) };
+    const recycled = Array.isArray(recycleResult?.results) ? recycleResult.results.filter(item => item.status === "recycled") : [];
+    const recycledBytes = recycled.reduce((sum, item) => sum + Math.max(0, Number(item.size) || 0), 0);
+    const history = { version: 2, movedCount: current.movedCount + deletedAssets.length, movedBytes: current.movedBytes + movedBytes, recycledFileCount: current.recycledFileCount + recycled.length, recycledBytes: current.recycledBytes + recycledBytes, lastReleasedAt: completedAt, events: [...current.events, { id: randomUUID(), completedAt, count: deletedAssets.length, bytes: movedBytes, recycledFileCount: recycled.length, recycledBytes, recycleStatus: recycleResult?.status || "not_requested", recycleResults: Array.isArray(recycleResult?.results) ? recycleResult.results : [], assets: deletedAssets.map(asset => ({ id: asset.id, library: asset.library, name: asset.name })) }].slice(-500) };
     await atomicJson(username, releaseHistoryPath(username), history);
+    await removeRecycledFromManifest(username, recycleResult?.results);
     try {
       const plan = JSON.parse(await readFile(releasePlanPath(username), "utf8"));
-      plan.assets = cleanTimelineAssets(plan.assets).filter(asset => !deletedKeys.has(`${asset.library}:${asset.id}`));
+      plan.assets = cleanReleaseAssets(plan.assets).filter(asset => !deletedKeys.has(`${asset.library}:${asset.id}`));
       plan.message = plan.assets.length ? `${plan.assets.length} 个精确匹配项目仍可在图片库手动释放。` : "本次释放计划中的精确匹配项目已全部处理；请重新统计后生成下一份计划。";
       await atomicJson(username, releasePlanPath(username), plan);
     } catch (error) {
@@ -422,6 +484,24 @@ export function createIcloudManager({ projectRoot }) {
     const total = remaining.reduce((bucket, asset) => { add(new Map([["total", bucket]]), "total", asset); return bucket; }, { key: "total", itemCount: 0, photoCount: 0, videoCount: 0, livePhotoCount: 0, rawCount: 0, originalBytes: 0 });
     const newest = map => [...map.values()].sort((a, b) => b.key.localeCompare(a.key));
     await atomicJson(username, timelinePath(username), { version: 2, scannedAt: timeline.scannedAt, staleAt: completedAt, staleReason: "已从 iCloud 移入最近删除；当前数字已在本地扣除，请重新统计以确认云端状态。", total, years: newest(buckets.years), quarters: newest(buckets.quarters), months: newest(buckets.months), assets: remaining });
+    return readReleaseHistory(username);
+  }
+
+  async function recordRecycleRetry(username, eventId, recycleResult) {
+    const current = await readReleaseHistory(username);
+    const eventIndex = current.events.findIndex(event => event.id === eventId);
+    if (eventIndex < 0) throw Object.assign(new Error("找不到本地回收记录。"), { status: 404 });
+    const event = current.events[eventIndex];
+    const previousResults = Array.isArray(event.recycleResults) ? event.recycleResults : [];
+    const retryByPath = new Map((recycleResult.results || []).map(result => [result.relativePath, result]));
+    const nextResults = previousResults.map(result => result.status === "failed" && retryByPath.has(result.relativePath) ? retryByPath.get(result.relativePath) : result);
+    const newlyRecycled = nextResults.filter((result, index) => result.status === "recycled" && previousResults[index]?.status !== "recycled");
+    const addedBytes = newlyRecycled.reduce((sum, result) => sum + Math.max(0, Number(result.size) || 0), 0);
+    const allRecycled = nextResults.length > 0 && nextResults.every(result => result.status === "recycled");
+    current.events[eventIndex] = { ...event, recycleResults: nextResults, recycleStatus: allRecycled ? "recycled" : nextResults.some(result => result.status === "recycled") ? "partial" : "failed", recycledFileCount: nextResults.filter(result => result.status === "recycled").length, recycledBytes: nextResults.filter(result => result.status === "recycled").reduce((sum, result) => sum + Math.max(0, Number(result.size) || 0), 0) };
+    const updated = { version: 2, movedCount: current.movedCount, movedBytes: current.movedBytes, recycledFileCount: current.recycledFileCount + newlyRecycled.length, recycledBytes: current.recycledBytes + addedBytes, lastReleasedAt: current.lastReleasedAt, events: current.events };
+    await atomicJson(username, releaseHistoryPath(username), updated);
+    await removeRecycledFromManifest(username, recycleResult?.results);
     return readReleaseHistory(username);
   }
 
@@ -624,5 +704,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readBackupHistory, recordCompletedRanges, readReleasePlan, createReleasePlan, confirmReleasePlan, readReleaseHistory, recordReleasedAssets, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readBackupHistory, recordCompletedRanges, readReleasePlan, createReleasePlan, confirmReleasePlan, readReleaseHistory, prepareLocalRecycle, prepareRecycleRetry, recordReleasedAssets, recordRecycleRetry, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

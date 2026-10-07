@@ -74,8 +74,8 @@ type PageSize = 20 | 50 | 100;
 type StoryboardView = { time: number; url: string };
 type StoryboardCacheRecord = { key: string; size: number; lastAccess: number };
 type HealthIssue = { video: VideoItem; kind: "unavailable" | "changed" | "empty" | "preview"; detail: string };
-type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number };
-type ReleaseCatalog = { releasePlan: { id: string | null; status: string; assets: IcloudAsset[] } | null; releaseHistory: { movedCount: number; movedBytes: number; lastReleasedAt: string | null }; timeline: { staleAt: string | null; staleReason: string | null } };
+type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number; localFiles: string[] };
+type ReleaseCatalog = { releasePlan: { id: string | null; status: string; assets: IcloudAsset[] } | null; releaseHistory: { movedCount: number; movedBytes: number; recycledFileCount: number; recycledBytes: number; lastReleasedAt: string | null }; timeline: { staleAt: string | null; staleReason: string | null } };
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg"]);
 const DB_STORE = "cache";
@@ -475,7 +475,8 @@ function Library({ username }: { username: string }) {
   }, []);
 
   const cloudAssetFor = useCallback((video: VideoItem) => {
-    const candidates = releaseCatalog?.releasePlan?.status === "confirmed" ? releaseCatalog.releasePlan.assets.filter(asset => asset.mediaType === "video" && asset.name.toLocaleLowerCase() === video.name.toLocaleLowerCase() && asset.mainBytes === video.size) : [];
+    const normalizedPath = video.path.replaceAll("\\", "/").toLocaleLowerCase();
+    const candidates = releaseCatalog?.releasePlan?.status === "confirmed" ? releaseCatalog.releasePlan.assets.filter(asset => asset.mediaType === "video" && asset.name.toLocaleLowerCase() === video.name.toLocaleLowerCase() && asset.mainBytes === video.size && asset.localFiles.some(path => path.replaceAll("\\", "/").toLocaleLowerCase() === normalizedPath)) : [];
     if (!candidates || candidates.length !== 1) return null;
     const created = new Date(candidates[0].created); const modified = new Date(video.modified);
     return created.getFullYear() === modified.getFullYear() && created.getMonth() === modified.getMonth() ? candidates[0] : null;
@@ -485,17 +486,25 @@ function Library({ username }: { username: string }) {
     const key = `${asset.library}:${asset.id}`;
     setReleasingAsset(key); setError(null); setNotice(null);
     try {
-      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key] }) });
-      const preview = await previewResponse.json() as { releaseResult?: { status: string }; error?: string };
+      const recycleLocal = window.confirm("是否同时把本地备份移入 Windows 回收站？\n\n确定：云端和本地同时清理\n取消：只清理 iCloud，保留本地视频");
+      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], recycleLocal }) });
+      const preview = await previewResponse.json() as { releaseResult?: { status: string }; localRecyclePlan?: { fileCount: number; bytes: number }; error?: string };
       if (!previewResponse.ok || preview.releaseResult?.status !== "matched") throw new Error(preview.error || "云端视频复核失败，没有执行删除。");
-      const confirmation = window.prompt(`已精确匹配“${video.name}”。本地视频会保留，云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。\n\n请输入“移入最近删除”继续：`, "");
+      const localSummary = recycleLocal ? `同时将 ${preview.localRecyclePlan?.fileCount || 0} 个本地原文件（${formatBytes(preview.localRecyclePlan?.bytes || 0)}）移入 Windows 回收站。` : "本地视频会保留。";
+      const confirmation = window.prompt(`已精确匹配“${video.name}”。云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。${localSummary}\n\n请输入“移入最近删除”继续：`, "");
       if (confirmation === null) return;
       if (confirmation !== "移入最近删除") throw new Error("确认文字不正确，没有执行删除。");
-      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation }) });
-      const data = await response.json() as { releaseResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation, recycleLocal }) });
+      const data = await response.json() as { releaseResult?: { status: string; message: string }; recycleResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
       if (!response.ok || data.releaseResult?.status !== "deleted") throw new Error(data.error || data.releaseResult?.message || "iCloud 删除失败。");
       setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
-      setNotice(`“${video.name}”已移入 iCloud“最近删除”，本地视频未删除。预计可释放 ${formatBytes(asset.originalBytes)}。`);
+      if (data.recycleResult?.status === "recycled") {
+        const nextVideos = videos.filter(item => item.id !== video.id);
+        const nextSources = sources.map(source => source.id === video.sourceId ? { ...source, videoCount: Math.max(0, source.videoCount - 1), totalSize: Math.max(0, source.totalSize - video.size) } : source);
+        setVideos(nextVideos); setSources(nextSources);
+        await Promise.all([dbSet(`library:${video.sourceId}`, nextVideos.filter(item => item.sourceId === video.sourceId).map(storedVideo)), dbSet("source-folders", nextSources)]);
+      }
+      setNotice(data.recycleResult ? `“${video.name}”已移入 iCloud“最近删除”。${data.recycleResult.message}` : `“${video.name}”已移入 iCloud“最近删除”，本地视频未删除。预计可释放 ${formatBytes(asset.originalBytes)}。`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "iCloud 删除失败。"); }
     finally { setReleasingAsset(null); }
   }
@@ -1255,7 +1264,7 @@ function Library({ username }: { username: string }) {
                     <div className="video-title">
                       <h2 title={video.path}>{video.name}</h2>
                       <div className="card-mark-actions" aria-label="视频标记">
-                        {cloudAsset && <button className="mark-button cloud-release" onClick={() => void releaseVideoFromIcloud(video, cloudAsset)} disabled={releasingAsset !== null} title="从 iCloud 移入最近删除（保留本地视频）" aria-label={`从 iCloud 移入最近删除：${video.name}`}>{releasingAsset === cloudKey ? "…" : "☁"}</button>}
+                        {cloudAsset && <button className="mark-button cloud-release" onClick={() => void releaseVideoFromIcloud(video, cloudAsset)} disabled={releasingAsset !== null} title="安全释放 iCloud，可选择同时移入本地回收站" aria-label={`安全释放云端和本地视频：${video.name}`}>{releasingAsset === cloudKey ? "…" : "☁"}</button>}
                         <button className={`mark-button liked-mark ${video.liked ? "active" : ""}`} onClick={() => updateMark(video.id, "liked")} title={video.liked ? "取消点赞" : "点赞"} aria-label={video.liked ? "取消点赞" : "点赞"} aria-pressed={video.liked}><MarkIcon type="liked" /></button>
                         <button className={`mark-button cleanup-mark ${video.cleanup ? "active" : ""}`} onClick={() => updateMark(video.id, "cleanup")} title={video.cleanup ? "取消待清理标记" : "标记为待清理"} aria-label={video.cleanup ? "取消待清理标记" : "标记为待清理"} aria-pressed={video.cleanup}><MarkIcon type="cleanup" /></button>
                         <button className={`mark-button tag-mark ${video.tagIds.length ? "active" : ""}`} onClick={() => setTaggingVideoId(current => current === video.id ? null : video.id)} title="添加或移除标签" aria-label={`管理 ${video.name} 的标签`} aria-expanded={taggingVideoId === video.id}><TagIcon /></button>

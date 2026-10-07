@@ -10,6 +10,7 @@ import { createPowerManager, isLocalAdmin, validatePowerRequest } from "./frameb
 import { createAccounts } from "./framebase-accounts.mjs";
 import { createIcloudManager } from "./framebase-icloud.mjs";
 import { createIcloudPdProvider } from "./icloud-providers/icloudpd-provider.mjs";
+import { createRecycleBin } from "./framebase-recycle-bin.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeStartedAt = new Date().toISOString();
@@ -59,6 +60,7 @@ const configPath = join(projectRoot, ".framebase-lan.json");
 const thumbnailDirectory = join(projectRoot, ".framebase-thumbnails");
 const accounts = createAccounts(join(projectRoot, ".framebase-accounts.json"));
 const icloud = createIcloudManager({ projectRoot });
+const recycleBin = createRecycleBin();
 const bundledIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe");
 const compatibleIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-compatible.exe");
 const icloudProvider = createIcloudPdProvider({
@@ -645,13 +647,24 @@ async function handleIcloud(request, response, url) {
     const requestedKeys = new Set(Array.isArray(body.assetKeys) ? body.assetKeys.filter(key => typeof key === "string").slice(0, 100) : []);
     const assets = plan.assets.filter(asset => requestedKeys.has(`${asset.library}:${asset.id}`));
     if (!assets.length || assets.length !== requestedKeys.size) return json(response, 400, { error: "选择的项目不在已确认释放计划中。" });
+    const recycleLocal = body.recycleLocal === true;
+    const localRecyclePlan = recycleLocal ? await icloud.prepareLocalRecycle(current.username, assets) : { files: [], fileCount: 0, bytes: 0 };
     const context = await icloud.connectionContext(current.username);
     const preview = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: false });
-    if (url.pathname.endsWith("/preview") || preview.status !== "matched") return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview });
+    if (url.pathname.endsWith("/preview") || preview.status !== "matched") return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview, localRecyclePlan: { fileCount: localRecyclePlan.fileCount, bytes: localRecyclePlan.bytes } });
     if (body.confirmation !== "移入最近删除") return json(response, 400, { error: "请输入“移入最近删除”确认。" });
     const released = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: true });
-    const releaseHistory = await icloud.recordReleasedAssets(current.username, assets, released);
-    return json(response, released.status === "deleted" ? 200 : 409, { releaseResult: released, releaseHistory, timeline: await icloud.readTimeline(current.username) });
+    const recycleResult = released.status === "deleted" && recycleLocal ? await recycleBin.recycle(localRecyclePlan.files) : null;
+    const releaseHistory = await icloud.recordReleasedAssets(current.username, assets, released, recycleResult);
+    return json(response, released.status === "deleted" ? 200 : 409, { releaseResult: released, recycleResult, releaseHistory, timeline: await icloud.readTimeline(current.username) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/release/recycle/retry") {
+    const body = await readJsonBody(request);
+    if (typeof body.eventId !== "string") return json(response, 400, { error: "缺少需要重试的本地回收记录。" });
+    const plan = await icloud.prepareRecycleRetry(current.username, body.eventId);
+    const recycleResult = await recycleBin.recycle(plan.files);
+    const releaseHistory = await icloud.recordRecycleRetry(current.username, body.eventId, recycleResult);
+    return json(response, recycleResult.status === "recycled" ? 200 : 409, { recycleResult, releaseHistory });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
     const context = await icloud.connectionContext(current.username);
