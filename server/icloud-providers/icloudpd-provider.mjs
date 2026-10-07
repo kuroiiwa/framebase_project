@@ -55,6 +55,13 @@ export function inventoryRecoveryLimits(expectedCount, actualCount) {
   return [...new Set(limits)].sort((left, right) => left - right);
 }
 
+export function isTolerableInventoryGap(expectedCount, actualCount) {
+  const expected = Math.max(0, Math.floor(Number(expectedCount) || 0));
+  const actual = Math.max(0, Math.floor(Number(actualCount) || 0));
+  if (expected < 1000 || actual >= expected) return false;
+  return expected - actual <= Math.max(32, Math.ceil(expected * 0.005));
+}
+
 function sha256File(path) {
   return new Promise((resolvePromise, reject) => {
     const hash = createHash("sha256");
@@ -658,6 +665,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const targets = libraries.length ? libraries.slice(0, 32) : [null];
       const itemsById = new Map();
       const incompleteLibraries = [];
+      const indexDiscrepancies = [];
       const parseInventory = (output, library) => {
         let expectedCount = 0;
         let sawTotal = false;
@@ -695,6 +703,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         if (!inventorySummary.sawTotal) {
           incompleteLibraries.push({ library: libraryLabel, expectedCount: null, completedCount: firstPassCount, missingTotal: true });
         } else if (expectedCount > firstPassCount) {
+          let acceptedStableGap = false;
           for (const recoveryLimit of inventoryRecoveryLimits(expectedCount, firstPassCount)) {
             const beforeRecovery = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
             const recoveryLabel = recoveryLimit < expectedCount ? `${recoveryLimit} 项` : "完整图库";
@@ -704,10 +713,18 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             parseInventory(reverseResult.stdout, library);
             const recoveredCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
             if (recoveredCount >= expectedCount) break;
+            if (recoveredCount === beforeRecovery && isTolerableInventoryGap(expectedCount, recoveredCount)) {
+              acceptedStableGap = true;
+              indexDiscrepancies.push({ library: libraryLabel, expectedCount, completedCount: recoveredCount });
+              report({ phase: "reading", message: `${libraryLabel} 已确认 ${recoveredCount} 个可枚举项目；Apple 索引另有 ${expectedCount - recoveredCount} 个不可枚举记录，停止重复补扫。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
+              break;
+            }
+          }
+          if (!acceptedStableGap) {
+            const completedCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+            if (expectedCount > completedCount) incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount });
           }
         }
-        const completedCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
-        if (expectedCount > completedCount) incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount });
         report({ phase: "reading", message: `${libraryLabel} 已读取完成。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
       }
       if (incompleteLibraries.length) {
@@ -734,7 +751,11 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       for (const item of itemsById.values()) increment(totals, "total", item);
       const total = totals.get("total") || empty("total");
       report({ phase: "completed", message: `已完成 ${total.itemCount} 个项目的时间统计。`, libraryIndex: targets.length, libraryCount: targets.length, itemCount: total.itemCount });
-      return { status: "ready", message: `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), assets: [...itemsById.values()], providerInfo };
+      const discrepancyCount = indexDiscrepancies.reduce((sum, item) => sum + item.expectedCount - item.completedCount, 0);
+      const message = discrepancyCount
+        ? `已只读统计 ${total.itemCount} 个可枚举 iCloud 媒体项目；Apple 索引另有 ${discrepancyCount} 个不可枚举记录。`
+        : `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`;
+      return { status: "ready", message, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), assets: [...itemsById.values()], providerInfo };
     } catch (error) {
       return { ...safeMessage(error), years: [], quarters: [], months: [], providerInfo };
     }

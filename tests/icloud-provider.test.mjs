@@ -4,13 +4,45 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createIcloudPdProvider, inventoryRecoveryLimits } from "../server/icloud-providers/icloudpd-provider.mjs";
+import { createIcloudPdProvider, inventoryRecoveryLimits, isTolerableInventoryGap } from "../server/icloud-providers/icloudpd-provider.mjs";
 
 test("timeline recovery starts with a small reverse window and expands only when needed", () => {
   assert.deepEqual(inventoryRecoveryLimits(4680, 4670), [64, 256, 1024, 4680]);
   assert.deepEqual(inventoryRecoveryLimits(4680, 3000), [1712, 4680]);
   assert.deepEqual(inventoryRecoveryLimits(3, 2), [3]);
   assert.deepEqual(inventoryRecoveryLimits(100, 100), []);
+});
+
+test("a small stable Apple index gap stops repeated reverse scans", async () => {
+  assert.equal(isTolerableInventoryGap(4680, 4670), true);
+  assert.equal(isTolerableInventoryGap(100, 99), false);
+  assert.equal(isTolerableInventoryGap(4680, 4600), false);
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-stable-gap-"));
+  const executablePath = join(root, "icloudpd.exe");
+  try {
+    await writeFile(executablePath, "test");
+    const inventory = Array.from({ length: 4670 }, (_, index) => `FRAMEBASE_INVENTORY {"id":"asset-${index}","created":"2025-03-02T10:00:00+08:00","mediaType":"photo","originalBytes":100,"livePhoto":false,"raw":false}`);
+    let reverseCalls = 0;
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args, options) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "", stderr: "" };
+        if (options?.env?.FRAMEBASE_INVENTORY_DIRECTION === "DESCENDING") {
+          reverseCalls += 1;
+          return { stdout: ['FRAMEBASE_INVENTORY_TOTAL {"count":4680,"library":"default"}', ...inventory.slice(-64)].join("\n"), stderr: "" };
+        }
+        return { stdout: ['FRAMEBASE_INVENTORY_TOTAL {"count":4680,"library":"default"}', ...inventory].join("\n"), stderr: "" };
+      },
+    });
+    const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") });
+    assert.equal(result.status, "ready");
+    assert.equal(result.total.itemCount, 4670);
+    assert.match(result.message, /10 个不可枚举记录/);
+    assert.equal(reverseCalls, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("icloudpd provider verifies an existing session without placing a password in process arguments", async () => {
