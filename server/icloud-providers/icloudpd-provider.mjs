@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readdir, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn as spawnPty } from "node-pty";
 
@@ -642,7 +642,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           if (!line.startsWith("FRAMEBASE_INVENTORY ")) continue;
           try {
             const item = JSON.parse(line.slice("FRAMEBASE_INVENTORY ".length));
-            if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, item);
+            if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, { ...item, library: library || "default" });
           } catch { /* Ignore malformed provider output without exposing it. */ }
         }
       }
@@ -661,9 +661,57 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const totals = new Map();
       for (const item of itemsById.values()) increment(totals, "total", item);
       const total = totals.get("total") || empty("total");
-      return { status: "ready", message: `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), providerInfo };
+      return { status: "ready", message: `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), assets: [...itemsById.values()], providerInfo };
     } catch (error) {
       return { ...safeMessage(error), years: [], quarters: [], months: [], providerInfo };
+    }
+  }
+
+  async function deleteAssets({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, assets, commit = false }) {
+    const providerInfo = await info();
+    if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", results: [], providerInfo };
+    const requested = Array.isArray(assets) ? assets.filter(asset => asset?.id && asset?.library && asset?.name && asset?.created && Number(asset?.originalBytes) > 0).slice(0, 100) : [];
+    if (!requested.length) return { status: "invalid", message: "没有可安全匹配的 iCloud 项目。", results: [], providerInfo };
+    const password = sessionSecrets.get(jobKey);
+    const temporaryDirectory = await mkdtemp(join(sessionDirectory, "framebase-delete-"));
+    const requestPath = join(temporaryDirectory, "request.json");
+    await writeFile(requestPath, JSON.stringify({ version: 1, assets: requested }), { encoding: "utf8", mode: 0o600 });
+    const baseArgs = [
+      "--log-level", "error", "--no-progress-bar", "--domain", domain,
+      "--password-provider", password ? "console" : "parameter", "--mfa-provider", "console",
+      "--cookie-directory", sessionDirectory, "--directory", backupDirectory, "--username", appleAccount,
+      "--size", "original", "--live-photo-size", "original", "--align-raw", "original", "--only-print-filenames",
+    ];
+    const results = [];
+    try {
+      const byLibrary = new Map();
+      for (const asset of requested) {
+        const collection = byLibrary.get(asset.library) || [];
+        collection.push(asset);
+        byLibrary.set(asset.library, collection);
+      }
+      for (const [library, libraryAssets] of byLibrary) {
+        await writeFile(requestPath, JSON.stringify({ version: 1, assets: libraryAssets }), { encoding: "utf8", mode: 0o600 });
+        const env = { ...process.env, FRAMEBASE_DELETE_REQUEST: requestPath, ...(commit ? { FRAMEBASE_DELETE_COMMIT: "1" } : {}) };
+        const args = [...baseArgs, ...(library !== "default" ? ["--library", library] : [])];
+        if (args.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe deletion arguments");
+        const result = password
+          ? await runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env })
+          : await runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 16 * 1024 * 1024, env });
+        for (const line of String(result.stdout || "").split(/\r?\n/)) {
+          if (!line.startsWith("FRAMEBASE_DELETE ")) continue;
+          try { results.push(JSON.parse(line.slice("FRAMEBASE_DELETE ".length))); } catch { /* Ignore malformed adapter output. */ }
+        }
+      }
+      const byId = new Map(results.map(result => [`${result.library}:${result.id}`, result]));
+      const complete = requested.map(asset => byId.get(`${asset.library}:${asset.id}`) || { id: asset.id, library: asset.library, status: "missing", bytes: 0 });
+      const succeeded = complete.filter(result => result.status === (commit ? "deleted" : "matched"));
+      const bytes = succeeded.reduce((sum, result) => sum + Math.max(0, Number(result.bytes) || 0), 0);
+      return { status: succeeded.length === requested.length ? (commit ? "deleted" : "matched") : "partial", message: commit ? `已将 ${succeeded.length} 个精确匹配项目移入 iCloud“最近删除”。` : `已精确匹配 ${succeeded.length}/${requested.length} 个云端项目。`, results: complete, count: succeeded.length, bytes, providerInfo };
+    } catch (error) {
+      return { ...safeMessage(error), results, providerInfo };
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
@@ -782,5 +830,5 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     return publicAuthState(job);
   }
 
-  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, scanTimeline, backupRecent, backupAll, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
+  return { id: "icloudpd", info, verifyExistingSession, verifyRuntimeSession, scanRecent, scanTimeline, deleteAssets, backupRecent, backupAll, startAuthentication, authenticationStatus, submitAuthenticationInput, cancelAuthentication, hasRuntimeCredential: jobKey => sessionSecrets.has(jobKey) };
 }

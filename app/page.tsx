@@ -74,6 +74,8 @@ type PageSize = 20 | 50 | 100;
 type StoryboardView = { time: number; url: string };
 type StoryboardCacheRecord = { key: string; size: number; lastAccess: number };
 type HealthIssue = { video: VideoItem; kind: "unavailable" | "changed" | "empty" | "preview"; detail: string };
+type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number };
+type ReleaseCatalog = { releasePlan: { id: string | null; status: string; assets: IcloudAsset[] } | null; releaseHistory: { movedCount: number; movedBytes: number; lastReleasedAt: string | null }; timeline: { staleAt: string | null; staleReason: string | null } };
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg"]);
 const DB_STORE = "cache";
@@ -460,8 +462,43 @@ function Library({ username }: { username: string }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [releaseCatalog, setReleaseCatalog] = useState<ReleaseCatalog | null>(null);
+  const [releasingAsset, setReleasingAsset] = useState<string | null>(null);
 
   useEffect(() => { localStorage.setItem(accountKey("framebase-last-library"), "video"); }, []);
+
+  useEffect(() => {
+    void fetch("/api/icloud/release/catalog", { cache: "no-store" })
+      .then(response => response.ok ? response.json() as Promise<ReleaseCatalog> : null)
+      .then(catalog => setReleaseCatalog(catalog))
+      .catch(() => undefined);
+  }, []);
+
+  const cloudAssetFor = useCallback((video: VideoItem) => {
+    const candidates = releaseCatalog?.releasePlan?.status === "confirmed" ? releaseCatalog.releasePlan.assets.filter(asset => asset.mediaType === "video" && asset.name.toLocaleLowerCase() === video.name.toLocaleLowerCase() && asset.mainBytes === video.size) : [];
+    if (!candidates || candidates.length !== 1) return null;
+    const created = new Date(candidates[0].created); const modified = new Date(video.modified);
+    return created.getFullYear() === modified.getFullYear() && created.getMonth() === modified.getMonth() ? candidates[0] : null;
+  }, [releaseCatalog]);
+
+  async function releaseVideoFromIcloud(video: VideoItem, asset: IcloudAsset) {
+    const key = `${asset.library}:${asset.id}`;
+    setReleasingAsset(key); setError(null); setNotice(null);
+    try {
+      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key] }) });
+      const preview = await previewResponse.json() as { releaseResult?: { status: string }; error?: string };
+      if (!previewResponse.ok || preview.releaseResult?.status !== "matched") throw new Error(preview.error || "云端视频复核失败，没有执行删除。");
+      const confirmation = window.prompt(`已精确匹配“${video.name}”。本地视频会保留，云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。\n\n请输入“移入最近删除”继续：`, "");
+      if (confirmation === null) return;
+      if (confirmation !== "移入最近删除") throw new Error("确认文字不正确，没有执行删除。");
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation }) });
+      const data = await response.json() as { releaseResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
+      if (!response.ok || data.releaseResult?.status !== "deleted") throw new Error(data.error || data.releaseResult?.message || "iCloud 删除失败。");
+      setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
+      setNotice(`“${video.name}”已移入 iCloud“最近删除”，本地视频未删除。预计可释放 ${formatBytes(asset.originalBytes)}。`);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "iCloud 删除失败。"); }
+    finally { setReleasingAsset(null); }
+  }
 
   useEffect(() => {
     if (window.location.hostname === "127.0.0.1") {
@@ -1210,7 +1247,7 @@ function Library({ username }: { username: string }) {
           {selecting && <p className="selection-summary" role="status">Shift 点击可跨页连续选择。已选 {selected.size} 个 · {offPageSelectionCount} 个不在本页{hiddenSelectionCount > 0 && <>，其中 {hiddenSelectionCount} 个不符合当前筛选 <button onClick={() => setSelected(current => new Set([...current].filter(id => filtered.some(video => video.id === id))))}>取消隐藏项选择</button></>}</p>}
           {loading ? <section className="loading-state"><span className="spinner" />正在扫描视频文件…</section> : filtered.length ? (
             <section className={`grid layout-${layout}`}>
-              {paginatedVideos.map(video => (
+              {paginatedVideos.map(video => { const cloudAsset = cloudAssetFor(video); const cloudKey = cloudAsset ? `${cloudAsset.library}:${cloudAsset.id}` : null; return (
                 <article className={`video-card ${selected.has(video.id) ? "selected" : ""}`} key={video.id}>
                   {selecting && <button className={`check ${selected.has(video.id) ? "checked" : ""}`} onClick={event => toggleSelection(video.id, event.shiftKey)} aria-label={`选择 ${video.name}`} aria-pressed={selected.has(video.id)}>{selected.has(video.id) ? "✓" : ""}</button>}
                   <HoverPreview item={video} onOpen={extend => selecting ? toggleSelection(video.id, extend) : openPlayer(video, false, filtered.map(item => item.id))} />
@@ -1218,6 +1255,7 @@ function Library({ username }: { username: string }) {
                     <div className="video-title">
                       <h2 title={video.path}>{video.name}</h2>
                       <div className="card-mark-actions" aria-label="视频标记">
+                        {cloudAsset && <button className="mark-button cloud-release" onClick={() => void releaseVideoFromIcloud(video, cloudAsset)} disabled={releasingAsset !== null} title="从 iCloud 移入最近删除（保留本地视频）" aria-label={`从 iCloud 移入最近删除：${video.name}`}>{releasingAsset === cloudKey ? "…" : "☁"}</button>}
                         <button className={`mark-button liked-mark ${video.liked ? "active" : ""}`} onClick={() => updateMark(video.id, "liked")} title={video.liked ? "取消点赞" : "点赞"} aria-label={video.liked ? "取消点赞" : "点赞"} aria-pressed={video.liked}><MarkIcon type="liked" /></button>
                         <button className={`mark-button cleanup-mark ${video.cleanup ? "active" : ""}`} onClick={() => updateMark(video.id, "cleanup")} title={video.cleanup ? "取消待清理标记" : "标记为待清理"} aria-label={video.cleanup ? "取消待清理标记" : "标记为待清理"} aria-pressed={video.cleanup}><MarkIcon type="cleanup" /></button>
                         <button className={`mark-button tag-mark ${video.tagIds.length ? "active" : ""}`} onClick={() => setTaggingVideoId(current => current === video.id ? null : video.id)} title="添加或移除标签" aria-label={`管理 ${video.name} 的标签`} aria-expanded={taggingVideoId === video.id}><TagIcon /></button>
@@ -1234,7 +1272,7 @@ function Library({ username }: { username: string }) {
                     {video.tagIds.length > 0 && <div className="video-tags">{video.tagIds.map(id => customTags.find(tag => tag.id === id)).filter((tag): tag is CustomTag => Boolean(tag)).map(tag => <button className="custom-tag" style={{ "--tag-color": tag.color } as CSSProperties} onClick={() => { if (!selectedTagIds.has(tag.id)) toggleTagFilter(tag.id); setTagFilterOpen(true); }} title={`筛选标签：${tag.name}`} key={tag.id}><i />{tag.name}</button>)}</div>}
                   </div>
                 </article>
-              ))}
+              ); })}
             </section>
           ) : <section className="no-results"><strong>没有符合条件的视频</strong><p>试试清除搜索词或调整筛选条件。</p><button onClick={() => { setQuery(""); setFormat("all"); setResolutionFilter("all"); setDurationFilter("all"); setSelectedTagIds(new Set()); setTab("all"); setCurrentPage(1); }}>清除筛选</button></section>}
 

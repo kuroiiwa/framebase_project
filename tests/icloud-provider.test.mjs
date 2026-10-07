@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -522,9 +522,44 @@ test("provider builds exact year, quarter, and month summaries from read-only in
     assert.deepEqual(result.years.map(item => [item.key, item.itemCount]), [["2024", 2], ["2023", 1]]);
     assert.deepEqual(result.quarters.map(item => item.key), ["2024-Q2", "2024-Q1", "2023-Q4"]);
     assert.deepEqual(result.months.map(item => item.key), ["2024-04", "2024-03", "2023-12"]);
+    assert.equal(result.assets.length, 3);
+    assert.equal(result.assets[0].library, "SharedSync");
     const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1");
     assert.ok(inventoryCall.args.includes("--only-print-filenames"));
     assert.equal(inventoryCall.args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider deletes only exact asset ids through the protected FrameBase adapter request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-delete-"));
+  const executablePath = join(root, "icloudpd.exe");
+  const calls = [];
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args, options) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        const request = JSON.parse(await readFile(options.env.FRAMEBASE_DELETE_REQUEST, "utf8"));
+        calls.push({ args, options, request });
+        const asset = request.assets[0];
+        return { stdout: `FRAMEBASE_DELETE ${JSON.stringify({ id: asset.id, library: asset.library, status: options.env.FRAMEBASE_DELETE_COMMIT === "1" ? "deleted" : "matched", bytes: asset.originalBytes })}\n`, stderr: "" };
+      },
+    });
+    const asset = { id: "asset-1", library: "SharedSync", name: "IMG_0001.HEIC", created: "2024-03-02T10:00:00+08:00", mediaType: "photo", originalBytes: 4096 };
+    const context = { jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"), assets: [asset] };
+    await mkdir(context.sessionDirectory, { recursive: true });
+    const preview = await provider.deleteAssets({ ...context, commit: false });
+    const deleted = await provider.deleteAssets({ ...context, commit: true });
+    assert.equal(preview.status, "matched");
+    assert.equal(deleted.status, "deleted");
+    assert.equal(deleted.bytes, 4096);
+    assert.equal(calls[0].args.includes("--library"), true);
+    assert.equal(calls[0].args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
+    assert.equal(calls[0].options.env.FRAMEBASE_DELETE_COMMIT, undefined);
+    assert.equal(calls[1].options.env.FRAMEBASE_DELETE_COMMIT, "1");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

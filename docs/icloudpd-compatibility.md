@@ -91,7 +91,7 @@ PR #1367 修改了两处：
 
 7. 运行 `--version` 并记录生成文件的 SHA-256，确认文件可执行。源码快照缺少官方构建元数据时，程序自身可能显示 `0.0.1`；FrameBase 会依据兼容文件名在界面显示 `1.32.3 · FrameBase 兼容版`。
 
-   当前加入 FrameBase 只读时间清单能力后的本机构建 SHA-256 为 `8116AE89652A13A09A05800890CE65EF3AF36DCF42829D6DC618928D69193245`。重新构建后哈希可能变化，应以新构建的测试结果为准，不能仅凭文件名判断是否包含补丁。
+   当前加入 FrameBase 只读时间清单和精确删除适配器后的本机构建 SHA-256 为 `2BC283E2658E051E35EDA5AF2A18233845211F591AE15822C8AB23FFC23171E3`。重新构建后哈希可能变化，应以新构建的测试结果为准，不能仅凭文件名判断是否包含补丁。
 
 ## FrameBase 时间清单扩展
 
@@ -107,7 +107,7 @@ FRAMEBASE_INVENTORY_JSON=1
 FRAMEBASE_INVENTORY {JSON}
 ```
 
-JSON 只包含对象 ID、文件名、拍摄时间、图片/视频类型、原始资源大小、Live Photo 视频大小和 RAW 标记。它不会下载文件，也不会调用删除接口。Provider 只解析带此前缀的行，并在内存中汇总为年份、季度和月份；原始逐项清单不会写入浏览器或普通日志。
+JSON 只包含对象 ID、图库、文件名、拍摄时间、图片/视频类型、原始资源大小、Live Photo 视频大小和 RAW 标记。它不会下载文件，也不会调用删除接口。Provider 只解析带此前缀的行，逐项清单按 FrameBase 用户持久化在本机，用于安全释放时的精确匹配；浏览器普通日志不会输出清单。
 
 重建时还必须运行：
 
@@ -116,6 +116,24 @@ JSON 只包含对象 ID、文件名、拍摄时间、图片/视频类型、原�
 ```
 
 该测试确认清单模式能输出元数据且不会创建媒体文件。不要把 Apple 密码或会话令牌放入环境变量；环境变量仅用于启用清单输出协议。
+
+## FrameBase 精确删除扩展
+
+官方 CLI 的 `--delete-after-download` 和 `--keep-icloud-recent-days` 只能按一次运行的处理范围删除，不能表达“只删除图片库中用户点选且已完成 SHA-256 备份的这一项”。FrameBase 兼容版因此增加内部协议：
+
+```text
+FRAMEBASE_DELETE_REQUEST=<受限权限的临时 JSON 文件>
+FRAMEBASE_DELETE_COMMIT=1
+```
+
+- 请求文件最多包含 100 个目标，且包含云端资产 ID、图库、文件名、拍摄时间、媒体类型和原始资源大小。
+- 兼容版遍历所选图库时只接受精确资产 ID，并再次逐项核对上述元数据；任何字段不一致都输出 `mismatch`，不调用 Apple 删除接口。
+- 未设置 `FRAMEBASE_DELETE_COMMIT=1` 时只能 dry-run，输出 `matched`。FrameBase 每次正式删除前都会先完成一轮 dry-run。
+- 提交模式复用 icloudpd 已有的 `delete_photo()`，按 `recordName` 与 `recordChangeTag` 更新单一 `CPLAsset` 的 `isDeleted=1`，结果是移入 iCloud“最近删除”，不是直接永久清除。
+- 临时请求文件不包含密码或 cookie，由 Provider 创建在当前 FrameBase 用户自己的 session 目录下，进程结束后立即删除。目标 ID 不放入命令行。
+- Live Photo 作为一个云端资产处理；本地 HEIC/JPEG 与配对 MOV 都必须验证成功后，才可匹配该资产。
+
+FrameBase 业务层仍禁止向普通备份命令传入三个批量删除参数。兼容版源码与可执行文件位于被 Git 忽略的 `tools/`，所以每次从零构建时都必须手动恢复这一扩展，并运行 `tests/test_framebase_inventory.py` 以及 FrameBase 的 `tests/icloud-provider.test.mjs`。真实 Apple 账户删除不能作为自动化测试；测试必须 mock Apple `/records/modify` 或模拟兼容版机器输出。
 
 ## 只读验证顺序
 

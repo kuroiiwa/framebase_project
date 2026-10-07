@@ -40,6 +40,8 @@ type Tab = "all" | "live" | "liked" | "cleanup";
 type Sort = "newest" | "oldest" | "largest" | "smallest" | "name";
 type PreviewRatio = "standard" | "phone";
 type PhotoPreferences = { compact: boolean; previewRatio: PreviewRatio; sort: Sort };
+type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number; livePhotoBytes: number; livePhoto: boolean };
+type ReleaseCatalog = { releasePlan: { id: string | null; status: string; assets: IcloudAsset[] } | null; releaseHistory: { movedCount: number; movedBytes: number; lastReleasedAt: string | null }; timeline: { staleAt: string | null; staleReason: string | null } };
 
 const PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "heic", "heif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
 const BROWSER_PREVIEW_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]);
@@ -396,6 +398,8 @@ function PhotoLibrary({ username }: { username: string }) {
   const [page, setPage] = useState(1);
   const [viewerId, setViewerId] = useState<string | null>(null);
   const [icloudBackupDirectory, setIcloudBackupDirectory] = useState<string | null>(null);
+  const [releaseCatalog, setReleaseCatalog] = useState<ReleaseCatalog | null>(null);
+  const [releasingAsset, setReleasingAsset] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
@@ -440,11 +444,38 @@ function PhotoLibrary({ username }: { username: string }) {
   }, []);
 
   useEffect(() => {
-    void fetch("/api/icloud/config", { cache: "no-store" }).then(async response => {
-      if (!response.ok) return null;
-      return response.json() as Promise<{ backupDirectory?: string | null }>;
-    }).then(config => setIcloudBackupDirectory(config?.backupDirectory || null)).catch(() => undefined);
+    void Promise.all([
+      fetch("/api/icloud/config", { cache: "no-store" }).then(response => response.ok ? response.json() as Promise<{ backupDirectory?: string | null }> : null),
+      fetch("/api/icloud/release/catalog", { cache: "no-store" }).then(response => response.ok ? response.json() as Promise<ReleaseCatalog> : null),
+    ]).then(([config, catalog]) => { setIcloudBackupDirectory(config?.backupDirectory || null); setReleaseCatalog(catalog); }).catch(() => undefined);
   }, []);
+
+  const cloudAssetFor = useCallback((item: PhotoItem) => {
+    const candidates = releaseCatalog?.releasePlan?.status === "confirmed" ? releaseCatalog.releasePlan.assets.filter(asset => asset.mediaType === "photo" && asset.name.toLocaleLowerCase() === item.name.toLocaleLowerCase() && asset.mainBytes === item.size) : [];
+    if (!candidates || candidates.length !== 1) return null;
+    const created = new Date(candidates[0].created);
+    const modified = new Date(item.modified);
+    return created.getFullYear() === modified.getFullYear() && created.getMonth() === modified.getMonth() ? candidates[0] : null;
+  }, [releaseCatalog]);
+
+  async function releaseFromIcloud(item: PhotoItem, asset: IcloudAsset) {
+    const key = `${asset.library}:${asset.id}`;
+    setReleasingAsset(key); setError(""); setNotice("");
+    try {
+      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key] }) });
+      const preview = await previewResponse.json() as { releaseResult?: { status: string; bytes: number }; error?: string };
+      if (!previewResponse.ok || preview.releaseResult?.status !== "matched") throw new Error(preview.error || "云端项目复核失败，没有执行删除。");
+      const confirmation = window.prompt(`已精确匹配“${item.name}”。本地备份会保留，云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。\n\n请输入“移入最近删除”继续：`, "");
+      if (confirmation === null) return;
+      if (confirmation !== "移入最近删除") throw new Error("确认文字不正确，没有执行删除。");
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation }) });
+      const data = await response.json() as { releaseResult?: { status: string; message: string; bytes: number }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
+      if (!response.ok || data.releaseResult?.status !== "deleted") throw new Error(data.error || data.releaseResult?.message || "iCloud 删除失败。");
+      setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
+      setNotice(`“${item.name}”已移入 iCloud“最近删除”，本地文件未删除。预计可释放 ${formatBytes(asset.originalBytes)}；彻底释放需清空“最近删除”。`);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "iCloud 删除失败。"); }
+    finally { setReleasingAsset(null); }
+  }
 
   const persistMarks = useCallback((items: PhotoItem[], sourceId: string) => {
     const marks = Object.fromEntries(items.filter(item => item.sourceId === sourceId).map(item => [item.path, { liked: item.liked, cleanup: item.cleanup }]));
@@ -541,7 +572,8 @@ function PhotoLibrary({ username }: { username: string }) {
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {notice && <div className={styles.notice} role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
     <section className={styles.hero}><div><p>独立图片库</p><h1>图片浏览与整理</h1><span>图片来源、索引和标记与原视频库彻底隔离；移除来源不会删除文件。</span></div><button onClick={() => void chooseFolder()} disabled={loading}>{loading ? `正在扫描 ${progress} 张…` : "添加图片文件夹"}</button></section>
-    {icloudBackupDirectory && <aside className={styles.icloudHint}><div><strong>iCloud 照片与视频备份目录</strong><span>{icloudBackupDirectory}</span></div><p>可将这个目录同时添加到图片库和视频库：本页只索引图片与 RAW，视频库只索引视频，两套标记和索引互不影响。</p></aside>}
+    {icloudBackupDirectory && <aside className={styles.icloudHint}><div><strong>iCloud 照片与视频备份目录</strong><span>{icloudBackupDirectory}</span></div><p>{releaseCatalog?.releaseHistory.movedCount ? `已移入“最近删除” ${releaseCatalog.releaseHistory.movedCount} 个项目，预计 ${formatBytes(releaseCatalog.releaseHistory.movedBytes)}。彻底释放需清空“最近删除”。` : "可将这个目录同时添加到图片库和视频库；两套标记和索引互不影响。"}</p></aside>}
+    {releaseCatalog?.timeline.staleAt && <aside className={styles.timelineStale}><strong>iCloud 统计需要确认</strong><span>{releaseCatalog.timeline.staleReason || "云端内容已变化，请到 iCloud 备份中心重新统计。"}</span><a href="/icloud">立即重新统计</a></aside>}
     <section className={styles.stats}><div><span>图片</span><strong>{photos.length}</strong></div><div><span>来源</span><strong>{sources.length}</strong></div><div><span>收藏</span><strong>{photos.filter(item => item.liked).length}</strong></div><div><span>占用</span><strong>{formatBytes(totalSize)}</strong></div></section>
     <section className={styles.sources} aria-label="图片来源">
       {sources.length === 0 && ready ? <p>尚未添加图片文件夹。这里不会读取视频库已经选择的目录。</p> : sources.map(source => <article key={source.id}><button onClick={() => { setSourceFilter(source.id); setPage(1); }} className={sourceFilter === source.id ? styles.activeSource : ""}><strong>{source.name}</strong><span>{source.photoCount} 张 · {formatBytes(source.totalSize)}</span></button><button onClick={() => void loadSource(source)} disabled={loading}>重扫</button><button onClick={() => void removeSource(source)} disabled={loading}>移除</button></article>)}
@@ -551,7 +583,7 @@ function PhotoLibrary({ username }: { username: string }) {
       <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
-    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<nav className={styles.cardActions}><button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>)}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { const cloudAsset = cloudAssetFor(item); const cloudKey = cloudAsset ? `${cloudAsset.library}:${cloudAsset.id}` : null; return <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<nav className={styles.cardActions}>{cloudAsset && <button title="从 iCloud 移入最近删除（保留本地文件）" aria-label="从 iCloud 移入最近删除" className={styles.cloudRelease} disabled={releasingAsset !== null} onClick={() => void releaseFromIcloud(item, cloudAsset)}>{releasingAsset === cloudKey ? "…" : "☁"}</button>}<button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
     <footer><span>图片库只读取用户明确授权的本地文件夹</span><a href="/?library=video">返回视频库 →</a></footer>
     {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} />}
   </main>;

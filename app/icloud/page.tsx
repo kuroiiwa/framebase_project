@@ -28,9 +28,10 @@ type IcloudConfig = {
   fullBackup?: FullBackupState;
   fullManifest?: { updatedAt: string | null; fileCount: number; coverage: { years: CoverageBucket[]; quarters: CoverageBucket[]; months: CoverageBucket[] } };
   releasePlan?: ReleasePlan | null;
+  releaseHistory?: { movedCount: number; movedBytes: number; lastReleasedAt: string | null };
 };
 
-type ReleasePlan = { id: string | null; status: "ready" | "blocked" | "confirmed"; message: string; createdAt: string | null; confirmedAt: string | null; eligibleCount: number; eligibleBytes: number; failedCount: number; files: Array<{ name: string; relativePath: string; mediaType: "photo" | "video"; size: number }> };
+type ReleasePlan = { id: string | null; status: "ready" | "blocked" | "confirmed"; message: string; createdAt: string | null; confirmedAt: string | null; eligibleCount: number; eligibleBytes: number; failedCount: number; files: Array<{ name: string; relativePath: string; mediaType: "photo" | "video"; size: number }>; assets: Array<{ id: string; library: string; name: string; originalBytes: number }> };
 
 type FullBackupState = {
   status: "idle" | "planning" | "downloading" | "verifying" | "paused" | "cancelled" | "completed" | "failed";
@@ -42,7 +43,7 @@ type FullBackupState = {
 };
 type TimelineBucket = { key: string; itemCount: number; photoCount: number; videoCount: number; livePhotoCount: number; rawCount: number; originalBytes: number };
 type CoverageBucket = { key: string; verifiedCount: number; verifiedBytes: number; photoCount: number; videoCount: number };
-type TimelineState = { scannedAt: string | null; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
+type TimelineState = { scannedAt: string | null; staleAt: string | null; staleReason: string | null; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
 type BackupRange = { key: string; label: string; start: string; end: string };
 type TimelineGranularity = "years" | "quarters" | "months";
 
@@ -402,6 +403,7 @@ function IcloudCenter({ username }: { username: string }) {
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>4</span><div><h2>按时间统计与选择</h2><p>只读获取拍摄时间、类型和原始资源大小，可按年、季度或月份选择增量备份范围。</p></div></div>
         <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button></div>
+        {config?.timeline?.staleAt && <div className={styles.timelineWarning}><strong>云端内容已发生变化</strong><span>{config.timeline.staleReason || "当前数字已按本地删除结果更新，请重新统计以确认 iCloud 云端状态。"}</span></div>}
         {config?.timeline?.scannedAt && <>
           <div className={styles.timelineTabs}><button className={timelineGranularity === "years" ? styles.active : ""} onClick={() => { setTimelineGranularity("years"); setSelectedPeriods([]); }}>按年份</button><button className={timelineGranularity === "quarters" ? styles.active : ""} onClick={() => { setTimelineGranularity("quarters"); setSelectedPeriods([]); }}>每 3 个月</button><button className={timelineGranularity === "months" ? styles.active : ""} onClick={() => { setTimelineGranularity("months"); setSelectedPeriods([]); }}>按月份</button></div>
           <div className={styles.timelineTable}><div className={styles.timelineRow}><span>选择</span><strong>时间</strong><span>备份状态</span><span>图片</span><span>视频</span><span>Live Photo</span><span>RAW</span><span>原始大小</span></div>{timelineBuckets.map(bucket => { const backupState = backupStateForBucket(bucket); return <label className={styles.timelineRow} key={bucket.key}><input type="checkbox" checked={selectedPeriods.includes(bucket.key)} onChange={() => setSelectedPeriods(current => current.includes(bucket.key) ? current.filter(key => key !== bucket.key) : [...current, bucket.key])} /><strong>{periodRange(bucket.key).label}</strong><span className={`${styles.backupBadge} ${styles[backupState.key]}`} title={backupState.detail}>{backupState.label}</span><span>{bucket.photoCount}</span><span>{bucket.videoCount}</span><span>{bucket.livePhotoCount}</span><span>{bucket.rawCount}</span><span>{formatBytes(bucket.originalBytes)}</span></label>; })}</div>
@@ -432,15 +434,16 @@ function IcloudCenter({ username }: { username: string }) {
 
       <article className={`${styles.card} ${config?.fullBackup?.status !== "completed" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>6</span><div><h2>iCloud 容量释放</h2><p>先重新复核本地清单，再进入独立确认；任何云端删除都不与备份按钮绑定。</p></div></div>
-        <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>icloudpd 不能按 SHA-256 清单精确指定云端对象，因此自动删除保持锁定，避免误删刚上传但尚未备份的新项目。</span></div>
+        <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>仅允许删除已通过本地 SHA-256、云端资产 ID、文件名、拍摄时间、原始大小和图库六重核对的项目；删除入口位于图片库，每次都先 dry-run 并要求手动确认。</span></div>
+        {config?.releaseHistory?.movedCount ? <div className={styles.releaseSummary}><div><span>已移入“最近删除”</span><strong>{config.releaseHistory.movedCount} 个项目</strong></div><div><span>预计可释放空间</span><strong>{formatBytes(config.releaseHistory.movedBytes)}</strong></div><p>这不是 Apple 已确认的最终释放量；清空 iCloud“最近删除”后空间才会彻底释放。</p></div> : null}
         {config?.releasePlan ? <div className={styles.fullStatus}>
           <div><strong>{config.releasePlan.status === "confirmed" ? "本地副本已确认" : config.releasePlan.status === "ready" ? "释放计划待确认" : "释放计划被阻止"}</strong><span>{config.releasePlan.message}</span></div>
-          <dl><div><dt>可释放项目</dt><dd>{config.releasePlan.eligibleCount}</dd></div><div><dt>本地已验证</dt><dd>{formatBytes(config.releasePlan.eligibleBytes)}</dd></div><div><dt>校验失败</dt><dd>{config.releasePlan.failedCount}</dd></div></dl>
+          <dl><div><dt>本地文件</dt><dd>{config.releasePlan.eligibleCount}</dd></div><div><dt>本地已验证</dt><dd>{formatBytes(config.releasePlan.eligibleBytes)}</dd></div><div><dt>精确云端匹配</dt><dd>{config.releasePlan.assets?.length || 0}</dd></div><div><dt>校验失败</dt><dd>{config.releasePlan.failedCount}</dd></div></dl>
           {config.releasePlan.files.length > 0 && <ul className={styles.releaseFiles}>{config.releasePlan.files.slice(0, 5).map(item => <li key={item.relativePath}><span>{item.mediaType === "video" ? "视频" : "图片"}</span><strong>{item.name}</strong><small>{formatBytes(item.size)}</small></li>)}</ul>}
         </div> : <p className={styles.releaseIntro}>完整备份完成后，可生成只读释放计划。生成计划会再次校验全部文件，不会访问删除接口。</p>}
         <div className={styles.actions}><button onClick={() => void createReleasePlan()} disabled={busy !== null || config?.fullBackup?.status !== "completed"}>{busy === "release" ? "正在复核本地文件…" : config?.releasePlan ? "重新生成释放计划" : "生成只读释放计划"}</button></div>
         {config?.releasePlan?.status === "ready" && <form className={styles.confirmRelease} onSubmit={confirmReleasePlan}><label>输入“确认本地备份完整”以完成本地确认<input value={releaseConfirmation} onChange={event => setReleaseConfirmation(event.target.value)} /></label><button className={styles.primary} disabled={busy !== null || releaseConfirmation !== "确认本地备份完整"}>确认本地副本</button></form>}
-        {config?.releasePlan?.status === "confirmed" && <div className={styles.manualRelease}><strong>下一步仍需人工操作</strong><span>请在 iCloud 照片中核对并删除对应项目，再到“最近删除”中决定是否彻底清空。自动删除将在支持精确对象匹配后再开放。</span><a href={config.icloudDomain === "cn" ? "https://www.icloud.com.cn/photos/" : "https://www.icloud.com/photos/"} target="_blank" rel="noreferrer">打开 iCloud 照片</a></div>}
+        {config?.releasePlan?.status === "confirmed" && <div className={styles.manualRelease}><strong>已开放逐项安全释放</strong><span>在图片库中，只有通过精确云端匹配的卡片才会显示云朵按钮。点击后先复核，再将该项目移入 iCloud“最近删除”；本地备份不会删除。</span><Link href="/photos">打开图片库</Link></div>}
       </article>
     </section>
 

@@ -443,7 +443,7 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, backup, fullBackupStored, backupCoverage, timeline, backupHistoryStored, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readBackupHistory(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
+    const [config, scan, backup, fullBackupStored, backupCoverage, timeline, backupHistoryStored, releasePlan, releaseHistory, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readBackupHistory(current.username), icloud.readReleasePlan(current.username), icloud.readReleaseHistory(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
     const legacyCompletedRanges = fullBackupStored.ranges.filter(range => fullBackupStored.completedRanges.includes(range.key));
     const backupHistory = legacyCompletedRanges.length ? await icloud.recordCompletedRanges(current.username, legacyCompletedRanges) : backupHistoryStored;
@@ -454,11 +454,12 @@ async function handleIcloud(request, response, url) {
       ...config,
       scan,
       backup,
-      timeline,
+      timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months },
       backupHistory,
       fullBackup,
       fullManifest: { updatedAt: backupCoverage.updatedAt, fileCount: backupCoverage.fileCount, coverage: { years: backupCoverage.years, quarters: backupCoverage.quarters, months: backupCoverage.months } },
       releasePlan,
+      releaseHistory,
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });
   }
@@ -631,6 +632,26 @@ async function handleIcloud(request, response, url) {
   if (request.method === "POST" && url.pathname === "/api/icloud/release/confirm") {
     const body = await readJsonBody(request);
     return json(response, 200, { releasePlan: await icloud.confirmReleasePlan(current.username, body.planId, body.confirmation) });
+  }
+  if (request.method === "GET" && url.pathname === "/api/icloud/release/catalog") {
+    const [releasePlan, releaseHistory, timeline] = await Promise.all([icloud.readReleasePlan(current.username), icloud.readReleaseHistory(current.username), icloud.readTimeline(current.username)]);
+    return json(response, 200, { releasePlan, releaseHistory, timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason } });
+  }
+  if (request.method === "POST" && (url.pathname === "/api/icloud/release/delete/preview" || url.pathname === "/api/icloud/release/delete")) {
+    if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "备份任务运行时不能释放云端项目。" });
+    const body = await readJsonBody(request);
+    const plan = await icloud.readReleasePlan(current.username);
+    if (!plan || plan.status !== "confirmed" || body.planId !== plan.id) return json(response, 409, { error: "释放计划尚未确认或已经失效。" });
+    const requestedKeys = new Set(Array.isArray(body.assetKeys) ? body.assetKeys.filter(key => typeof key === "string").slice(0, 100) : []);
+    const assets = plan.assets.filter(asset => requestedKeys.has(`${asset.library}:${asset.id}`));
+    if (!assets.length || assets.length !== requestedKeys.size) return json(response, 400, { error: "选择的项目不在已确认释放计划中。" });
+    const context = await icloud.connectionContext(current.username);
+    const preview = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: false });
+    if (url.pathname.endsWith("/preview") || preview.status !== "matched") return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview });
+    if (body.confirmation !== "移入最近删除") return json(response, 400, { error: "请输入“移入最近删除”确认。" });
+    const released = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: true });
+    const releaseHistory = await icloud.recordReleasedAssets(current.username, assets, released);
+    return json(response, released.status === "deleted" ? 200 : 409, { releaseResult: released, releaseHistory, timeline: await icloud.readTimeline(current.username) });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/auth/start") {
     const context = await icloud.connectionContext(current.username);

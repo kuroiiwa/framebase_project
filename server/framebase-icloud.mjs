@@ -68,6 +68,10 @@ export function createIcloudManager({ projectRoot }) {
     return join(userDirectory(username), "backup-history.json");
   }
 
+  function releaseHistoryPath(username) {
+    return join(userDirectory(username), "release-history.json");
+  }
+
   function sha256File(path) {
     return new Promise((resolvePromise, reject) => {
       const hash = createHash("sha256");
@@ -203,7 +207,17 @@ export function createIcloudManager({ projectRoot }) {
       photoCount: Math.max(0, Number(item?.photoCount) || 0), videoCount: Math.max(0, Number(item?.videoCount) || 0),
       livePhotoCount: Math.max(0, Number(item?.livePhotoCount) || 0), rawCount: Math.max(0, Number(item?.rawCount) || 0),
       originalBytes: Math.max(0, Number(item?.originalBytes) || 0),
-    })).filter(item => item.key && item.itemCount > 0).slice(0, 500) : [];
+    })).filter(item => item.key).slice(0, 500) : [];
+  }
+
+  function cleanTimelineAssets(value) {
+    return Array.isArray(value) ? value.map(item => ({
+      id: String(item?.id || ""), library: String(item?.library || "default"), name: String(item?.name || ""),
+      created: String(item?.created || ""), mediaType: item?.mediaType === "video" ? "video" : "photo",
+      extension: String(item?.extension || "").toLowerCase(), originalBytes: Math.max(0, Number(item?.originalBytes) || 0),
+      mainBytes: Math.max(0, Number(item?.mainBytes) || 0), livePhotoBytes: Math.max(0, Number(item?.livePhotoBytes) || 0),
+      livePhoto: Boolean(item?.livePhoto), raw: Boolean(item?.raw),
+    })).filter(item => item.id && item.name && !Number.isNaN(new Date(item.created).getTime()) && item.originalBytes > 0).slice(0, 50_000) : [];
   }
 
   async function readTimeline(username) {
@@ -212,20 +226,24 @@ export function createIcloudManager({ projectRoot }) {
       const parsed = JSON.parse(await readFile(timelinePath(username), "utf8"));
       return {
         scannedAt: typeof parsed.scannedAt === "string" ? parsed.scannedAt : null,
+        staleAt: typeof parsed.staleAt === "string" ? parsed.staleAt : null,
+        staleReason: typeof parsed.staleReason === "string" ? parsed.staleReason : null,
         total: cleanTimelineBuckets([parsed.total])[0] || null,
         years: cleanTimelineBuckets(parsed.years), quarters: cleanTimelineBuckets(parsed.quarters), months: cleanTimelineBuckets(parsed.months),
+        assets: cleanTimelineAssets(parsed.assets),
       };
     } catch (error) {
-      if (error.code === "ENOENT") return { scannedAt: null, total: null, years: [], quarters: [], months: [] };
+      if (error.code === "ENOENT") return { scannedAt: null, staleAt: null, staleReason: null, total: null, years: [], quarters: [], months: [], assets: [] };
       throw error;
     }
   }
 
   async function recordTimeline(username, result) {
     const timeline = {
-      version: 1, scannedAt: typeof result.scannedAt === "string" ? result.scannedAt : new Date().toISOString(),
+      version: 2, scannedAt: typeof result.scannedAt === "string" ? result.scannedAt : new Date().toISOString(), staleAt: null, staleReason: null,
       total: cleanTimelineBuckets([result.total])[0] || null,
       years: cleanTimelineBuckets(result.years), quarters: cleanTimelineBuckets(result.quarters), months: cleanTimelineBuckets(result.months),
+      assets: cleanTimelineAssets(result.assets),
     };
     await atomicJson(username, timelinePath(username), timeline);
     return timeline;
@@ -280,6 +298,7 @@ export function createIcloudManager({ projectRoot }) {
         eligibleBytes: Math.max(0, Number(parsed.eligibleBytes) || 0),
         failedCount: Math.max(0, Number(parsed.failedCount) || 0),
         files: cleanFullFiles(parsed.files).slice(0, 100),
+        assets: cleanTimelineAssets(parsed.assets).slice(0, 500),
         failures: Array.isArray(parsed.failures) ? parsed.failures.filter(item => item && typeof item.relativePath === "string").slice(0, 100) : [],
       };
     } catch (error) {
@@ -289,7 +308,7 @@ export function createIcloudManager({ projectRoot }) {
   }
 
   async function createReleasePlan(username) {
-    const [config, fullBackup, manifest] = await Promise.all([read(username), readFullBackup(username), readFullManifest(username)]);
+    const [config, fullBackup, manifest, timeline] = await Promise.all([read(username), readFullBackup(username), readFullManifest(username), readTimeline(username)]);
     if (!config.backupDirectory || fullBackup.status !== "completed" || !manifest.updatedAt || manifest.files.length === 0) {
       throw Object.assign(new Error("请先完成一次完整增量备份和 SHA-256 校验。"), { status: 409 });
     }
@@ -314,13 +333,30 @@ export function createIcloudManager({ projectRoot }) {
       }
     }
     const createdAt = new Date().toISOString();
+    const eligibleByName = new Map();
+    for (const file of eligible) {
+      const key = file.name.toLocaleLowerCase();
+      const candidates = eligibleByName.get(key) || [];
+      candidates.push(file);
+      eligibleByName.set(key, candidates);
+    }
+    const matchedAssets = timeline.assets.filter(asset => {
+      const created = new Date(asset.created);
+      const yearMonth = `${created.getFullYear()}/${String(created.getMonth() + 1).padStart(2, "0")}`;
+      const mainMatches = (eligibleByName.get(asset.name.toLocaleLowerCase()) || []).filter(file => file.size === asset.mainBytes && file.relativePath.replaceAll("\\", "/").includes(yearMonth));
+      if (mainMatches.length !== 1) return false;
+      if (!asset.livePhoto || asset.livePhotoBytes === 0) return true;
+      const stem = asset.name.replace(/\.[^.]+$/, "").toLocaleLowerCase();
+      const liveMatches = eligible.filter(file => file.extension === "mov" && file.size === asset.livePhotoBytes && file.name.replace(/\.[^.]+$/, "").toLocaleLowerCase() === stem && file.relativePath.replaceAll("\\", "/").includes(yearMonth));
+      return liveMatches.length === 1;
+    });
     const ready = failures.length === 0 && eligible.length === manifest.files.length;
     const plan = {
       version: 1, id: randomUUID(), status: ready ? "ready" : "blocked",
       message: ready ? `已重新校验 ${eligible.length} 个本地文件；可以进入人工释放确认。` : `${failures.length} 个本地文件未通过复核，禁止释放 iCloud 内容。`,
       createdAt, confirmedAt: null, manifestUpdatedAt: manifest.updatedAt,
       eligibleCount: eligible.length, eligibleBytes: eligible.reduce((sum, item) => sum + item.size, 0),
-      failedCount: failures.length, files: eligible, failures,
+      failedCount: failures.length, files: eligible, assets: matchedAssets, failures,
     };
     await atomicJson(username, releasePlanPath(username), plan);
     return readReleasePlan(username);
@@ -333,9 +369,60 @@ export function createIcloudManager({ projectRoot }) {
       throw Object.assign(new Error("释放计划已失效，请重新生成并校验。"), { status: 409 });
     }
     if (confirmation !== "确认本地备份完整") throw Object.assign(new Error("确认文字不正确。"), { status: 400 });
-    const confirmed = { ...JSON.parse(await readFile(releasePlanPath(username), "utf8")), status: "confirmed", confirmedAt: new Date().toISOString(), message: "本地副本已确认完整；自动云端删除仍保持锁定。" };
+    const raw = JSON.parse(await readFile(releasePlanPath(username), "utf8"));
+    const confirmed = { ...raw, status: "confirmed", confirmedAt: new Date().toISOString(), message: raw.assets?.length ? `本地副本已确认完整；${raw.assets.length} 个云端项目已通过精确匹配，可在图片库手动移入“最近删除”。` : "本地副本已确认完整；当前清单尚未精确关联云端项目，请先刷新时间统计后重新生成计划。" };
     await atomicJson(username, releasePlanPath(username), confirmed);
     return readReleasePlan(username);
+  }
+
+  async function readReleaseHistory(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(releaseHistoryPath(username), "utf8"));
+      const events = Array.isArray(parsed.events) ? parsed.events.filter(item => item && typeof item.completedAt === "string").slice(-500) : [];
+      return { movedCount: Math.max(0, Number(parsed.movedCount) || 0), movedBytes: Math.max(0, Number(parsed.movedBytes) || 0), lastReleasedAt: typeof parsed.lastReleasedAt === "string" ? parsed.lastReleasedAt : null, events };
+    } catch (error) {
+      if (error.code === "ENOENT") return { movedCount: 0, movedBytes: 0, lastReleasedAt: null, events: [] };
+      throw error;
+    }
+  }
+
+  async function recordReleasedAssets(username, requestedAssets, result) {
+    const deletedKeys = new Set((result.results || []).filter(item => item.status === "deleted").map(item => `${item.library}:${item.id}`));
+    const current = await readReleaseHistory(username);
+    const previouslyDeleted = new Set(current.events.flatMap(event => Array.isArray(event.assets) ? event.assets.map(asset => `${asset.library}:${asset.id}`) : []));
+    const deletedAssets = cleanTimelineAssets(requestedAssets).filter(asset => deletedKeys.has(`${asset.library}:${asset.id}`) && !previouslyDeleted.has(`${asset.library}:${asset.id}`));
+    if (!deletedAssets.length) return current;
+    const completedAt = new Date().toISOString();
+    const movedBytes = deletedAssets.reduce((sum, asset) => sum + asset.originalBytes, 0);
+    const history = { version: 1, movedCount: current.movedCount + deletedAssets.length, movedBytes: current.movedBytes + movedBytes, lastReleasedAt: completedAt, events: [...current.events, { completedAt, count: deletedAssets.length, bytes: movedBytes, assets: deletedAssets.map(asset => ({ id: asset.id, library: asset.library, name: asset.name })) }].slice(-500) };
+    await atomicJson(username, releaseHistoryPath(username), history);
+    try {
+      const plan = JSON.parse(await readFile(releasePlanPath(username), "utf8"));
+      plan.assets = cleanTimelineAssets(plan.assets).filter(asset => !deletedKeys.has(`${asset.library}:${asset.id}`));
+      plan.message = plan.assets.length ? `${plan.assets.length} 个精确匹配项目仍可在图片库手动释放。` : "本次释放计划中的精确匹配项目已全部处理；请重新统计后生成下一份计划。";
+      await atomicJson(username, releasePlanPath(username), plan);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const timeline = await readTimeline(username);
+    const remaining = timeline.assets.filter(asset => !deletedKeys.has(`${asset.library}:${asset.id}`));
+    const buckets = { years: new Map(), quarters: new Map(), months: new Map() };
+    const add = (map, key, asset) => {
+      const bucket = map.get(key) || { key, itemCount: 0, photoCount: 0, videoCount: 0, livePhotoCount: 0, rawCount: 0, originalBytes: 0 };
+      bucket.itemCount += 1; bucket.originalBytes += asset.originalBytes;
+      if (asset.mediaType === "video") bucket.videoCount += 1; else bucket.photoCount += 1;
+      if (asset.livePhoto) bucket.livePhotoCount += 1; if (asset.raw) bucket.rawCount += 1;
+      map.set(key, bucket);
+    };
+    for (const asset of remaining) {
+      const date = new Date(asset.created); const year = date.getFullYear(); const month = date.getMonth() + 1;
+      add(buckets.years, String(year), asset); add(buckets.quarters, `${year}-Q${Math.floor((month - 1) / 3) + 1}`, asset); add(buckets.months, `${year}-${String(month).padStart(2, "0")}`, asset);
+    }
+    const total = remaining.reduce((bucket, asset) => { add(new Map([["total", bucket]]), "total", asset); return bucket; }, { key: "total", itemCount: 0, photoCount: 0, videoCount: 0, livePhotoCount: 0, rawCount: 0, originalBytes: 0 });
+    const newest = map => [...map.values()].sort((a, b) => b.key.localeCompare(a.key));
+    await atomicJson(username, timelinePath(username), { version: 2, scannedAt: timeline.scannedAt, staleAt: completedAt, staleReason: "已从 iCloud 移入最近删除；当前数字已在本地扣除，请重新统计以确认云端状态。", total, years: newest(buckets.years), quarters: newest(buckets.quarters), months: newest(buckets.months), assets: remaining });
+    return readReleaseHistory(username);
   }
 
   async function readScan(username) {
@@ -537,5 +624,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readBackupHistory, recordCompletedRanges, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readBackupHistory, recordCompletedRanges, readReleasePlan, createReleasePlan, confirmReleasePlan, readReleaseHistory, recordReleasedAssets, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

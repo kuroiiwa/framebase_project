@@ -122,6 +122,8 @@ h1 { margin:0; font-size:28px; letter-spacing:-1.2px; }
 .mark-button.liked-mark.active { border-color:#f1c5c5; background:#fff0ef; color:#e55759; }
 .mark-button.cleanup-mark.active { border-color:#c8dc82; background:#edf5cf; color:#71872d; }
 .mark-button.tag-mark.active { border-color:#b8cc84; background:#f0f5df; color:#708337; }
+.mark-button.cloud-release { border-color:#bcd8e8; background:#eef8fd; color:#397899; font-size:14px; }
+.mark-button:disabled { cursor:wait; opacity:.5; transform:none; }
 .card-body p { margin:0; color:var(--muted); font-size:calc(9px + var(--font-bump)); }.card-body p span { margin:0 5px; }
 .source-label { max-width:110px; display:inline-block; overflow:hidden; color:#7f914f; text-overflow:ellipsis; vertical-align:bottom; white-space:nowrap; font-weight:700; }
 .tags { display:flex; gap:5px; }.tags span { padding:3px 6px; border-radius:4px; background:#eff0ea; color:#7f837b; font:8px Consolas,monospace; }
@@ -212,6 +214,7 @@ html[data-theme="dark"] .mark-button:hover { border-color:#464c40; background:#2
 html[data-theme="dark"] .mark-button.liked-mark.active { border-color:#714443; background:#392321; color:#ff8582; }
 html[data-theme="dark"] .mark-button.cleanup-mark.active { border-color:#657938; background:#2d391f; color:#d5ee7b; }
 html[data-theme="dark"] .mark-button.tag-mark.active { border-color:#657938; background:#2d391f; color:#d5ee7b; }
+html[data-theme="dark"] .mark-button.cloud-release { border-color:#3e6375; background:#20343e; color:#8dd4f7; }
 html[data-theme="dark"] .tag-manager,html[data-theme="dark"] .tag-filter-panel { background:#1c1f1a; }
 html[data-theme="dark"] .tag-create-row input:not([type="color"]),html[data-theme="dark"] .tag-name-edit { background:#20231e; }
 html[data-theme="dark"] .video-tag-picker { border-color:#343a2e; background:#22271d; }
