@@ -28,6 +28,8 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(icloud, /media-header-button.*href="\/\?library=video">← 返回视频库<\/a>/);
   assert.match(icloud, /media-header-button.*href="\/photos">返回图片库<\/a>/);
   assert.match(photos, /import\("heic2any"\)/);
+  assert.match(photos, /import\("libheif-js\/wasm-bundle\.js"\)/);
+  assert.match(photos, /decodeModernHeic/);
   assert.match(photos, /HEIC 预览生成失败/);
   assert.match(photos, /framebase-photo-view/);
   assert.match(photos, /preferencesReady/);

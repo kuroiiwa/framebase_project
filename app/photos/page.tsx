@@ -233,12 +233,46 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
 async function createPreviewBlob(item: PhotoItem) {
   const file = await item.handle.getFile();
   if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
-    const { default: heic2any } = await import("heic2any");
-    const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.86 });
-    return Array.isArray(converted) ? converted[0] : converted;
+    try {
+      const { default: heic2any } = await import("heic2any");
+      const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.86 });
+      return Array.isArray(converted) ? converted[0] : converted;
+    } catch {
+      return decodeModernHeic(file);
+    }
   }
   if (BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) return file;
   return null;
+}
+
+async function decodeModernHeic(file: Blob) {
+  const { default: libheif } = await import("libheif-js/wasm-bundle.js");
+  const images = new libheif.HeifDecoder().decode(await file.arrayBuffer());
+  const image = images.find(candidate => candidate.is_primary?.()) || images[0];
+  if (!image) throw new Error("heic_no_image");
+  const width = image.get_width();
+  const height = image.get_height();
+  if (!width || !height || width * height > 100_000_000) throw new Error("heic_invalid_dimensions");
+  const imageData = new ImageData(width, height);
+  try {
+    await new Promise<void>((resolve, reject) => image.display(imageData, result => result ? resolve() : reject(new Error("heic_decode_failed"))));
+    if (typeof OffscreenCanvas !== "undefined") {
+      const canvas = new OffscreenCanvas(width, height);
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("heic_canvas_unavailable");
+      context.putImageData(imageData, 0, 0);
+      return canvas.convertToBlob({ type: "image/jpeg", quality: 0.86 });
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("heic_canvas_unavailable");
+    context.putImageData(imageData, 0, 0);
+    return await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("heic_canvas_failed")), "image/jpeg", 0.86));
+  } finally {
+    image.free?.();
+  }
 }
 
 async function createPreviewObjectUrl(item: PhotoItem, cancelled: () => boolean) {
