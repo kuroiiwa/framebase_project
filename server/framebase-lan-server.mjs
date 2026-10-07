@@ -17,9 +17,41 @@ const runtimePackageVersion = (() => {
   try { return String(JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8")).version || "unknown"); }
   catch { return "unknown"; }
 })();
+function readGitCommit() {
+  let gitDirectory = join(projectRoot, ".git");
+  try {
+    const pointer = readFileSync(gitDirectory, "utf8").trim();
+    if (pointer.startsWith("gitdir:")) gitDirectory = resolve(projectRoot, pointer.slice("gitdir:".length).trim());
+  } catch { /* A normal checkout uses a .git directory rather than a pointer file. */ }
+  let commonDirectory = gitDirectory;
+  try { commonDirectory = resolve(gitDirectory, readFileSync(join(gitDirectory, "commondir"), "utf8").trim()); }
+  catch { /* Non-worktree repositories keep refs in the same Git directory. */ }
+  try {
+    const head = readFileSync(join(gitDirectory, "HEAD"), "utf8").trim();
+    if (/^[a-f0-9]{40,64}$/i.test(head)) return head.slice(0, 8);
+    if (!head.startsWith("ref:")) return null;
+    const reference = head.slice("ref:".length).trim();
+    for (const root of [gitDirectory, commonDirectory]) {
+      try {
+        const commit = readFileSync(join(root, reference), "utf8").trim();
+        if (/^[a-f0-9]{40,64}$/i.test(commit)) return commit.slice(0, 8);
+      } catch { /* The reference may be stored in packed-refs. */ }
+    }
+    for (const root of [gitDirectory, commonDirectory]) {
+      try {
+        const match = readFileSync(join(root, "packed-refs"), "utf8").split(/\r?\n/).find(line => line.endsWith(` ${reference}`));
+        const commit = match?.split(" ")[0] || "";
+        if (/^[a-f0-9]{40,64}$/i.test(commit)) return commit.slice(0, 8);
+      } catch { /* A repository with loose refs does not need packed-refs. */ }
+    }
+  } catch { /* Packaged deployments may not include Git metadata. */ }
+  return null;
+}
 const runtimeCommit = (() => {
   const supplied = String(process.env.FRAMEBASE_GIT_COMMIT || "").trim();
   if (supplied) return supplied.slice(0, 40);
+  const stored = readGitCommit();
+  if (stored) return stored;
   try { return execFileSync("git", ["rev-parse", "--short=8", "HEAD"], { cwd: projectRoot, encoding: "utf8", timeout: 2000, windowsHide: true }).trim() || "unknown"; }
   catch { return "unknown"; }
 })();

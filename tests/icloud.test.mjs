@@ -134,6 +134,9 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /transferRateBps/);
   assert.match(server, /readBackupCoverage/);
   assert.match(server, /runtimeStartedAt/);
+  assert.match(server, /function readGitCommit\(\)/);
+  assert.match(server, /readFileSync\(join\(gitDirectory, "HEAD"\)/);
+  assert.match(server, /readFileSync\(join\(root, "packed-refs"\)/);
   assert.match(server, /git", \["rev-parse", "--short=8", "HEAD"\]/);
   assert.match(server, /url\.pathname === "\/api\/runtime\/version"/);
   assert.match(server, /pid: process\.pid/);
