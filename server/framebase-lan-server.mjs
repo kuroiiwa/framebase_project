@@ -449,14 +449,17 @@ async function handleIcloud(request, response, url) {
     let fullBackup = fullBackupStored;
     const legacyCompletedRanges = fullBackupStored.ranges.filter(range => fullBackupStored.completedRanges.includes(range.key));
     const backupHistory = legacyCompletedRanges.length ? await icloud.recordCompletedRanges(current.username, legacyCompletedRanges) : backupHistoryStored;
-    if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
+    const allPersistedRangesComplete = fullBackupStored.ranges.length > 0 && fullBackupStored.failed === 0 && fullBackupStored.ranges.every(range => fullBackupStored.completedRanges.includes(range.key));
+    if (allPersistedRangesComplete && fullBackupStored.status !== "completed" && !icloudFullBackupJobs.has(current.username)) {
+      fullBackup = await icloud.writeFullBackup(current.username, { status: "completed", phase: "completed", completedAt: fullBackupStored.completedAt || new Date().toISOString(), transferRateBps: 0, message: `已根据本地持久化记录确认 ${fullBackupStored.ranges.length} 个时间范围全部完成，无需重新下载。` });
+    } else if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
       fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", transferRateBps: 0, message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
     }
     return json(response, 200, {
       ...config,
       scan,
       backup,
-      timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months },
+      timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, assetCount: timeline.assetCount, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months },
       backupHistory,
       fullBackup,
       fullManifest: { updatedAt: backupCoverage.updatedAt, fileCount: backupCoverage.fileCount, coverage: { years: backupCoverage.years, quarters: backupCoverage.quarters, months: backupCoverage.months } },
@@ -511,7 +514,8 @@ async function handleIcloud(request, response, url) {
       if (result.status === "needs_auth") await icloud.recordConnectionCheck(current.username, result);
       return json(response, 200, { timeline: await icloud.readTimeline(current.username), timelineResult: { status: result.status, message: result.message } });
     }
-    return json(response, 200, { timeline: await icloud.recordTimeline(current.username, result), timelineResult: { status: result.status, message: result.message } });
+    const timeline = await icloud.recordTimeline(current.username, result);
+    return json(response, 200, { timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, assetCount: timeline.assetCount, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months }, timelineResult: { status: result.status, message: result.message } });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/backup/test") {
     const previousBackup = await icloud.readBackup(current.username);

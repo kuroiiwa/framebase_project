@@ -244,16 +244,17 @@ export function createIcloudManager({ projectRoot }) {
     validateUsername(username);
     try {
       const parsed = JSON.parse(await readFile(timelinePath(username), "utf8"));
+      const assets = cleanTimelineAssets(parsed.assets);
       return {
         scannedAt: typeof parsed.scannedAt === "string" ? parsed.scannedAt : null,
         staleAt: typeof parsed.staleAt === "string" ? parsed.staleAt : null,
         staleReason: typeof parsed.staleReason === "string" ? parsed.staleReason : null,
         total: cleanTimelineBuckets([parsed.total])[0] || null,
         years: cleanTimelineBuckets(parsed.years), quarters: cleanTimelineBuckets(parsed.quarters), months: cleanTimelineBuckets(parsed.months),
-        assets: cleanTimelineAssets(parsed.assets),
+        assetCount: assets.length, assets,
       };
     } catch (error) {
-      if (error.code === "ENOENT") return { scannedAt: null, staleAt: null, staleReason: null, total: null, years: [], quarters: [], months: [], assets: [] };
+      if (error.code === "ENOENT") return { scannedAt: null, staleAt: null, staleReason: null, assetCount: 0, total: null, years: [], quarters: [], months: [], assets: [] };
       throw error;
     }
   }
@@ -265,6 +266,7 @@ export function createIcloudManager({ projectRoot }) {
       years: cleanTimelineBuckets(result.years), quarters: cleanTimelineBuckets(result.quarters), months: cleanTimelineBuckets(result.months),
       assets: cleanTimelineAssets(result.assets),
     };
+    timeline.assetCount = timeline.assets.length;
     await atomicJson(username, timelinePath(username), timeline);
     return timeline;
   }
@@ -328,9 +330,12 @@ export function createIcloudManager({ projectRoot }) {
   }
 
   async function createReleasePlan(username) {
-    const [config, fullBackup, manifest, timeline] = await Promise.all([read(username), readFullBackup(username), readFullManifest(username), readTimeline(username)]);
-    if (!config.backupDirectory || fullBackup.status !== "completed" || !manifest.updatedAt || manifest.files.length === 0) {
-      throw Object.assign(new Error("请先完成一次完整增量备份和 SHA-256 校验。"), { status: 409 });
+    const [config, manifest, timeline] = await Promise.all([read(username), readFullManifest(username), readTimeline(username)]);
+    if (!config.backupDirectory || !manifest.updatedAt || manifest.files.length === 0) {
+      throw Object.assign(new Error("当前还没有经过 SHA-256 验证的本地文件。请先在“完整增量备份”中选择一个时间范围并完成备份。"), { status: 409 });
+    }
+    if (timeline.assets.length === 0) {
+      throw Object.assign(new Error("现有时间统计是旧格式，缺少云端资产 ID。请先在“按时间统计与选择”中点击“刷新统计”，完成后再生成释放计划；不需要重新备份。"), { status: 409 });
     }
     const backupRoot = await realpath(config.backupDirectory);
     const eligible = [];
@@ -373,7 +378,7 @@ export function createIcloudManager({ projectRoot }) {
     const ready = failures.length === 0 && eligible.length === manifest.files.length;
     const plan = {
       version: 1, id: randomUUID(), status: ready ? "ready" : "blocked",
-      message: ready ? `已重新校验 ${eligible.length} 个本地文件；可以进入人工释放确认。` : `${failures.length} 个本地文件未通过复核，禁止释放 iCloud 内容。`,
+      message: ready ? `已重新校验本地清单中的 ${eligible.length} 个文件；${matchedAssets.length} 个云端项目完成精确匹配，可以进入人工释放确认。` : `${failures.length} 个本地文件未通过复核，禁止释放 iCloud 内容。`,
       createdAt, confirmedAt: null, manifestUpdatedAt: manifest.updatedAt,
       eligibleCount: eligible.length, eligibleBytes: eligible.reduce((sum, item) => sum + item.size, 0),
       failedCount: failures.length, files: eligible, assets: matchedAssets, failures,

@@ -43,7 +43,7 @@ type FullBackupState = {
 };
 type TimelineBucket = { key: string; itemCount: number; photoCount: number; videoCount: number; livePhotoCount: number; rawCount: number; originalBytes: number };
 type CoverageBucket = { key: string; verifiedCount: number; verifiedBytes: number; photoCount: number; videoCount: number };
-type TimelineState = { scannedAt: string | null; staleAt: string | null; staleReason: string | null; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
+type TimelineState = { scannedAt: string | null; staleAt: string | null; staleReason: string | null; assetCount: number; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
 type BackupRange = { key: string; label: string; start: string; end: string };
 type TimelineGranularity = "years" | "quarters" | "months";
 
@@ -341,6 +341,8 @@ function IcloudCenter({ username }: { username: string }) {
   const progressTotal = Math.max(progressDone, fullBackup?.planned || plannedPhotoCount + plannedVideoCount);
   const progressPercent = progressTotal ? Math.min(100, Math.round(progressDone / progressTotal * 100)) : 0;
   const planningIndeterminate = Boolean(fullBackupActive && fullBackup?.phase === "planning" && !progressTotal);
+  const verifiedManifestCount = config?.fullManifest?.fileCount || 0;
+  const hasPreciseCloudCatalog = Boolean(config?.timeline?.assetCount);
   const backupStateForBucket = (bucket: TimelineBucket) => {
     const bucketRange = periodRange(bucket.key);
     const activeRange = fullBackup?.ranges?.length ? fullBackup.ranges[Math.max(0, (fullBackup.rangeIndex || 1) - 1)] : null;
@@ -444,7 +446,7 @@ function IcloudCenter({ username }: { username: string }) {
         </div>
       </article>
 
-      <article className={`${styles.card} ${config?.fullBackup?.status !== "completed" ? styles.disabled : ""}`}>
+      <article className={`${styles.card} ${verifiedManifestCount === 0 ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>6</span><div><h2>iCloud 容量释放</h2><p>先重新复核本地清单，再进入独立确认；任何云端删除都不与备份按钮绑定。</p></div></div>
         <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>仅允许删除已通过本地 SHA-256、云端资产 ID、文件名、拍摄时间、原始大小和图库六重核对的项目；删除入口位于图片库，每次都先 dry-run 并要求手动确认。</span></div>
         {config?.releaseHistory?.movedCount ? <><div className={styles.releaseSummary}><div><span>云端“最近删除”</span><strong>{config.releaseHistory.movedCount} 个 · {formatBytes(config.releaseHistory.movedBytes)}</strong></div><div><span>Windows 回收站</span><strong>{config.releaseHistory.recycledFileCount || 0} 个 · {formatBytes(config.releaseHistory.recycledBytes || 0)}</strong></div><p>两侧都保留恢复窗口；分别清空 iCloud“最近删除”和 Windows 回收站后，空间才会彻底释放。</p></div>{config.releaseHistory.events?.filter(event => event.recycleStatus === "failed" || event.recycleStatus === "partial").map(event => <div className={styles.recycleRetry} key={event.id}><span>有 {event.recycleResults.filter(result => result.status === "failed").length} 个本地文件未移入回收站。</span><button onClick={() => void retryLocalRecycle(event.id)} disabled={busy !== null}>重试本地回收</button></div>)}</> : null}
@@ -452,8 +454,8 @@ function IcloudCenter({ username }: { username: string }) {
           <div><strong>{config.releasePlan.status === "confirmed" ? "本地副本已确认" : config.releasePlan.status === "ready" ? "释放计划待确认" : "释放计划被阻止"}</strong><span>{config.releasePlan.message}</span></div>
           <dl><div><dt>本地文件</dt><dd>{config.releasePlan.eligibleCount}</dd></div><div><dt>本地已验证</dt><dd>{formatBytes(config.releasePlan.eligibleBytes)}</dd></div><div><dt>精确云端匹配</dt><dd>{config.releasePlan.assets?.length || 0}</dd></div><div><dt>校验失败</dt><dd>{config.releasePlan.failedCount}</dd></div></dl>
           {config.releasePlan.files.length > 0 && <ul className={styles.releaseFiles}>{config.releasePlan.files.slice(0, 5).map(item => <li key={item.relativePath}><span>{item.mediaType === "video" ? "视频" : "图片"}</span><strong>{item.name}</strong><small>{formatBytes(item.size)}</small></li>)}</ul>}
-        </div> : <p className={styles.releaseIntro}>完整备份完成后，可生成只读释放计划。生成计划会再次校验全部文件，不会访问删除接口。</p>}
-        <div className={styles.actions}><button onClick={() => void createReleasePlan()} disabled={busy !== null || config?.fullBackup?.status !== "completed"}>{busy === "release" ? "正在复核本地文件…" : config?.releasePlan ? "重新生成释放计划" : "生成只读释放计划"}</button></div>
+        </div> : <p className={styles.releaseIntro}>{verifiedManifestCount === 0 ? "先在“完整增量备份”中选择至少一个时间范围并完成备份，系统才会建立可用于安全释放的 SHA-256 清单。" : !hasPreciseCloudCatalog ? `本地已有 ${verifiedManifestCount} 个 SHA-256 验证文件，不需要重新备份；但当前时间统计是旧格式，请先到上方第 4 区点击“刷新统计”，保存云端资产 ID。` : `本地持久化清单已有 ${verifiedManifestCount} 个 SHA-256 验证文件，可以直接生成释放计划；即使上方任务因服务重启显示“已暂停”，也不需要重新下载。`}</p>}
+        <div className={styles.actions}><button onClick={() => void createReleasePlan()} disabled={busy !== null || verifiedManifestCount === 0 || !hasPreciseCloudCatalog}>{busy === "release" ? `正在复核 ${verifiedManifestCount} 个本地文件…` : !hasPreciseCloudCatalog && verifiedManifestCount > 0 ? "请先刷新上方时间统计" : config?.releasePlan ? "重新生成释放计划" : "生成只读释放计划"}</button></div>
         {config?.releasePlan?.status === "ready" && <form className={styles.confirmRelease} onSubmit={confirmReleasePlan}><label>输入“确认本地备份完整”以完成本地确认<input value={releaseConfirmation} onChange={event => setReleaseConfirmation(event.target.value)} /></label><button className={styles.primary} disabled={busy !== null || releaseConfirmation !== "确认本地备份完整"}>确认本地副本</button></form>}
         {config?.releasePlan?.status === "confirmed" && <div className={styles.manualRelease}><strong>已开放逐项安全释放</strong><span>图片库和视频库中只有通过精确云端匹配的卡片才会显示云朵按钮。每次可选择只清理 iCloud，或在云端成功后同时把本地原片移入 Windows 回收站。</span><Link href="/photos">打开图片库</Link></div>}
       </article>

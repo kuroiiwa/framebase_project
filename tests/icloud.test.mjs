@@ -72,7 +72,7 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
   }
 });
 
-test("capacity release plan requires a completed backup and fresh local SHA-256 verification", async () => {
+test("capacity release plan trusts a persisted manifest even when the recovered task is paused", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "framebase-release-project-"));
   const selectedRoot = await mkdtemp(join(tmpdir(), "framebase-release-backup-"));
   try {
@@ -84,7 +84,7 @@ test("capacity release plan requires a completed backup and fresh local SHA-256 
     await writeFile(localPath, "verified-original");
     const sha256 = createHash("sha256").update("verified-original").digest("hex");
     await manager.writeFullManifest("alice", [{ name: "IMG_0001.HEIC", relativePath, extension: "heic", mediaType: "photo", size: 17, sha256, verifiedAt: new Date().toISOString() }]);
-    await manager.writeFullBackup("alice", { status: "completed", phase: "completed", message: "done", completedAt: new Date().toISOString(), manifestFileCount: 1 });
+    await manager.writeFullBackup("alice", { status: "paused", phase: "paused", message: "service restarted", manifestFileCount: 1 });
     const cloudAsset = { id: "asset-1", library: "default", name: "IMG_0001.HEIC", created: "2026-09-12T10:00:00+08:00", mediaType: "photo", extension: "heic", originalBytes: 17, mainBytes: 17, livePhotoBytes: 0, livePhoto: false, raw: false };
     await manager.recordTimeline("alice", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }, years: [{ key: "2026", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }], quarters: [{ key: "2026-Q3", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }], months: [{ key: "2026-09", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }], assets: [cloudAsset] });
     const ready = await manager.createReleasePlan("alice");
@@ -108,6 +108,7 @@ test("capacity release plan requires a completed backup and fresh local SHA-256 
     assert.equal((await manager.readTimeline("alice")).total.itemCount, 0);
     assert.equal((await manager.readFullManifest("alice")).files.length, 0);
     await manager.writeFullManifest("alice", [{ name: "IMG_0001.HEIC", relativePath, extension: "heic", mediaType: "photo", size: 17, sha256, verifiedAt: new Date().toISOString() }]);
+    await manager.recordTimeline("alice", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }, years: [], quarters: [], months: [], assets: [cloudAsset] });
     await writeFile(localPath, "tampered-original");
     const blocked = await manager.createReleasePlan("alice");
     assert.equal(blocked.status, "blocked");
@@ -163,6 +164,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /resumingExisting \? previousState\.completedRanges/);
   assert.match(server, /onRangeComplete/);
   assert.match(page, /生成只读释放计划/);
+  assert.match(page, /请先刷新上方时间统计/);
   assert.match(page, /六重核对/);
   assert.match(page, /已开放逐项安全释放/);
   assert.match(page, /视频库与独立图片库按格式隔离管理/);
