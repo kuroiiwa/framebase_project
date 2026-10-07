@@ -42,6 +42,7 @@ type FullBackupState = {
   ranges: BackupRange[];
 };
 type TimelineBucket = { key: string; itemCount: number; photoCount: number; videoCount: number; livePhotoCount: number; rawCount: number; originalBytes: number };
+type DisplayTimelineBucket = TimelineBucket & { localOnly?: boolean };
 type CoverageBucket = { key: string; verifiedCount: number; verifiedBytes: number; photoCount: number; videoCount: number };
 type TimelineState = { scannedAt: string | null; staleAt: string | null; staleReason: string | null; assetCount: number; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
 type BackupRange = { key: string; label: string; start: string; end: string };
@@ -356,11 +357,48 @@ function IcloudCenter({ username }: { username: string }) {
 
   const readyForConnection = Boolean(config?.backupDirectory);
   const connectionConfigured = Boolean(config?.appleAccount);
-  const timelineBuckets = config?.timeline?.[timelineGranularity] || [];
-  const coverageByKey = new Map((config?.fullManifest?.coverage?.[timelineGranularity] || []).map(bucket => [bucket.key, bucket]));
   const rangesOverlap = (left: BackupRange, right: BackupRange) => left.start <= right.end && right.start <= left.end;
   const rangeContains = (outer: BackupRange, inner: BackupRange) => outer.start <= inner.start && outer.end >= inner.end;
   const fullBackup = config?.fullBackup;
+  const coverageByKey = new Map((config?.fullManifest?.coverage?.[timelineGranularity] || []).map(bucket => [bucket.key, bucket]));
+  const currentCompletedDefinitions = (fullBackup?.ranges || []).filter(range => fullBackup?.completedRanges.includes(range.key));
+  const completedDefinitions = [...(config?.backupHistory?.completedRanges || []), ...currentCompletedDefinitions];
+  const cloudBuckets = config?.timeline?.[timelineGranularity] || [];
+  const cloudBucketsByKey = new Map(cloudBuckets.map(bucket => [bucket.key, bucket]));
+  const visiblePeriodKeys = new Set([...cloudBucketsByKey.keys(), ...coverageByKey.keys()]);
+  const addRangePeriods = (range: BackupRange, include: (outer: BackupRange, period: BackupRange) => boolean) => {
+    const firstYear = Number(range.start.slice(0, 4));
+    const lastYear = Number(range.end.slice(0, 4));
+    if (!Number.isInteger(firstYear) || !Number.isInteger(lastYear) || firstYear < 1900 || lastYear > 2200) return;
+    for (let year = firstYear; year <= lastYear; year += 1) {
+      const keys = timelineGranularity === "years"
+        ? [`${year}`]
+        : timelineGranularity === "quarters"
+          ? [1, 2, 3, 4].map(quarter => `${year}-Q${quarter}`)
+          : Array.from({ length: 12 }, (_, month) => `${year}-${String(month + 1).padStart(2, "0")}`);
+      for (const key of keys) {
+        const period = periodRange(key);
+        if (include(range, period)) visiblePeriodKeys.add(key);
+      }
+    }
+  };
+  for (const range of completedDefinitions) addRangePeriods(range, rangeContains);
+  for (const range of fullBackup?.ranges || []) addRangePeriods(range, rangesOverlap);
+  const timelineBuckets: DisplayTimelineBucket[] = [...visiblePeriodKeys].sort((left, right) => right.localeCompare(left)).map(key => {
+    const cloudBucket = cloudBucketsByKey.get(key);
+    if (cloudBucket) return cloudBucket;
+    const coverage = coverageByKey.get(key);
+    return {
+      key,
+      itemCount: coverage?.verifiedCount || 0,
+      photoCount: coverage?.photoCount || 0,
+      videoCount: coverage?.videoCount || 0,
+      livePhotoCount: 0,
+      rawCount: 0,
+      originalBytes: coverage?.verifiedBytes || 0,
+      localOnly: true,
+    };
+  });
   const syncedPhotoCount = fullBackup?.syncedPhotoCount || fullBackup?.photoCount || 0;
   const syncedVideoCount = fullBackup?.syncedVideoCount || fullBackup?.videoCount || 0;
   const plannedPhotoCount = Math.max(syncedPhotoCount, fullBackup?.plannedPhotoCount || 0);
@@ -374,8 +412,6 @@ function IcloudCenter({ username }: { username: string }) {
   const backupStateForBucket = (bucket: TimelineBucket) => {
     const bucketRange = periodRange(bucket.key);
     const activeRange = fullBackup?.ranges?.length ? fullBackup.ranges[Math.max(0, (fullBackup.rangeIndex || 1) - 1)] : null;
-    const currentCompletedDefinitions = (fullBackup?.ranges || []).filter(range => fullBackup?.completedRanges.includes(range.key));
-    const completedDefinitions = [...(config?.backupHistory?.completedRanges || []), ...currentCompletedDefinitions];
     const coverage = coverageByKey.get(bucket.key);
     if (completedDefinitions.some(range => rangeContains(range, bucketRange))) return { key: "backupComplete", label: "已备份", detail: coverage ? `本地已验证 ${coverage.verifiedCount} 个文件` : "本轮已完成校验" };
     if (fullBackupActive && (!fullBackup?.ranges?.length || (activeRange && rangesOverlap(activeRange, bucketRange)))) return { key: "backupRunning", label: "备份中", detail: "正在处理" };
@@ -449,7 +485,7 @@ function IcloudCenter({ username }: { username: string }) {
         {config?.timeline?.staleAt && <div className={styles.timelineWarning}><strong>云端内容已发生变化</strong><span>{config.timeline.staleReason || "当前数字已按本地删除结果更新，请重新统计以确认 iCloud 云端状态。"}</span></div>}
         {config?.timeline?.scannedAt && <>
           <div className={styles.timelineTabs}><button className={timelineGranularity === "years" ? styles.active : ""} onClick={() => { setTimelineGranularity("years"); setSelectedPeriods([]); }}>按年份</button><button className={timelineGranularity === "quarters" ? styles.active : ""} onClick={() => { setTimelineGranularity("quarters"); setSelectedPeriods([]); }}>每 3 个月</button><button className={timelineGranularity === "months" ? styles.active : ""} onClick={() => { setTimelineGranularity("months"); setSelectedPeriods([]); }}>按月份</button></div>
-          <div className={styles.timelineTable}><div className={styles.timelineRow}><span>选择</span><strong>时间</strong><span>备份状态</span><span>图片</span><span>视频</span><span>Live Photo</span><span>RAW</span><span>原始大小</span></div>{timelineBuckets.map(bucket => { const backupState = backupStateForBucket(bucket); return <label className={styles.timelineRow} key={bucket.key}><input type="checkbox" checked={selectedPeriods.includes(bucket.key)} onChange={() => setSelectedPeriods(current => current.includes(bucket.key) ? current.filter(key => key !== bucket.key) : [...current, bucket.key])} /><strong>{periodRange(bucket.key).label}</strong><span className={`${styles.backupBadge} ${styles[backupState.key]}`} title={backupState.detail}>{backupState.label}</span><span>{bucket.photoCount}</span><span>{bucket.videoCount}</span><span>{bucket.livePhotoCount}</span><span>{bucket.rawCount}</span><span>{formatBytes(bucket.originalBytes)}</span></label>; })}</div>
+          <div className={styles.timelineTable}><div className={styles.timelineRow}><span>选择</span><strong>时间</strong><span>备份状态</span><span>图片</span><span>视频</span><span>Live Photo</span><span>RAW</span><span>原始大小</span></div>{timelineBuckets.map(bucket => { const backupState = backupStateForBucket(bucket); return <label className={`${styles.timelineRow} ${bucket.localOnly ? styles.timelineLocalOnly : ""}`} key={bucket.key}><input type="checkbox" disabled={bucket.localOnly} checked={!bucket.localOnly && selectedPeriods.includes(bucket.key)} onChange={() => setSelectedPeriods(current => current.includes(bucket.key) ? current.filter(key => key !== bucket.key) : [...current, bucket.key])} /><div className={styles.timelinePeriod}><strong>{periodRange(bucket.key).label}</strong>{bucket.localOnly && <small>仅本地记录</small>}</div><span className={`${styles.backupBadge} ${styles[backupState.key]}`} title={backupState.detail}>{backupState.label}</span><span>{bucket.photoCount}</span><span>{bucket.videoCount}</span><span>{bucket.livePhotoCount}</span><span>{bucket.rawCount}</span><span>{formatBytes(bucket.originalBytes)}</span></label>; })}</div>
           <div className={styles.timelineActions}><span>已选择 {selectedPeriods.length} 个时间范围</span><button className={styles.primary} onClick={() => void controlFullBackup("start", selectedPeriods.map(periodRange))} disabled={busy !== null || selectedPeriods.length === 0 || fullBackupActive}>备份所选范围</button></div>
         </>}
       </article>

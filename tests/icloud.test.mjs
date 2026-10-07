@@ -60,6 +60,8 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     await manager.recordCompletedRanges("gabri", [{ key: "2025-Q4", label: "2025 年第 4 季度", start: "2025-10-01T00:00:00", end: "2025-12-31T23:59:59" }, { key: "2026", label: "2026 年", start: "2026-01-01T00:00:00", end: "2026-12-31T23:59:59" }]);
     assert.deepEqual((await manager.readBackupHistory("gabri")).completedRanges.map(item => item.key), ["2025-Q4", "2026"]);
     assert.equal((await manager.readBackupHistory("alice")).completedRanges.length, 0);
+    await manager.recordTimeline("gabri", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 1024 }, years: [{ key: "2027", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 1024 }], quarters: [], months: [] });
+    assert.deepEqual((await manager.readBackupHistory("gabri")).completedRanges.map(item => item.key), ["2025-Q4", "2026"]);
 
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));
@@ -146,6 +148,9 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /部分备份/);
   assert.match(page, /mergeConfig\(current, data\)/);
   assert.match(page, /config\?\.backupHistory\?\.completedRanges/);
+  assert.match(page, /visiblePeriodKeys/);
+  assert.match(page, /仅本地记录/);
+  assert.match(page, /disabled=\{bucket\.localOnly\}/);
   assert.match(page, /实时同步速率/);
   assert.match(page, /等待 iCloud/);
   assert.match(page, /图片进度/);
