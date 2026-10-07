@@ -129,6 +129,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /mergeConfig\(current, data\)/);
   assert.match(page, /config\?\.backupHistory\?\.completedRanges/);
   assert.match(page, /实时同步速率/);
+  assert.match(page, /等待 iCloud/);
   assert.match(page, /图片进度/);
   assert.match(page, /syncedPhotoCount/);
   assert.match(page, /transferRateBps/);
@@ -150,6 +151,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /← 返回视频库/);
   assert.match(styles, /\.topbar \.backLink\{[^}]*display:inline-flex;align-items:center;justify-content:center/);
   assert.match(styles, /\.runtimeVersion\{/);
+  assert.match(styles, /\.progressIndeterminate i\{/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
   assert.match(server, /icloud\.configureBackupDirectory\(current\.username/);

@@ -389,6 +389,28 @@ test("resume skips fully completed ranges before querying iCloud", async () => {
   }
 });
 
+test("planning emits heartbeat progress while iCloud is still responding", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-planning-heartbeat-"));
+  const executablePath = join(root, "icloudpd.exe");
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      progressInterval: 10,
+      runCommand: async (_executable, args) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) await new Promise(resolve => setTimeout(resolve, 35));
+        return { stdout: "", stderr: "" };
+      },
+    });
+    const progress = [];
+    await provider.backupAll({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"), onProgress: update => progress.push(update) });
+    assert.ok(progress.some(update => update.phase === "planning" && update.message.includes("已等待") && update.message.includes("秒")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("full backup verifies local files with a bounded two-worker pool", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-parallel-verification-"));
   const executablePath = join(root, "icloudpd.exe");

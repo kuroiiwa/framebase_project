@@ -327,6 +327,7 @@ function IcloudCenter({ username }: { username: string }) {
   const progressDone = fullBackup?.phase === "verifying" || fullBackup?.status === "completed" ? fullBackup.verified : fullBackup?.downloaded || 0;
   const progressTotal = Math.max(progressDone, fullBackup?.planned || plannedPhotoCount + plannedVideoCount);
   const progressPercent = progressTotal ? Math.min(100, Math.round(progressDone / progressTotal * 100)) : 0;
+  const planningIndeterminate = Boolean(fullBackupActive && fullBackup?.phase === "planning" && !progressTotal);
   const backupStateForBucket = (bucket: TimelineBucket) => {
     const bucketRange = periodRange(bucket.key);
     const activeRange = fullBackup?.ranges?.length ? fullBackup.ranges[Math.max(0, (fullBackup.rangeIndex || 1) - 1)] : null;
@@ -416,7 +417,7 @@ function IcloudCenter({ username }: { username: string }) {
           {config?.fullBackup?.rangeCount ? <div className={styles.rangeStatus}><strong>时间范围 {config.fullBackup.rangeIndex || 1}/{config.fullBackup.rangeCount}</strong><span>{config.fullBackup.currentRange || "正在准备"} · 已完成 {config.fullBackup.completedRanges.length} 个范围</span></div> : null}
           {config?.fullBackup && <div className={styles.liveMetrics}><div><span>实时同步速率</span><strong>{config.fullBackup.phase === "downloading" ? `${formatBytes(config.fullBackup.transferRateBps || 0)}/秒` : "—"}</strong></div><div><span>图片进度</span><strong>{syncedPhotoCount} / {plannedPhotoCount || "—"}</strong></div><div><span>视频进度</span><strong>{syncedVideoCount} / {plannedVideoCount || "—"}</strong></div><div><span>总同步进度</span><strong>{config.fullBackup.downloaded} / {config.fullBackup.planned || "—"}</strong></div></div>}
           {config?.fullBackup && <dl><div><dt>计划</dt><dd>{config.fullBackup.planned}</dd></div><div><dt>已验证</dt><dd>{config.fullBackup.verified}</dd></div><div><dt>增量跳过</dt><dd>{config.fullBackup.skipped}</dd></div><div><dt>失败</dt><dd>{config.fullBackup.failed}</dd></div><div><dt>图片</dt><dd>{config.fullBackup.photoCount}</dd></div><div><dt>视频</dt><dd>{config.fullBackup.videoCount}</dd></div></dl>}
-          {progressTotal ? <div className={styles.progressLine}><div className={styles.progress} aria-label={`完整备份进度 ${progressPercent}%`}><i style={{ width: `${progressPercent}%` }} /></div><strong>{progressPercent}%</strong></div> : null}
+          {progressTotal ? <div className={styles.progressLine}><div className={styles.progress} aria-label={`完整备份进度 ${progressPercent}%`}><i style={{ width: `${progressPercent}%` }} /></div><strong>{progressPercent}%</strong></div> : planningIndeterminate ? <div className={styles.progressLine}><div className={`${styles.progress} ${styles.progressIndeterminate}`} aria-label="正在查询 iCloud 清单"><i /></div><strong>等待 iCloud</strong></div> : null}
           {config?.fullBackup?.downloadedBytes ? <small>本地已存在或写入：{formatBytes(config.fullBackup.downloadedBytes)}</small> : null}
           {config?.fullBackup?.verifiedBytes ? <small>已通过完整性校验：{formatBytes(config.fullBackup.verifiedBytes)} · 清单共 {config.fullManifest?.fileCount || config.fullBackup.verified} 个文件</small> : null}
         </div>

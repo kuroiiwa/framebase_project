@@ -360,6 +360,21 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     const run = (args, timeout, maxBuffer = 64 * 1024 * 1024) => password
       ? runWithRuntimePassword(args, password, timeout, signal)
       : runCommand(executablePath, args, { timeout, maxBuffer, signal });
+    const runPlanningStep = async (args, timeout, progress) => {
+      const startedAt = Date.now();
+      let polling = false;
+      let progressPoll = Promise.resolve();
+      await onProgress(progress(0));
+      const timer = setInterval(() => {
+        if (polling) return;
+        polling = true;
+        const elapsedSeconds = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+        progressPoll = Promise.resolve(onProgress(progress(elapsedSeconds))).catch(() => undefined).finally(() => { polling = false; });
+      }, safeProgressInterval);
+      timer.unref?.();
+      try { return await run(args, timeout); }
+      finally { clearInterval(timer); await progressPoll; }
+    };
     const cleanLines = value => String(value || "").replace(/i?cloud password for [^:\r\n]+:/gi, "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
     const parsePaths = (value, library) => cleanLines(value).map(line => {
       const extension = extname(line).slice(1).toLowerCase();
@@ -411,7 +426,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const completedRanges = [...new Set((Array.isArray(initialCompletedRanges) ? initialCompletedRanges : []).filter(key => requestedRanges.some(range => range.key === key)))];
       await onProgress({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], message: "正在读取 iCloud 图库清单…" });
       if (completedRanges.length === requestedRanges.length) return { status: "completed", message: `所选 ${completedRanges.length} 个时间范围已由本地完成记录确认，无需重复连接 iCloud、下载或哈希。`, files: [], planned: 0, downloadedBytes: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, completedRanges, providerInfo };
-      const libraryResult = await run([...baseArgs, "--list-libraries"], 180_000);
+      const libraryResult = await runPlanningStep([...baseArgs, "--list-libraries"], 180_000, elapsed => ({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: 0, verified: 0, skipped: 0, failed: 0, verifiedBytes: 0, message: elapsed ? `正在连接 iCloud 并读取图库列表，已等待 ${elapsed} 秒…` : "正在连接 iCloud 并读取图库列表…" }));
       const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
       const libraries = [null, ...namedLibraries];
       const planByPath = new Map();
@@ -481,7 +496,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         for (const library of libraries) {
           if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
           const libraryArgs = library ? ["--library", library] : [];
-          const result = await run([...mediaArgs, ...libraryArgs, ...rangeArgs(range), "--only-print-filenames"], 30 * 60_000);
+          const libraryName = library ? `图库“${library}”` : "主图库";
+          const result = await runPlanningStep([...mediaArgs, ...libraryArgs, ...rangeArgs(range), "--only-print-filenames"], 30 * 60_000, elapsed => ({ status: "planning", phase: "planning", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), message: elapsed ? `正在向 iCloud 查询 ${currentRange} 的${libraryName}，已等待 ${elapsed} 秒…` : `正在向 iCloud 查询 ${currentRange} 的${libraryName}…` }));
           const items = parsePaths(result.stdout, library);
           if (items.length > 0) activeOperations.push({ library, range, items });
           for (const item of items) {
