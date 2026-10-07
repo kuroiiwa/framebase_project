@@ -57,6 +57,13 @@ function mergeConfig(current: IcloudConfig | null, update: IcloudConfig) {
   return current ? { ...current, ...update } : update;
 }
 
+async function fetchIcloudConfig() {
+  const response = await fetch("/api/icloud/config", { cache: "no-store" });
+  const data = await response.json() as IcloudConfig & { error?: string };
+  if (!response.ok) throw new Error(data.error || "无法读取 iCloud 备份配置");
+  return data;
+}
+
 export default function IcloudPage() {
   return <AccountGate>{username => <IcloudCenter key={username} username={username} />}</AccountGate>;
 }
@@ -81,12 +88,7 @@ function IcloudCenter({ username }: { username: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    void fetch("/api/icloud/config", { cache: "no-store" })
-      .then(async response => {
-        const data = await response.json() as IcloudConfig & { error?: string };
-        if (!response.ok) throw new Error(data.error || "无法读取 iCloud 备份配置");
-        return data;
-      })
+    void fetchIcloudConfig()
       .then(data => {
         if (cancelled) return;
         setConfig(data);
@@ -107,10 +109,11 @@ function IcloudCenter({ username }: { username: string }) {
 
   useEffect(() => {
     if (timelineJob?.status !== "running") return;
-    const poll = () => void fetch("/api/icloud/timeline/status", { cache: "no-store" }).then(response => response.json() as Promise<{ timelineJob: TimelineJob }>).then(data => {
+    const poll = () => void fetch("/api/icloud/timeline/status", { cache: "no-store" }).then(response => response.json() as Promise<{ timelineJob: TimelineJob }>).then(async data => {
       setTimelineJob(data.timelineJob);
       if (data.timelineJob.status === "completed") {
-        if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob.timeline } : current);
+        try { setConfig(await fetchIcloudConfig()); }
+        catch { if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob.timeline } : current); }
         setSelectedPeriods([]); setMessage(data.timelineJob.message); setBusy(null);
       } else if (data.timelineJob.status === "failed") {
         setError(data.timelineJob.message); setBusy(null);
@@ -290,7 +293,8 @@ function IcloudCenter({ username }: { username: string }) {
       if (!data.timelineJob) throw new Error("时间统计任务未能启动");
       setTimelineJob(data.timelineJob);
       if (data.timelineJob.status === "completed") {
-        if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob!.timeline } : current);
+        try { setConfig(await fetchIcloudConfig()); }
+        catch { if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob.timeline } : current); }
         setSelectedPeriods([]); setMessage(data.timelineJob.message); setBusy(null);
       } else if (data.timelineJob.status === "failed") {
         setError(data.timelineJob.message); setBusy(null);
