@@ -71,6 +71,7 @@ const icloudProvider = createIcloudPdProvider({
 });
 const icloudBackupUsers = new Set();
 const icloudFullBackupJobs = new Map();
+const icloudTimelineJobs = new Map();
 const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
 const appPort = Number(process.env.FRAMEBASE_APP_PORT || 3001);
@@ -508,14 +509,34 @@ async function handleIcloud(request, response, url) {
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/timeline") {
     if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "备份任务运行时不能刷新时间统计。" });
+    const existing = icloudTimelineJobs.get(current.username);
+    if (existing?.status === "running") return json(response, 202, { timelineJob: existing });
     const context = await icloud.connectionContext(current.username);
-    const result = await icloudProvider.scanTimeline({ ...context, jobKey: current.username });
-    if (result.status !== "ready") {
-      if (result.status === "needs_auth") await icloud.recordConnectionCheck(current.username, result);
-      return json(response, 200, { timeline: await icloud.readTimeline(current.username), timelineResult: { status: result.status, message: result.message } });
-    }
-    const timeline = await icloud.recordTimeline(current.username, result);
-    return json(response, 200, { timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, assetCount: timeline.assetCount, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months }, timelineResult: { status: result.status, message: result.message } });
+    const username = current.username;
+    const job = { status: "running", phase: "starting", message: "正在准备 iCloud 元数据扫描…", library: null, libraryIndex: 0, libraryCount: 0, itemCount: 0, elapsedSeconds: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    icloudTimelineJobs.set(username, job);
+    void (async () => {
+      try {
+        const result = await icloudProvider.scanTimeline({ ...context, jobKey: username, onProgress: progress => Object.assign(job, progress, { updatedAt: new Date().toISOString() }) });
+        if (result.status !== "ready") {
+          if (result.status === "needs_auth") await icloud.recordConnectionCheck(username, result);
+          Object.assign(job, { status: "failed", phase: "failed", message: result.message, resultStatus: result.status, updatedAt: new Date().toISOString() });
+          return;
+        }
+        const timeline = await icloud.recordTimeline(username, result);
+        Object.assign(job, { status: "completed", phase: "completed", message: result.message, itemCount: timeline.total?.itemCount || 0, timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, assetCount: timeline.assetCount, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months }, updatedAt: new Date().toISOString() });
+      } catch {
+        Object.assign(job, { status: "failed", phase: "failed", message: "时间统计任务意外停止，请重新验证连接后重试。", updatedAt: new Date().toISOString() });
+      }
+    })();
+    return json(response, 202, { timelineJob: job });
+  }
+  if (request.method === "GET" && url.pathname === "/api/icloud/timeline/status") {
+    const timelineJob = icloudTimelineJobs.get(current.username);
+    const visibleJob = timelineJob?.status === "running"
+      ? { ...timelineJob, elapsedSeconds: Math.max(timelineJob.elapsedSeconds || 0, Math.floor((Date.now() - Date.parse(timelineJob.startedAt)) / 1000)) }
+      : timelineJob;
+    return json(response, 200, { timelineJob: visibleJob || { status: "idle", phase: "idle", message: "尚未开始刷新统计。", library: null, libraryIndex: 0, libraryCount: 0, itemCount: 0, elapsedSeconds: 0 } });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/backup/test") {
     const previousBackup = await icloud.readBackup(current.username);

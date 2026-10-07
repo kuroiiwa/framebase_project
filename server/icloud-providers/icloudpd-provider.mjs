@@ -604,7 +604,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory }) {
+  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, onProgress = () => undefined }) {
+    const startedAt = Date.now();
+    const report = update => { try { onProgress({ elapsedSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)), ...update }); } catch { /* Progress reporting must not stop the scan. */ } };
+    report({ phase: "starting", message: "正在准备 iCloud 元数据扫描…", libraryIndex: 0, libraryCount: 0, itemCount: 0 });
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", providerInfo, years: [], quarters: [], months: [] };
     const password = sessionSecrets.get(jobKey);
@@ -629,6 +632,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       map.set(key, bucket);
     };
     try {
+      report({ phase: "discovering", message: "正在读取 iCloud 图库列表…", libraryIndex: 0, libraryCount: 0, itemCount: 0 });
       const libraryArgs = baseArgs.filter(argument => argument !== "--only-print-filenames");
       const librariesResult = password
         ? await runWithRuntimePassword([...libraryArgs, "--list-libraries"], password, 180_000)
@@ -636,8 +640,15 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const libraries = [...new Set(String(librariesResult.stdout || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
       const targets = libraries.length ? libraries.slice(0, 32) : [null];
       const itemsById = new Map();
-      for (const library of targets) {
-        const result = await runInventory([...baseArgs, ...(library ? ["--library", library] : [])]);
+      for (let libraryOffset = 0; libraryOffset < targets.length; libraryOffset += 1) {
+        const library = targets[libraryOffset];
+        const libraryLabel = library || "主图库";
+        report({ phase: "reading", message: `正在读取 ${libraryLabel}…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
+        const heartbeat = setInterval(() => report({ phase: "reading", message: `正在读取 ${libraryLabel}，iCloud 仍在返回数据…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size }), 1000);
+        heartbeat.unref?.();
+        let result;
+        try { result = await runInventory([...baseArgs, ...(library ? ["--library", library] : [])]); }
+        finally { clearInterval(heartbeat); }
         for (const line of String(result.stdout || "").split(/\r?\n/)) {
           if (!line.startsWith("FRAMEBASE_INVENTORY ")) continue;
           try {
@@ -645,7 +656,9 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, { ...item, library: library || "default" });
           } catch { /* Ignore malformed provider output without exposing it. */ }
         }
+        report({ phase: "reading", message: `${libraryLabel} 已读取完成。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
       }
+      report({ phase: "aggregating", message: `正在汇总 ${itemsById.size} 个项目的时间信息…`, libraryIndex: targets.length, libraryCount: targets.length, itemCount: itemsById.size });
       const years = new Map(); const quarters = new Map(); const months = new Map();
       for (const item of itemsById.values()) {
         const created = new Date(item.created);
@@ -661,6 +674,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const totals = new Map();
       for (const item of itemsById.values()) increment(totals, "total", item);
       const total = totals.get("total") || empty("total");
+      report({ phase: "completed", message: `已完成 ${total.itemCount} 个项目的时间统计。`, libraryIndex: targets.length, libraryCount: targets.length, itemCount: total.itemCount });
       return { status: "ready", message: `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), assets: [...itemsById.values()], providerInfo };
     } catch (error) {
       return { ...safeMessage(error), years: [], quarters: [], months: [], providerInfo };

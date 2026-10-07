@@ -46,6 +46,7 @@ type CoverageBucket = { key: string; verifiedCount: number; verifiedBytes: numbe
 type TimelineState = { scannedAt: string | null; staleAt: string | null; staleReason: string | null; assetCount: number; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
 type BackupRange = { key: string; label: string; start: string; end: string };
 type TimelineGranularity = "years" | "quarters" | "months";
+type TimelineJob = { status: "idle" | "running" | "completed" | "failed"; phase: string; message: string; library: string | null; libraryIndex: number; libraryCount: number; itemCount: number; elapsedSeconds: number; timeline?: TimelineState };
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
 type RuntimeVersion = { app: "FrameBase"; version: string; commit: string; startedAt: string; pid: number; node: string };
@@ -70,6 +71,7 @@ function IcloudCenter({ username }: { username: string }) {
   const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | "release" | null>(null);
   const [releaseConfirmation, setReleaseConfirmation] = useState("");
   const [timelineGranularity, setTimelineGranularity] = useState<TimelineGranularity>("years");
+  const [timelineJob, setTimelineJob] = useState<TimelineJob | null>(null);
   const [selectedPeriods, setSelectedPeriods] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -94,6 +96,28 @@ function IcloudCenter({ username }: { username: string }) {
       .catch(reason => { if (!cancelled) setError(reason instanceof Error ? reason.message : "无法读取配置"); });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    void fetch("/api/icloud/timeline/status", { cache: "no-store" }).then(response => response.json() as Promise<{ timelineJob: TimelineJob }>).then(data => {
+      setTimelineJob(data.timelineJob);
+      if (data.timelineJob.status === "running") setBusy("scan");
+    }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (timelineJob?.status !== "running") return;
+    const poll = () => void fetch("/api/icloud/timeline/status", { cache: "no-store" }).then(response => response.json() as Promise<{ timelineJob: TimelineJob }>).then(data => {
+      setTimelineJob(data.timelineJob);
+      if (data.timelineJob.status === "completed") {
+        if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob.timeline } : current);
+        setSelectedPeriods([]); setMessage(data.timelineJob.message); setBusy(null);
+      } else if (data.timelineJob.status === "failed") {
+        setError(data.timelineJob.message); setBusy(null);
+      }
+    }).catch(() => undefined);
+    const timer = setInterval(poll, 1000);
+    return () => clearInterval(timer);
+  }, [timelineJob?.status]);
 
   useEffect(() => {
     let cancelled = false;
@@ -260,13 +284,17 @@ function IcloudCenter({ username }: { username: string }) {
     setBusy("scan"); setError(""); setMessage("");
     try {
       const response = await fetch("/api/icloud/timeline", { method: "POST" });
-      const data = await response.json() as { timeline?: TimelineState; timelineResult?: { status: string; message: string }; error?: string };
+      const data = await response.json() as { timelineJob?: TimelineJob; error?: string };
       if (!response.ok) throw new Error(data.error || "无法读取 iCloud 时间统计");
-      if (data.timeline) setConfig(current => current ? { ...current, timeline: data.timeline } : current);
-      setSelectedPeriods([]);
-      if (data.timelineResult?.status === "ready") setMessage(data.timelineResult.message); else setError(data.timelineResult?.message || "时间统计失败，请重新验证连接。");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取 iCloud 时间统计"); }
-    finally { setBusy(null); }
+      if (!data.timelineJob) throw new Error("时间统计任务未能启动");
+      setTimelineJob(data.timelineJob);
+      if (data.timelineJob.status === "completed") {
+        if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob!.timeline } : current);
+        setSelectedPeriods([]); setMessage(data.timelineJob.message); setBusy(null);
+      } else if (data.timelineJob.status === "failed") {
+        setError(data.timelineJob.message); setBusy(null);
+      }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取 iCloud 时间统计"); setBusy(null); }
   }
 
   function periodRange(key: string): BackupRange {
@@ -417,6 +445,7 @@ function IcloudCenter({ username }: { username: string }) {
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>4</span><div><h2>按时间统计与选择</h2><p>只读获取拍摄时间、类型和原始资源大小，可按年、季度或月份选择增量备份范围。</p></div></div>
         <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button></div>
+        {timelineJob?.status === "running" && <div className={styles.timelineScanProgress}><div><strong>{timelineJob.message}</strong><span>{timelineJob.libraryCount ? `图库 ${timelineJob.libraryIndex}/${timelineJob.libraryCount}${timelineJob.library ? ` · ${timelineJob.library}` : ""}` : "正在发现图库"}</span></div><div className={styles.progressLine}><div className={`${styles.progress} ${timelineJob.libraryCount ? "" : styles.progressIndeterminate}`}><i style={timelineJob.libraryCount ? { width: `${Math.max(4, Math.round(timelineJob.libraryIndex / timelineJob.libraryCount * 100))}%` } : undefined} /></div><strong>{timelineJob.libraryCount ? `${Math.round(timelineJob.libraryIndex / timelineJob.libraryCount * 100)}%` : "连接中"}</strong></div><dl><div><dt>已读取项目</dt><dd>{timelineJob.itemCount.toLocaleString()}</dd></div><div><dt>已用时间</dt><dd>{Math.floor(timelineJob.elapsedSeconds / 60)}分 {timelineJob.elapsedSeconds % 60}秒</dd></div><div><dt>当前阶段</dt><dd>{timelineJob.phase === "discovering" ? "发现图库" : timelineJob.phase === "aggregating" ? "生成统计" : "读取元数据"}</dd></div></dl></div>}
         {config?.timeline?.staleAt && <div className={styles.timelineWarning}><strong>云端内容已发生变化</strong><span>{config.timeline.staleReason || "当前数字已按本地删除结果更新，请重新统计以确认 iCloud 云端状态。"}</span></div>}
         {config?.timeline?.scannedAt && <>
           <div className={styles.timelineTabs}><button className={timelineGranularity === "years" ? styles.active : ""} onClick={() => { setTimelineGranularity("years"); setSelectedPeriods([]); }}>按年份</button><button className={timelineGranularity === "quarters" ? styles.active : ""} onClick={() => { setTimelineGranularity("quarters"); setSelectedPeriods([]); }}>每 3 个月</button><button className={timelineGranularity === "months" ? styles.active : ""} onClick={() => { setTimelineGranularity("months"); setSelectedPeriods([]); }}>按月份</button></div>

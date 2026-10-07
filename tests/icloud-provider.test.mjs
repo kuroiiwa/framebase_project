@@ -500,6 +500,7 @@ test("provider builds exact year, quarter, and month summaries from read-only in
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-timeline-"));
   const executablePath = join(root, "icloudpd.exe");
   const calls = [];
+  const progress = [];
   try {
     await writeFile(executablePath, "test");
     const provider = createIcloudPdProvider({
@@ -515,7 +516,7 @@ test("provider builds exact year, quarter, and month summaries from read-only in
         ].join("\n"), stderr: "" };
       },
     });
-    const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") });
+    const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"), onProgress: update => progress.push(update) });
     assert.equal(result.status, "ready");
     assert.equal(result.total.itemCount, 3);
     assert.equal(result.total.originalBytes, 600);
@@ -524,6 +525,9 @@ test("provider builds exact year, quarter, and month summaries from read-only in
     assert.deepEqual(result.months.map(item => item.key), ["2024-04", "2024-03", "2023-12"]);
     assert.equal(result.assets.length, 3);
     assert.equal(result.assets[0].library, "SharedSync");
+    assert.ok(progress.some(update => update.phase === "discovering"));
+    assert.ok(progress.some(update => update.phase === "reading" && update.libraryIndex === 1 && update.libraryCount === 1));
+    assert.ok(progress.some(update => update.phase === "completed" && update.itemCount === 3));
     const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1");
     assert.ok(inventoryCall.args.includes("--only-print-filenames"));
     assert.equal(inventoryCall.args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
