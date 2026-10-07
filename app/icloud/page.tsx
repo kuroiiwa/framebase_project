@@ -24,6 +24,7 @@ type IcloudConfig = {
   scan?: { scannedAt: string | null; sampleCount: number; samples: Array<{ name: string; extension: string; mediaType: "photo" | "video" }> };
   backup?: { completedAt: string | null; fileCount: number; files: Array<{ name: string; relativePath: string; extension: string; mediaType: "photo" | "video"; size: number; sha256: string | null }> };
   timeline?: TimelineState;
+  backupHistory?: { updatedAt: string | null; completedRanges: BackupRange[] };
   fullBackup?: FullBackupState;
   fullManifest?: { updatedAt: string | null; fileCount: number; coverage: { years: CoverageBucket[]; quarters: CoverageBucket[]; months: CoverageBucket[] } };
   releasePlan?: ReleasePlan | null;
@@ -47,6 +48,10 @@ type TimelineGranularity = "years" | "quarters" | "months";
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
 const activeAuthStates = new Set<AuthState["status"]>(["starting", "waiting_password", "verifying", "waiting_mfa"]);
+
+function mergeConfig(current: IcloudConfig | null, update: IcloudConfig) {
+  return current ? { ...current, ...update } : update;
+}
 
 export default function IcloudPage() {
   return <AccountGate>{username => <IcloudCenter key={username} username={username} />}</AccountGate>;
@@ -122,7 +127,7 @@ function IcloudCenter({ username }: { username: string }) {
       const data = await response.json() as IcloudConfig & { cancelled?: boolean; error?: string };
       if (!response.ok) throw new Error(data.error || "无法选择备份文件夹");
       if (data.cancelled) return;
-      setConfig(current => ({ ...data, providerInfo: current?.providerInfo })); setManualPath(data.selectedDirectory || "");
+      setConfig(current => mergeConfig(current, data)); setManualPath(data.selectedDirectory || "");
       setMessage("备份目录已为当前 FrameBase 用户单独创建。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法选择备份文件夹"); }
     finally { setBusy(null); }
@@ -135,7 +140,7 @@ function IcloudCenter({ username }: { username: string }) {
       const response = await fetch("/api/icloud/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: manualPath.trim() }) });
       const data = await response.json() as IcloudConfig & { error?: string };
       if (!response.ok) throw new Error(data.error || "无法保存备份目录");
-      setConfig(current => ({ ...data, providerInfo: current?.providerInfo })); setManualPath(data.selectedDirectory || "");
+      setConfig(current => mergeConfig(current, data)); setManualPath(data.selectedDirectory || "");
       setMessage("备份目录已保存。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法保存备份目录"); }
     finally { setBusy(null); }
@@ -148,7 +153,7 @@ function IcloudCenter({ username }: { username: string }) {
       const response = await fetch("/api/icloud/connection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ appleAccount: appleAccount.trim(), icloudDomain }) });
       const data = await response.json() as IcloudConfig & { error?: string };
       if (!response.ok) throw new Error(data.error || "无法保存 Apple 连接配置");
-      setConfig(data); setAppleAccount(data.appleAccount || ""); setIcloudDomain(data.icloudDomain);
+      setConfig(current => mergeConfig(current, data)); setAppleAccount(data.appleAccount || ""); setIcloudDomain(data.icloudDomain);
       setMessage("Apple 账户配置已保存；密码不会保存在 FrameBase 配置中。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法保存 Apple 连接配置"); }
     finally { setBusy(null); }
@@ -160,7 +165,7 @@ function IcloudCenter({ username }: { username: string }) {
       const response = await fetch("/api/icloud/verify", { method: "POST" });
       const data = await response.json() as IcloudConfig & { verification?: { status: string; message: string }; error?: string };
       if (!response.ok) throw new Error(data.error || "无法验证 iCloud 会话");
-      setConfig(data);
+      setConfig(current => mergeConfig(current, data));
       if (data.verification?.status === "connected") setMessage("iCloud 会话验证成功。");
       else setError(data.verification?.message || "现有会话不可用，需要重新登录 Apple ID。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法验证 iCloud 会话"); }
@@ -203,7 +208,7 @@ function IcloudCenter({ username }: { username: string }) {
       const response = await fetch("/api/icloud/scan", { method: "POST" });
       const data = await response.json() as IcloudConfig & { scanResult?: { status: string; message: string }; error?: string };
       if (!response.ok) throw new Error(data.error || "无法扫描 iCloud 媒体");
-      setConfig(current => ({ ...data, providerInfo: current?.providerInfo }));
+      setConfig(current => mergeConfig(current, data));
       if (data.scanResult?.status === "ready") setMessage(data.scanResult.message);
       else setError(data.scanResult?.message || "iCloud 只读扫描失败，请重新验证连接。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法扫描 iCloud 媒体"); }
@@ -217,7 +222,7 @@ function IcloudCenter({ username }: { username: string }) {
       const response = await fetch("/api/icloud/backup/test", { method: "POST" });
       const data = await response.json() as IcloudConfig & { backupResult?: { status: string; message: string }; error?: string };
       if (!response.ok) throw new Error(data.error || "无法完成测试备份");
-      setConfig(current => ({ ...data, providerInfo: current?.providerInfo }));
+      setConfig(current => mergeConfig(current, data));
       if (data.backupResult?.status === "completed") setMessage(data.backupResult.message);
       else setError(data.backupResult?.message || "测试备份未完成，请检查连接和本地目录。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法完成测试备份"); }
@@ -313,7 +318,8 @@ function IcloudCenter({ username }: { username: string }) {
   const backupStateForBucket = (bucket: TimelineBucket) => {
     const bucketRange = periodRange(bucket.key);
     const activeRange = fullBackup?.ranges?.length ? fullBackup.ranges[Math.max(0, (fullBackup.rangeIndex || 1) - 1)] : null;
-    const completedDefinitions = (fullBackup?.ranges || []).filter(range => fullBackup?.completedRanges.includes(range.key));
+    const currentCompletedDefinitions = (fullBackup?.ranges || []).filter(range => fullBackup?.completedRanges.includes(range.key));
+    const completedDefinitions = [...(config?.backupHistory?.completedRanges || []), ...currentCompletedDefinitions];
     const coverage = coverageByKey.get(bucket.key);
     if (completedDefinitions.some(range => rangeContains(range, bucketRange))) return { key: "backupComplete", label: "已备份", detail: coverage ? `本地已验证 ${coverage.verifiedCount} 个文件` : "本轮已完成校验" };
     if (fullBackupActive && (!fullBackup?.ranges?.length || (activeRange && rangesOverlap(activeRange, bucketRange)))) return { key: "backupRunning", label: "备份中", detail: "正在处理" };

@@ -394,8 +394,10 @@ async function handleIcloud(request, response, url) {
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
-    const [config, scan, backup, fullBackupStored, backupCoverage, timeline, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
+    const [config, scan, backup, fullBackupStored, backupCoverage, timeline, backupHistoryStored, releasePlan, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readBackupHistory(current.username), icloud.readReleasePlan(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
+    const legacyCompletedRanges = fullBackupStored.ranges.filter(range => fullBackupStored.completedRanges.includes(range.key));
+    const backupHistory = legacyCompletedRanges.length ? await icloud.recordCompletedRanges(current.username, legacyCompletedRanges) : backupHistoryStored;
     if (["planning", "downloading", "verifying"].includes(fullBackup.status) && !icloudFullBackupJobs.has(current.username)) {
       fullBackup = await icloud.writeFullBackup(current.username, { status: "paused", phase: "paused", transferRateBps: 0, message: "FrameBase 曾在任务运行时停止；可点击继续以安全恢复。" });
     }
@@ -404,6 +406,7 @@ async function handleIcloud(request, response, url) {
       scan,
       backup,
       timeline,
+      backupHistory,
       fullBackup,
       fullManifest: { updatedAt: backupCoverage.updatedAt, fileCount: backupCoverage.fileCount, coverage: { years: backupCoverage.years, quarters: backupCoverage.quarters, months: backupCoverage.months } },
       releasePlan,
@@ -525,6 +528,7 @@ async function handleIcloud(request, response, url) {
           } : update),
           onRangeComplete: async update => {
             const savedManifest = update.files.length ? await icloud.writeFullManifest(current.username, update.files) : await icloud.readFullManifest(current.username);
+            await icloud.recordCompletedRanges(current.username, ranges.filter(range => update.completedRanges.includes(range.key)));
             await icloud.writeFullBackup(current.username, { completedRanges: update.completedRanges, manifestFileCount: savedManifest.files.length });
           },
         });
@@ -534,6 +538,7 @@ async function handleIcloud(request, response, url) {
         }
         const savedManifest = result.files?.length ? await icloud.writeFullManifest(current.username, result.files) : previousManifest;
         const completed = result.status === "completed";
+        if (completed) await icloud.recordCompletedRanges(current.username, ranges.filter(range => result.completedRanges?.includes(range.key)));
         await icloud.writeFullBackup(current.username, {
           status: completed ? "completed" : "failed", phase: completed ? "completed" : "failed", message: result.message,
           completedAt: completed ? new Date().toISOString() : null, currentLibrary: null, currentRange: null,

@@ -64,6 +64,10 @@ export function createIcloudManager({ projectRoot }) {
     return join(userDirectory(username), "timeline.json");
   }
 
+  function backupHistoryPath(username) {
+    return join(userDirectory(username), "backup-history.json");
+  }
+
   function sha256File(path) {
     return new Promise((resolvePromise, reject) => {
       const hash = createHash("sha256");
@@ -224,6 +228,39 @@ export function createIcloudManager({ projectRoot }) {
     };
     await atomicJson(username, timelinePath(username), timeline);
     return timeline;
+  }
+
+  function cleanBackupRanges(value) {
+    return Array.isArray(value) ? value.map(item => ({
+      key: String(item?.key || ""), label: String(item?.label || ""),
+      start: String(item?.start || ""), end: String(item?.end || ""),
+      completedAt: typeof item?.completedAt === "string" ? item.completedAt : null,
+    })).filter(item => item.key && item.label && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.start) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(item.end) && item.start <= item.end).slice(0, 500) : [];
+  }
+
+  async function readBackupHistory(username) {
+    validateUsername(username);
+    try {
+      const parsed = JSON.parse(await readFile(backupHistoryPath(username), "utf8"));
+      return { updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : null, completedRanges: cleanBackupRanges(parsed.completedRanges) };
+    } catch (error) {
+      if (error.code === "ENOENT") return { updatedAt: null, completedRanges: [] };
+      throw error;
+    }
+  }
+
+  async function recordCompletedRanges(username, ranges) {
+    const incoming = cleanBackupRanges(ranges);
+    const current = await readBackupHistory(username);
+    if (!incoming.length) return current;
+    const byPeriod = new Map(current.completedRanges.map(item => [`${item.start}|${item.end}`, item]));
+    const completedAt = new Date().toISOString();
+    for (const item of incoming) byPeriod.set(`${item.start}|${item.end}`, { ...item, completedAt: item.completedAt || completedAt });
+    const completedRanges = [...byPeriod.values()].sort((left, right) => left.start.localeCompare(right.start));
+    if (completedRanges.length === current.completedRanges.length && incoming.every(item => current.completedRanges.some(saved => saved.start === item.start && saved.end === item.end))) return current;
+    const history = { version: 1, updatedAt: completedAt, completedRanges };
+    await atomicJson(username, backupHistoryPath(username), history);
+    return { updatedAt: history.updatedAt, completedRanges: history.completedRanges };
   }
 
   async function readReleasePlan(username) {
@@ -499,5 +536,5 @@ export function createIcloudManager({ projectRoot }) {
     return { ...config, backup: { completedAt, fileCount: files.length, files } };
   }
 
-  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
+  return { read, readScan, readBackup, readFullBackup, readFullManifest, readBackupCoverage, writeFullBackup, writeFullManifest, readTimeline, recordTimeline, readBackupHistory, recordCompletedRanges, readReleasePlan, createReleasePlan, confirmReleasePlan, configureBackupDirectory, configureConnection, connectionContext, recordConnectionCheck, recordScan, recordBackup };
 }

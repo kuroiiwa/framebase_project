@@ -56,6 +56,10 @@ test("iCloud backup configuration stays isolated by FrameBase user", async () =>
     await manager.recordTimeline("gabri", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }, years: [{ key: "2026", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }], quarters: [{ key: "2026-Q3", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }], months: [{ key: "2026-09", itemCount: 2, photoCount: 1, videoCount: 1, originalBytes: 6144 }] });
     assert.equal((await manager.readTimeline("gabri")).months[0].key, "2026-09");
     assert.equal((await manager.readTimeline("alice")).years.length, 0);
+    await manager.recordCompletedRanges("gabri", [{ key: "2026", label: "2026 年", start: "2026-01-01T00:00:00", end: "2026-12-31T23:59:59" }]);
+    await manager.recordCompletedRanges("gabri", [{ key: "2025-Q4", label: "2025 年第 4 季度", start: "2025-10-01T00:00:00", end: "2025-12-31T23:59:59" }, { key: "2026", label: "2026 年", start: "2026-01-01T00:00:00", end: "2026-12-31T23:59:59" }]);
+    assert.deepEqual((await manager.readBackupHistory("gabri")).completedRanges.map(item => item.key), ["2025-Q4", "2026"]);
+    assert.equal((await manager.readBackupHistory("alice")).completedRanges.length, 0);
 
     const gabriFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "gabri", "config.json"), "utf8"));
     const aliceFile = JSON.parse(await readFile(join(projectRoot, ".framebase-icloud", "alice", "config.json"), "utf8"));
@@ -119,11 +123,15 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /备份所选范围/);
   assert.match(page, /备份状态/);
   assert.match(page, /部分备份/);
+  assert.match(page, /mergeConfig\(current, data\)/);
+  assert.match(page, /config\?\.backupHistory\?\.completedRanges/);
   assert.match(page, /实时同步速率/);
   assert.match(page, /图片进度/);
   assert.match(page, /syncedPhotoCount/);
   assert.match(page, /transferRateBps/);
   assert.match(server, /readBackupCoverage/);
+  assert.match(server, /readBackupHistory/);
+  assert.match(server, /recordCompletedRanges/);
   assert.match(server, /resumingExisting \? previousState\.completedRanges/);
   assert.match(server, /onRangeComplete/);
   assert.match(page, /生成只读释放计划/);
