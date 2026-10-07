@@ -509,10 +509,14 @@ test("provider builds exact year, quarter, and month summaries from read-only in
         calls.push({ args, options });
         if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
         if (args.includes("--list-libraries")) return { stdout: "SharedSync\n", stderr: "" };
+        if (options?.env?.FRAMEBASE_INVENTORY_DIRECTION === "DESCENDING") return { stdout: [
+          'FRAMEBASE_INVENTORY_TOTAL {"count":3,"library":"SharedSync"}',
+          'FRAMEBASE_INVENTORY {"id":"c","created":"2023-12-04T10:00:00+08:00","mediaType":"photo","originalBytes":300,"livePhoto":false,"raw":true}',
+        ].join("\n"), stderr: "" };
         return { stdout: [
+          'FRAMEBASE_INVENTORY_TOTAL {"count":3,"library":"SharedSync"}',
           'FRAMEBASE_INVENTORY {"id":"a","created":"2024-03-02T10:00:00+08:00","mediaType":"photo","originalBytes":100,"livePhoto":true,"raw":false}',
           'FRAMEBASE_INVENTORY {"id":"b","created":"2024-04-03T10:00:00+08:00","mediaType":"video","originalBytes":200,"livePhoto":false,"raw":false}',
-          'FRAMEBASE_INVENTORY {"id":"c","created":"2023-12-04T10:00:00+08:00","mediaType":"photo","originalBytes":300,"livePhoto":false,"raw":true}',
         ].join("\n"), stderr: "" };
       },
     });
@@ -527,10 +531,38 @@ test("provider builds exact year, quarter, and month summaries from read-only in
     assert.equal(result.assets[0].library, "SharedSync");
     assert.ok(progress.some(update => update.phase === "discovering"));
     assert.ok(progress.some(update => update.phase === "reading" && update.libraryIndex === 1 && update.libraryCount === 1));
+    assert.ok(progress.some(update => update.message.includes("正在反向补全")));
     assert.ok(progress.some(update => update.phase === "completed" && update.itemCount === 3));
     const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1");
     assert.ok(inventoryCall.args.includes("--only-print-filenames"));
     assert.equal(inventoryCall.args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
+    assert.equal(calls.filter(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1").some(call => call.options.env.FRAMEBASE_INVENTORY_DIRECTION === "DESCENDING"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider refuses to replace a timeline when both inventory directions remain incomplete", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-provider-incomplete-timeline-"));
+  const executablePath = join(root, "icloudpd.exe");
+  try {
+    await writeFile(executablePath, "test");
+    const provider = createIcloudPdProvider({
+      executablePath,
+      runCommand: async (_executable, args, options) => {
+        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--list-libraries")) return { stdout: "", stderr: "" };
+        const id = options?.env?.FRAMEBASE_INVENTORY_DIRECTION === "DESCENDING" ? "b" : "a";
+        return { stdout: [
+          'FRAMEBASE_INVENTORY_TOTAL {"count":3,"library":"default"}',
+          `FRAMEBASE_INVENTORY {"id":"${id}","created":"2024-03-02T10:00:00+08:00","mediaType":"photo","originalBytes":100,"livePhoto":false,"raw":false}`,
+        ].join("\n"), stderr: "" };
+      },
+    });
+    const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") });
+    assert.equal(result.status, "incomplete");
+    assert.match(result.message, /2\/3/);
+    assert.equal(result.assets.length, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

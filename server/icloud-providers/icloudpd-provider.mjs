@@ -89,7 +89,9 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
   function runWithRuntimePassword(args, password, timeout = 120_000, signal, processOptions = {}) {
     return new Promise((resolve, reject) => {
       let child;
-      try { child = spawnProcess(executablePath, args, processOptions); }
+      const { maxOutput = 64_000, ...spawnOptions } = processOptions;
+      const safeMaxOutput = Math.min(128 * 1024 * 1024, Math.max(64_000, Number(maxOutput) || 64_000));
+      try { child = spawnProcess(executablePath, args, spawnOptions); }
       catch (error) { reject(error); return; }
       let output = "";
       let settled = false;
@@ -111,7 +113,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       if (signal?.aborted) { abort(); return; }
       signal?.addEventListener("abort", abort, { once: true });
       const observe = chunk => {
-        output = stripTerminalCodes(`${output}${String(chunk)}`).slice(-64_000);
+        output = stripTerminalCodes(`${output}${String(chunk)}`).slice(-safeMaxOutput);
         if (!passwordSent && /icloud password|password for/i.test(output)) {
           passwordSent = true;
           if (typeof child.write === "function") child.write(`${password}\r`);
@@ -618,9 +620,12 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--size", "original", "--live-photo-size", "original", "--align-raw", "original", "--only-print-filenames",
     ];
     const inventoryEnv = { ...process.env, FRAMEBASE_INVENTORY_JSON: "1" };
-    const runInventory = args => password
-      ? runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env: inventoryEnv })
-      : runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env: inventoryEnv });
+    const runInventory = (args, direction = "ASCENDING") => {
+      const env = { ...inventoryEnv, FRAMEBASE_INVENTORY_DIRECTION: direction };
+      return password
+        ? runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env, maxOutput: 128 * 1024 * 1024 })
+        : runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env });
+    };
     const empty = key => ({ key, photoCount: 0, videoCount: 0, livePhotoCount: 0, rawCount: 0, originalBytes: 0, itemCount: 0 });
     const increment = (map, key, item) => {
       const bucket = map.get(key) || empty(key);
@@ -640,6 +645,23 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const libraries = [...new Set(String(librariesResult.stdout || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
       const targets = libraries.length ? libraries.slice(0, 32) : [null];
       const itemsById = new Map();
+      const incompleteLibraries = [];
+      const parseInventory = (output, library) => {
+        let expectedCount = 0;
+        for (const line of String(output || "").split(/\r?\n/)) {
+          if (line.startsWith("FRAMEBASE_INVENTORY_TOTAL ")) {
+            try { expectedCount = Math.max(expectedCount, Number(JSON.parse(line.slice("FRAMEBASE_INVENTORY_TOTAL ".length))?.count) || 0); }
+            catch { /* Ignore malformed provider totals. */ }
+            continue;
+          }
+          if (!line.startsWith("FRAMEBASE_INVENTORY ")) continue;
+          try {
+            const item = JSON.parse(line.slice("FRAMEBASE_INVENTORY ".length));
+            if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, { ...item, library: library || "default" });
+          } catch { /* Ignore malformed provider output without exposing it. */ }
+        }
+        return expectedCount;
+      };
       for (let libraryOffset = 0; libraryOffset < targets.length; libraryOffset += 1) {
         const library = targets[libraryOffset];
         const libraryLabel = library || "主图库";
@@ -647,16 +669,24 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         const heartbeat = setInterval(() => report({ phase: "reading", message: `正在读取 ${libraryLabel}，iCloud 仍在返回数据…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size }), 1000);
         heartbeat.unref?.();
         let result;
-        try { result = await runInventory([...baseArgs, ...(library ? ["--library", library] : [])]); }
+        const inventoryArgs = [...baseArgs, ...(library ? ["--library", library] : [])];
+        try { result = await runInventory(inventoryArgs); }
         finally { clearInterval(heartbeat); }
-        for (const line of String(result.stdout || "").split(/\r?\n/)) {
-          if (!line.startsWith("FRAMEBASE_INVENTORY ")) continue;
-          try {
-            const item = JSON.parse(line.slice("FRAMEBASE_INVENTORY ".length));
-            if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, { ...item, library: library || "default" });
-          } catch { /* Ignore malformed provider output without exposing it. */ }
+        const libraryKeyPrefix = `${library || "default"}:`;
+        const expectedCount = parseInventory(result.stdout, library);
+        const firstPassCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+        if (expectedCount > firstPassCount) {
+          report({ phase: "reading", message: `${libraryLabel} 首轮返回 ${firstPassCount}/${expectedCount} 项，正在反向补全…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
+          const reverseResult = await runInventory(inventoryArgs, "DESCENDING");
+          parseInventory(reverseResult.stdout, library);
         }
+        const completedCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+        if (expectedCount > completedCount) incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount });
         report({ phase: "reading", message: `${libraryLabel} 已读取完成。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
+      }
+      if (incompleteLibraries.length) {
+        const missing = incompleteLibraries[0];
+        return { status: "incomplete", message: `Apple 本次只返回了“${missing.library}”的 ${missing.completedCount}/${missing.expectedCount} 项。已保留上次统计，请稍后重试。`, years: [], quarters: [], months: [], assets: [], providerInfo };
       }
       report({ phase: "aggregating", message: `正在汇总 ${itemsById.size} 个项目的时间信息…`, libraryIndex: targets.length, libraryCount: targets.length, itemCount: itemsById.size });
       const years = new Map(); const quarters = new Map(); const months = new Map();
