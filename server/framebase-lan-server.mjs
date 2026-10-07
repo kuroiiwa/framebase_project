@@ -1,17 +1,28 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { networkInterfaces } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createPowerManager, isLocalAdmin, validatePowerRequest } from "./framebase-power.mjs";
 import { createAccounts } from "./framebase-accounts.mjs";
 import { createIcloudManager } from "./framebase-icloud.mjs";
 import { createIcloudPdProvider } from "./icloud-providers/icloudpd-provider.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const runtimeStartedAt = new Date().toISOString();
+const runtimePackageVersion = (() => {
+  try { return String(JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8")).version || "unknown"); }
+  catch { return "unknown"; }
+})();
+const runtimeCommit = (() => {
+  const supplied = String(process.env.FRAMEBASE_GIT_COMMIT || "").trim();
+  if (supplied) return supplied.slice(0, 40);
+  try { return execFileSync("git", ["rev-parse", "--short=8", "HEAD"], { cwd: projectRoot, encoding: "utf8", timeout: 2000, windowsHide: true }).trim() || "unknown"; }
+  catch { return "unknown"; }
+})();
 const configPath = join(projectRoot, ".framebase-lan.json");
 const thumbnailDirectory = join(projectRoot, ".framebase-thumbnails");
 const accounts = createAccounts(join(projectRoot, ".framebase-accounts.json"));
@@ -64,6 +75,12 @@ function mobileSession(request) {
   const current = mobileSessions.get(token);
   if (!current || !accounts.hasSession(current.pcToken)) return null;
   return current;
+}
+
+function handleRuntimeVersion(request, response) {
+  if (!requirePc(request, response)) return;
+  if (request.method !== "GET") return json(response, 405, { error: "不支持的操作。" });
+  return json(response, 200, { app: "FrameBase", version: runtimePackageVersion, commit: runtimeCommit, startedAt: runtimeStartedAt, pid: process.pid, node: process.version });
 }
 
 async function handleAccount(request, response, url) {
@@ -787,6 +804,7 @@ function proxyToApp(request, response, attempt = 0) {
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    if (url.pathname === "/api/runtime/version") return handleRuntimeVersion(request, response);
     if (url.pathname.startsWith("/api/account/")) return await handleAccount(request, response, url);
     if (url.pathname.startsWith("/api/icloud/")) return await handleIcloud(request, response, url);
     if (url.pathname === "/api/lan/power" || url.pathname.startsWith("/api/lan/power/")) return await handlePower(request, response, url);

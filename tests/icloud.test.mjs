@@ -109,6 +109,9 @@ test("iCloud backup center remains a separate authenticated route", async () => 
     readFile(new URL("../server/framebase-lan-server.mjs", import.meta.url), "utf8"),
   ]);
   assert.match(page, /iCloud 备份中心/);
+  assert.match(page, /\/api\/runtime\/version/);
+  assert.match(page, /后端运行版本/);
+  assert.match(page, /未检测到运行版本/);
   assert.match(page, /<AccountGate>/);
   assert.match(page, /\/api\/icloud\/pick-folder/);
   assert.match(page, /\/api\/icloud\/connection/);
@@ -130,6 +133,10 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /syncedPhotoCount/);
   assert.match(page, /transferRateBps/);
   assert.match(server, /readBackupCoverage/);
+  assert.match(server, /runtimeStartedAt/);
+  assert.match(server, /git", \["rev-parse", "--short=8", "HEAD"\]/);
+  assert.match(server, /url\.pathname === "\/api\/runtime\/version"/);
+  assert.match(server, /pid: process\.pid/);
   assert.match(server, /readBackupHistory/);
   assert.match(server, /recordCompletedRanges/);
   assert.match(server, /resumingExisting \? previousState\.completedRanges/);
@@ -139,6 +146,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /视频库与独立图片库按格式隔离管理/);
   assert.match(page, /← 返回视频库/);
   assert.match(styles, /\.topbar \.backLink\{[^}]*display:inline-flex;align-items:center;justify-content:center/);
+  assert.match(styles, /\.runtimeVersion\{/);
   assert.match(lanPage, /← 返回视频库/);
   assert.match(server, /requirePc\(request, response\)/);
   assert.match(server, /icloud\.configureBackupDirectory\(current\.username/);

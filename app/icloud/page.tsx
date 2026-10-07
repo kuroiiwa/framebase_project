@@ -47,6 +47,7 @@ type BackupRange = { key: string; label: string; start: string; end: string };
 type TimelineGranularity = "years" | "quarters" | "months";
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
+type RuntimeVersion = { app: "FrameBase"; version: string; commit: string; startedAt: string; pid: number; node: string };
 const activeAuthStates = new Set<AuthState["status"]>(["starting", "waiting_password", "verifying", "waiting_mfa"]);
 
 function mergeConfig(current: IcloudConfig | null, update: IcloudConfig) {
@@ -71,6 +72,8 @@ function IcloudCenter({ username }: { username: string }) {
   const [selectedPeriods, setSelectedPeriods] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [runtimeVersion, setRuntimeVersion] = useState<RuntimeVersion | null>(null);
+  const [runtimeVersionUnavailable, setRuntimeVersionUnavailable] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,6 +91,15 @@ function IcloudCenter({ username }: { username: string }) {
         setIcloudDomain(data.icloudDomain || "cn");
       })
       .catch(reason => { if (!cancelled) setError(reason instanceof Error ? reason.message : "无法读取配置"); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/runtime/version", { cache: "no-store" }).then(async response => {
+      if (!response.ok) throw new Error("runtime-version-unavailable");
+      return response.json() as Promise<RuntimeVersion>;
+    }).then(data => { if (!cancelled) setRuntimeVersion(data); }).catch(() => { if (!cancelled) setRuntimeVersionUnavailable(true); });
     return () => { cancelled = true; };
   }, []);
 
@@ -338,6 +350,8 @@ function IcloudCenter({ username }: { username: string }) {
       <h1>把 iCloud 原片安全保存到这台电脑</h1>
       <span>每个 FrameBase 用户拥有独立的目录、认证会话、任务和清单。FrameBase 通过可替换 Provider 调用 icloudpd，不保存 Apple 密码。</span>
     </section>
+
+    <aside className={`${styles.runtimeVersion} ${runtimeVersionUnavailable ? styles.runtimeVersionOld : ""}`} aria-live="polite">{runtimeVersion ? <><strong>后端运行版本 <code>{runtimeVersion.commit !== "unknown" ? runtimeVersion.commit : `v${runtimeVersion.version}`}</code></strong><span>启动于 {new Date(runtimeVersion.startedAt).toLocaleString("zh-CN")} · PID {runtimeVersion.pid} · Node {runtimeVersion.node}</span></> : runtimeVersionUnavailable ? <><strong>未检测到运行版本</strong><span>当前后端可能仍是旧进程；新版后端启动后会在这里显示提交号和启动时间。</span></> : <><strong>正在读取后端运行版本…</strong><span>用于确认 iCloud 任务是否由最新进程执行。</span></>}</aside>
 
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {message && <div className={styles.notice} role="status">{message}<button onClick={() => setMessage("")}>×</button></div>}
