@@ -11,6 +11,7 @@ import { createAccounts } from "./framebase-accounts.mjs";
 import { createIcloudManager } from "./framebase-icloud.mjs";
 import { createIcloudPdProvider } from "./icloud-providers/icloudpd-provider.mjs";
 import { createRecycleBin } from "./framebase-recycle-bin.mjs";
+import { preparePhotoRecycle } from "./framebase-photo-recycle.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeStartedAt = new Date().toISOString();
@@ -441,6 +442,27 @@ async function handleFolderPicker(request, response) {
   return json(response, 200, selectedPath ? { path: selectedPath } : { cancelled: true });
 }
 
+async function handlePhotoRecycle(request, response) {
+  const current = requirePc(request, response);
+  if (!current) return;
+  if (request.method !== "POST") return json(response, 405, { error: "不支持的操作。" });
+  if (request.headers.origin !== 'http://' + request.headers.host) return json(response, 403, { error: "请从 FrameBase 图片库发起操作。" });
+  if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username) || icloud.readReleaseProgress(current.username).status === "running") return json(response, 409, { error: "备份或复核运行时不能删除本地原片。" });
+  const body = await readJsonBody(request);
+  if (body.confirmation !== "移入本地回收站") return json(response, 400, { error: "请确认移入本地回收站。" });
+  const name = typeof body.sourceName === "string" ? body.sourceName.trim().slice(0, 160) : "";
+  if (!name) return json(response, 400, { error: "图片来源无效。" });
+  const selectedPath = await pickWindowsFolder(name);
+  if (!selectedPath) return json(response, 200, { cancelled: true });
+  if (basename(selectedPath).toLowerCase() !== name.toLowerCase()) return json(response, 409, { error: "请选择当前图片所属的来源文件夹。" });
+  const plan = await preparePhotoRecycle(selectedPath, body.files);
+  // Recheck after the native folder dialog, during which another task may start.
+  if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username) || icloud.readReleaseProgress(current.username).status === "running") return json(response, 409, { error: "备份或复核正在运行，请结束后再删除。" });
+  const recycleResult = await recycleBin.recycle(plan.files);
+  await icloud.recordLocalPhotoRecycle(current.username, plan.files, recycleResult);
+  return json(response, 200, { recycleResult });
+}
+
 async function handleIcloud(request, response, url) {
   const current = requirePc(request, response);
   if (!current) return;
@@ -465,6 +487,7 @@ async function handleIcloud(request, response, url) {
       fullBackup,
       fullManifest: { updatedAt: backupCoverage.updatedAt, fileCount: backupCoverage.fileCount, coverage: { years: backupCoverage.years, quarters: backupCoverage.quarters, months: backupCoverage.months } },
       releasePlan,
+      releaseProgress: await icloud.restoreReleaseProgress(current.username),
       releaseHistory,
       providerInfo: { id: providerInfo.id, available: providerInfo.available, version: providerInfo.version },
     });
@@ -654,7 +677,13 @@ async function handleIcloud(request, response, url) {
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/release/plan") {
     if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "备份任务运行时不能生成释放计划。" });
-    return json(response, 200, { releasePlan: await icloud.createReleasePlan(current.username) });
+    if (icloud.readReleaseProgress(current.username).status === "running") return json(response, 409, { error: "释放计划正在复核，请等待当前任务完成。" });
+    void icloud.createReleasePlan(current.username).catch(() => undefined);
+    return json(response, 202, { releaseProgress: icloud.readReleaseProgress(current.username) });
+  }
+  if (request.method === "GET" && url.pathname === "/api/icloud/release/status") {
+    const releaseProgress = await icloud.restoreReleaseProgress(current.username);
+    return json(response, 200, { releaseProgress, releasePlan: releaseProgress.status === "completed" ? await icloud.readReleasePlan(current.username) : null });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/release/confirm") {
     const body = await readJsonBody(request);
@@ -897,6 +926,7 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
     if (url.pathname === "/api/runtime/version") return handleRuntimeVersion(request, response);
     if (url.pathname.startsWith("/api/account/")) return await handleAccount(request, response, url);
+    if (url.pathname === "/api/photos/recycle") return await handlePhotoRecycle(request, response);
     if (url.pathname.startsWith("/api/icloud/")) return await handleIcloud(request, response, url);
     if (url.pathname === "/api/lan/power" || url.pathname.startsWith("/api/lan/power/")) return await handlePower(request, response, url);
     if (url.pathname === "/api/lan/config" || url.pathname === "/api/lan/rescan" || url.pathname === "/api/lan/pairing-code") return await handleConfig(request, response, url);

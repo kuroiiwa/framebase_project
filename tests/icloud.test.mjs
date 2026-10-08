@@ -6,6 +6,37 @@ import { join } from "node:path";
 import test from "node:test";
 import { createIcloudManager } from "../server/framebase-icloud.mjs";
 
+test("confirmed release catalogs retain every matched asset beyond the first 500", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "framebase-large-release-"));
+  try {
+    const directory = join(projectRoot, ".framebase-icloud", "alice");
+    await mkdir(directory, { recursive: true });
+    const assets = Array.from({ length: 601 }, (_, index) => ({ id: String(index), library: "default", name: `IMG_${index}.HEIC`, created: "2023-12-31T10:00:00+08:00", mediaType: "photo", mainBytes: 100, originalBytes: 100, localFiles: [`2023/12/31/IMG_${index}.HEIC`] }));
+    await writeFile(join(directory, "release-plan.json"), JSON.stringify({ status: "confirmed", assets }));
+    const plan = await createIcloudManager({ projectRoot }).readReleasePlan("alice");
+    assert.equal(plan.assets.length, 601);
+    assert.equal(plan.assets[600].id, "600");
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
+test("release summary distinguishes Live Photo files from cloud projects and unmatched originals", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "framebase-release-summary-"));
+  try {
+    const directory = join(projectRoot, ".framebase-icloud", "alice");
+    await mkdir(directory, { recursive: true });
+    const files = ["one.heic", "one.mov", "other.jpg"].map(name => ({ name, relativePath: "2023/12/" + name, size: 100, sha256: "a".repeat(64), extension: name.split(".").pop(), mediaType: name.endsWith("mov") ? "video" : "photo" }));
+    const asset = { id: "live", library: "default", name: "one.heic", created: "2023-12-01T00:00:00+08:00", mediaType: "photo", mainBytes: 100, originalBytes: 200, livePhotoBytes: 100, livePhoto: true, localFiles: [files[0].relativePath, files[1].relativePath] };
+    await writeFile(join(directory, "release-plan.json"), JSON.stringify({ status: "confirmed", eligibleCount: 3, files, assets: [asset] }));
+    const plan = await createIcloudManager({ projectRoot }).readReleasePlan("alice");
+    assert.equal(plan.matchedAssetCount, 1);
+    assert.equal(plan.matchedLocalFileCount, 2);
+    assert.equal(plan.unmatchedLocalFileCount, 1);
+    assert.equal(plan.livePhotoAssetCount, 1);
+    assert.equal(plan.unmatchedFiles[0].name, "other.jpg");
+    assert.equal(plan.eligibleCount, plan.matchedLocalFileCount + plan.unmatchedLocalFileCount);
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
 test("iCloud backup configuration stays isolated by FrameBase user", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "framebase-icloud-project-"));
   const selectedRoot = await mkdtemp(join(tmpdir(), "framebase-icloud-backup-"));
@@ -92,12 +123,31 @@ test("capacity release plan trusts a persisted manifest even when the recovered 
     await manager.writeFullBackup("alice", { status: "paused", phase: "paused", message: "service restarted", manifestFileCount: 1 });
     const cloudAsset = { id: "asset-1", library: "default", name: "IMG_0001.HEIC", created: "2026-09-12T10:00:00+08:00", mediaType: "photo", extension: "heic", originalBytes: 17, mainBytes: 17, livePhotoBytes: 0, livePhoto: false, raw: false };
     await manager.recordTimeline("alice", { scannedAt: new Date().toISOString(), total: { key: "total", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }, years: [{ key: "2026", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }], quarters: [{ key: "2026-Q3", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }], months: [{ key: "2026-09", itemCount: 1, photoCount: 1, videoCount: 0, originalBytes: 17 }], assets: [cloudAsset] });
-    const ready = await manager.createReleasePlan("alice");
+    const task = manager.createReleasePlan("alice");
+    assert.equal(manager.readReleaseProgress("alice").status, "running");
+    assert.equal(manager.readReleaseProgress("bob").status, "idle");
+    await assert.rejects(manager.createReleasePlan("alice"), { status: 409 });
+    const ready = await task;
+    assert.equal(manager.readReleaseProgress("alice").status, "completed");
+    assert.equal(manager.readReleaseProgress("alice").checked, 1);
+    assert.equal(manager.readReleaseProgress("alice").readBytes, 17);
+    assert.equal(manager.readReleaseProgress("alice").totalBytes, 17);
+    const reloaded = createIcloudManager({ projectRoot });
+    assert.equal((await reloaded.restoreReleaseProgress("alice")).checked, 1);
+    assert.equal((await reloaded.restoreReleaseProgress("alice")).status, "completed");
+    assert.equal((await reloaded.restoreReleaseProgress("bob")).status, "idle");
+    await writeFile(join(projectRoot, ".framebase-icloud", "alice", "release-progress.json"), JSON.stringify({ status: "running", checked: 1, total: 2, readBytes: 17 }));
+    const interrupted = await reloaded.restoreReleaseProgress("alice");
+    assert.equal(interrupted.status, "failed");
+    assert.equal(interrupted.checked, 1);
+    assert.equal(interrupted.readBytes, 17);
+    assert.match(interrupted.message, /服务曾在复核期间停止/);
     assert.equal(ready.status, "ready");
     assert.equal(ready.eligibleCount, 1);
     assert.equal(ready.assets.length, 1);
     await assert.rejects(manager.confirmReleasePlan("alice", ready.id, "错误文字"), { status: 400 });
-    const confirmed = await manager.confirmReleasePlan("alice", ready.id, "确认本地备份完整");
+    await assert.rejects(manager.confirmReleasePlan("alice", ready.id, false), { status: 400 });
+    const confirmed = await manager.confirmReleasePlan("alice", ready.id, true);
     assert.equal(confirmed.status, "confirmed");
     const localRecycle = await manager.prepareLocalRecycle("alice", [cloudAsset]);
     assert.equal(localRecycle.fileCount, 1);
@@ -108,6 +158,8 @@ test("capacity release plan trusts a persisted manifest even when the recovered 
     assert.equal(history.recycledFileCount, 1);
     assert.equal(history.recycledBytes, 17);
     assert.equal((await manager.readReleasePlan("alice")).assets.length, 0);
+    assert.equal((await manager.readReleasePlan("alice")).eligibleCount, 0);
+    assert.equal((await manager.readReleasePlan("alice")).eligibleBytes, 0);
     assert.equal((await manager.recordReleasedAssets("alice", [cloudAsset], { results: [{ id: "asset-1", library: "default", status: "deleted", bytes: 17 }] })).movedCount, 1);
     assert.ok((await manager.readTimeline("alice")).staleAt);
     assert.equal((await manager.readTimeline("alice")).total.itemCount, 0);
@@ -118,6 +170,18 @@ test("capacity release plan trusts a persisted manifest even when the recovered 
     const blocked = await manager.createReleasePlan("alice");
     assert.equal(blocked.status, "blocked");
     assert.equal(blocked.failedCount, 1);
+    assert.equal(manager.readReleaseProgress("alice").failed, 1);
+    await assert.rejects(manager.createReleasePlan("bob"), { status: 409 });
+    assert.equal(manager.readReleaseProgress("bob").status, "failed");
+    await writeFile(localPath, "verified-original");
+    const localPlan = await manager.createReleasePlan("alice");
+    await manager.confirmReleasePlan("alice", localPlan.id, "确认本地备份完整");
+    await manager.recordLocalPhotoRecycle("alice", [{ path: localPath, relativePath, size: 17 }], { results: [{ relativePath, status: "failed" }] });
+    assert.equal((await manager.readReleasePlan("alice")).status, "confirmed");
+    await manager.recordLocalPhotoRecycle("alice", [{ path: localPath, relativePath, size: 17 }], { results: [{ relativePath, status: "recycled" }] });
+    assert.equal((await manager.readFullManifest("alice")).files.length, 0);
+    assert.equal((await manager.readReleasePlan("alice")).status, "blocked");
+    assert.equal((await manager.readTimeline("alice")).total.itemCount, 1);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
     await rm(selectedRoot, { recursive: true, force: true });

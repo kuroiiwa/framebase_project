@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { findPhotoCloudAsset } from "../app/photos/cloud-match.ts";
+
+test("confirmed cloud photos match backup paths independently of local download dates", () => {
+  const asset = { id: "photo-1", name: "IMG_2548.HEIC", mediaType: "photo", mainBytes: 100, localFiles: ["2023/12/31/IMG_2548.HEIC"] };
+  const plan = { status: "confirmed", assets: [asset] };
+  const item = { name: asset.name, path: asset.localFiles[0], size: 100, sourceName: "zhang", modified: Date.now() };
+  assert.equal(findPhotoCloudAsset(item, plan), asset);
+  assert.equal(findPhotoCloudAsset({ ...item, sourceName: "2023", path: "12/31/IMG_2548.HEIC" }, plan), asset);
+  assert.equal(findPhotoCloudAsset({ ...item, sourceName: "12", path: "31/IMG_2548.HEIC" }, plan), asset);
+  assert.equal(findPhotoCloudAsset({ ...item, sourceName: "FrameBase-iCloud", path: "zhang/2023/12/31/IMG_2548.HEIC" }, plan, "E:\\FrameBase-iCloud\\zhang"), asset);
+  assert.equal(findPhotoCloudAsset({ ...item, path: "2024/12/31/IMG_2548.HEIC" }, plan), null);
+  assert.equal(findPhotoCloudAsset({ ...item, size: 101 }, plan), null);
+  assert.equal(findPhotoCloudAsset(item, { ...plan, status: "ready" }), null);
+  assert.equal(findPhotoCloudAsset(item, { ...plan, assets: [asset, { ...asset, id: "ambiguous" }] }), null);
+});
 
 test("photo library remains isolated from the existing video library", async () => {
   const [photos, photoStyles, icloud, videos, accountGate, globalStyles] = await Promise.all([

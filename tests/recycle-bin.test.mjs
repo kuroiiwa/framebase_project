@@ -1,6 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createRecycleBin } from "../server/framebase-recycle-bin.mjs";
+import { preparePhotoRecycle } from "../server/framebase-photo-recycle.mjs";
+import { createHash } from "node:crypto";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+test("single-photo recycle verifies exact local content and rejects paths outside the selected source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-photo-recycle-"));
+  try {
+    await writeFile(join(root, "one.jpg"), "image");
+    await writeFile(join(root, "one.mov"), "video");
+    const image = { relativePath: "one.jpg", size: 5, sha256: createHash("sha256").update("image").digest("hex") };
+    const video = { relativePath: "one.mov", size: 5, sha256: createHash("sha256").update("video").digest("hex") };
+    assert.equal((await preparePhotoRecycle(root, [image])).fileCount, 1);
+    assert.equal((await preparePhotoRecycle(root, [image, video])).bytes, 10);
+    await assert.rejects(preparePhotoRecycle(root, [{ ...image, relativePath: "../one.jpg" }]), /路径超出/);
+    await assert.rejects(preparePhotoRecycle(root, [{ ...image, relativePath: join(root, "..", "one.jpg") }]), /路径超出/);
+    await assert.rejects(preparePhotoRecycle(root, [image, { ...video, relativePath: "other.mov" }]), /不匹配/);
+    await assert.rejects(preparePhotoRecycle(root, [{ ...image, relativePath: "script.exe" }]), /仅允许删除图片/);
+    await writeFile(join(root, "one.jpg"), "other");
+    await assert.rejects(preparePhotoRecycle(root, [image]), /文件与当前图片不一致/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("Windows recycle adapter passes exact paths through the child environment", async () => {
   const calls = [];

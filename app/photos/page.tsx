@@ -7,6 +7,7 @@ import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
 import ThemeSelector from "../theme-selector";
 import styles from "./photos.module.css";
+import { findPhotoCloudAsset } from "./cloud-match";
 
 type FsPermission = "granted" | "denied" | "prompt";
 type FileHandle = { kind: "file"; name: string; getFile(): Promise<File> };
@@ -358,7 +359,7 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
   </button>;
 }
 
-function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void }) {
+function PhotoViewer({ item, previous, next, onClose, onDelete, cloudAvailable, cloudLoading, cloudMessage, releaseBusy }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void; onDelete: (mode: "local" | "icloud" | "both") => void; cloudAvailable: boolean; cloudLoading: boolean; cloudMessage: string; releaseBusy: boolean }) {
   const [initialUrl] = useState<string | null>(() => {
     const thumbnail = readThumbnailCache(item);
     return thumbnail ? URL.createObjectURL(thumbnail) : null;
@@ -368,6 +369,22 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   const [playingLive, setPlayingLive] = useState(false);
   const [liveUrl, setLiveUrl] = useState<string | null>(null);
   const [liveFailed, setLiveFailed] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const mediaRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const changeZoom = (factor: number) => setZoom(value => Math.min(8, Math.max(1, value * factor)));
+  const fitImage = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+  useEffect(() => {
+    const media = mediaRef.current;
+    if (!media || playingLive) return;
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault();
+      setZoom(value => Math.min(8, Math.max(1, value * (event.deltaY < 0 ? 1.15 : 1 / 1.15))));
+    };
+    media.addEventListener("wheel", wheel, { passive: false });
+    return () => media.removeEventListener("wheel", wheel);
+  }, [playingLive]);
   useEffect(() => {
     let cancelled = false;
     let objectUrl = "";
@@ -396,7 +413,11 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   useEffect(() => () => { if (liveUrl) URL.revokeObjectURL(liveUrl); }, [liveUrl]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
+      if (document.querySelector("dialog[open]")) return;
       if (event.key === "Escape") onClose();
+      if (event.key === "+" || event.key === "=") setZoom(value => Math.min(8, value * 1.25));
+      if (event.key === "-") setZoom(value => Math.max(1, value / 1.25));
+      if (event.key === "0") { setZoom(1); setPan({ x: 0, y: 0 }); }
       if (event.key === "ArrowLeft") previous();
       if (event.key === "ArrowRight") next();
     };
@@ -406,8 +427,21 @@ function PhotoViewer({ item, previous, next, onClose }: { item: PhotoItem; previ
   return <div className={styles.viewer} role="dialog" aria-modal="true" aria-label={item.name}>
     <button className={styles.viewerClose} onClick={onClose} aria-label="关闭">×</button>
     <button className={styles.viewerPrevious} onClick={previous} aria-label="上一张">‹</button>
-    <figure><div className={styles.viewerMedia}>{playingLive && liveUrl ? <video src={liveUrl} controls autoPlay playsInline preload="metadata" aria-label={`${item.name} 实况视频`} onError={() => { setLiveFailed(true); setPlayingLive(false); }} onEnded={() => setPlayingLive(false)} /> : url && !failed ? <img src={url} alt={item.name} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}{item.liveVideo && <button className={styles.liveToggle} onClick={() => { setLiveFailed(false); setPlayingLive(value => !value); }}>{playingLive ? liveUrl ? "显示照片" : "正在读取实况…" : "▶ 播放实况"}</button>}{liveFailed && <span className={styles.liveError}>实况视频无法播放，请检查 Windows HEVC 解码支持。</span>}</div><figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}{item.liveVideo ? ` · 实况 ${item.liveVideo.name}` : ""}</span></figcaption></figure>
+    <figure><div ref={mediaRef} className={styles.viewerMedia} style={{ cursor: zoom > 1 && !playingLive ? "grab" : "default" }} onPointerDown={event => {
+      if (zoom <= 1 || playingLive || (event.target as HTMLElement).closest("button,video")) return;
+      dragRef.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }} onPointerMove={event => { const drag = dragRef.current; if (drag) setPan({ x: drag.panX + event.clientX - drag.x, y: drag.panY + event.clientY - drag.y }); }} onPointerUp={() => { dragRef.current = null; }} onPointerCancel={() => { dragRef.current = null; }}>
+      {playingLive && liveUrl ? <video src={liveUrl} controls autoPlay playsInline preload="metadata" aria-label={item.name + " 实况视频"} onError={() => { setLiveFailed(true); setPlayingLive(false); }} onEnded={() => setPlayingLive(false)} /> : url && !failed ? <img src={url} alt={item.name} draggable={false} style={{ transform: "translate(" + (zoom === 1 ? 0 : pan.x) + "px," + (zoom === 1 ? 0 : pan.y) + "px) scale(" + zoom + ")" }} onDoubleClick={() => { if (zoom > 1) fitImage(); else setZoom(2); }} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}
+      {item.liveVideo && <button className={styles.liveToggle} onClick={() => { setLiveFailed(false); setPlayingLive(value => !value); }}>{playingLive ? liveUrl ? "显示照片" : "正在读取实况…" : "▶ 播放实况"}</button>}
+      {liveFailed && <span className={styles.liveError}>实况视频无法播放，请检查 Windows HEVC 解码支持。</span>}
+    </div><figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}{item.liveVideo ? " · 实况 " + item.liveVideo.name : ""}</span></figcaption></figure>
     <button className={styles.viewerNext} onClick={next} aria-label="下一张">›</button>
+    <aside className={styles.viewerSidebar} aria-label="图片操作">
+      <h2>图片操作</h2><p>{item.name}</p>
+      <section><h3>缩放</h3><div className={styles.zoomControls}><button disabled={playingLive || zoom <= 1} onClick={() => changeZoom(1 / 1.25)} aria-label="缩小">−</button><output>{Math.round(zoom * 100)}%</output><button disabled={playingLive || zoom >= 8} onClick={() => changeZoom(1.25)} aria-label="放大">＋</button></div><button disabled={playingLive} onClick={fitImage}>适应窗口</button><small>滚轮缩放 · 双击放大/复位 · 放大后拖动<br />键盘 + / − 缩放，0 复位</small></section>
+      <section><h3>删除范围</h3><button disabled={releaseBusy} onClick={() => onDelete("local")}>仅删除本地</button><button disabled={releaseBusy || cloudLoading || !cloudAvailable} onClick={() => onDelete("icloud")}>仅删除 iCloud</button><button disabled={releaseBusy || cloudLoading || !cloudAvailable} onClick={() => onDelete("both")}>两边都删除</button><small>本地移入 Windows 回收站，云端移入“最近删除”。{item.liveVideo ? "包含配对实况视频。" : ""}</small><p className={styles.viewerCloudStatus}>{cloudLoading ? "正在读取云端匹配状态…" : cloudAvailable ? "此图片已完成精确云端匹配。" : cloudMessage}</p></section>
+    </aside>
   </div>;
 }
 
@@ -433,6 +467,11 @@ function PhotoLibrary({ username }: { username: string }) {
   const [viewerId, setViewerId] = useState<string | null>(null);
   const [icloudBackupDirectory, setIcloudBackupDirectory] = useState<string | null>(null);
   const [releaseCatalog, setReleaseCatalog] = useState<ReleaseCatalog | null>(null);
+  const [releaseCatalogLoading, setReleaseCatalogLoading] = useState(false);
+  const [releaseCatalogError, setReleaseCatalogError] = useState("");
+  const [deleteItem, setDeleteItem] = useState<PhotoItem | null>(null);
+  const [deleteMode, setDeleteMode] = useState<"local" | "icloud" | "both">("local");
+  const deleteDialogRef = useRef<HTMLDialogElement>(null);
   const [releasingAsset, setReleasingAsset] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -477,27 +516,82 @@ function PhotoLibrary({ username }: { username: string }) {
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    void Promise.all([
-      fetch("/api/icloud/config", { cache: "no-store" }).then(response => response.ok ? response.json() as Promise<{ backupDirectory?: string | null }> : null),
-      fetch("/api/icloud/release/catalog", { cache: "no-store" }).then(response => response.ok ? response.json() as Promise<ReleaseCatalog> : null),
-    ]).then(([config, catalog]) => { setIcloudBackupDirectory(config?.backupDirectory || null); setReleaseCatalog(catalog); }).catch(() => undefined);
+  const refreshReleaseCatalog = useCallback(async () => {
+    setReleaseCatalogLoading(true);
+    try {
+      const response = await fetch("/api/icloud/release/catalog", { cache: "no-store" });
+      if (!response.ok) throw new Error("无法读取云端释放计划，请刷新后重试。");
+      setReleaseCatalog(await response.json() as ReleaseCatalog);
+      setReleaseCatalogError("");
+    } catch (reason) { setReleaseCatalogError(reason instanceof Error ? reason.message : "无法读取释放计划。"); }
+    finally { setReleaseCatalogLoading(false); }
   }, []);
 
-  const cloudAssetFor = useCallback((item: PhotoItem) => {
-    const normalizedPath = item.path.replaceAll("\\", "/").toLocaleLowerCase();
-    const candidates = releaseCatalog?.releasePlan?.status === "confirmed" ? releaseCatalog.releasePlan.assets.filter(asset => asset.mediaType === "photo" && asset.name.toLocaleLowerCase() === item.name.toLocaleLowerCase() && asset.mainBytes === item.size && asset.localFiles.some(path => path.replaceAll("\\", "/").toLocaleLowerCase() === normalizedPath)) : [];
-    if (!candidates || candidates.length !== 1) return null;
-    const created = new Date(candidates[0].created);
-    const modified = new Date(item.modified);
-    return created.getFullYear() === modified.getFullYear() && created.getMonth() === modified.getMonth() ? candidates[0] : null;
-  }, [releaseCatalog]);
+  useEffect(() => {
+    void fetch("/api/icloud/config", { cache: "no-store" }).then(response => response.ok ? response.json() as Promise<{ backupDirectory?: string | null }> : null).then(config => setIcloudBackupDirectory(config?.backupDirectory || null)).catch(() => undefined);
+    queueMicrotask(() => void refreshReleaseCatalog());
+    const refresh = () => { void refreshReleaseCatalog(); };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [refreshReleaseCatalog]);
 
-  async function releaseFromIcloud(item: PhotoItem, asset: IcloudAsset) {
+  const cloudAssetFor = useCallback((item: PhotoItem) => findPhotoCloudAsset(item, releaseCatalog?.releasePlan, icloudBackupDirectory), [releaseCatalog, icloudBackupDirectory]);
+
+  useEffect(() => {
+    if (deleteItem && !deleteDialogRef.current?.open) deleteDialogRef.current?.showModal();
+  }, [deleteItem]);
+
+  async function removeRecycledPhoto(item: PhotoItem) {
+    const nextPhotos = photos.filter(photo => photo.id !== item.id);
+    const nextSources = sources.map(source => source.id === item.sourceId ? { ...source, photoCount: Math.max(0, source.photoCount - 1), totalSize: Math.max(0, source.totalSize - item.size) } : source);
+    setPhotos(nextPhotos); setSources(nextSources);
+    if (viewerId === item.id) setViewerId(null);
+    await Promise.all([dbSet('photo-library:' + item.sourceId, nextPhotos.filter(photo => photo.sourceId === item.sourceId)), dbSet(SOURCES_KEY, nextSources)]);
+  }
+
+  async function recycleLocalPhoto(item: PhotoItem) {
+    setReleasingAsset(item.id); setError(""); setNotice("");
+    try {
+      if (!window.confirm('将“' + item.name + '”' + (item.liveVideo ? '及其配对实况视频' : '') + '移入 Windows 回收站？iCloud 内容会保留。接下来请选择图片来源文件夹“' + item.sourceName + '”。')) return;
+      const entries = [{ relativePath: item.path, handle: item.handle }, ...(item.liveVideo ? [{ relativePath: item.liveVideo.path, handle: item.liveVideo.handle }] : [])];
+      const files = await Promise.all(entries.map(async entry => {
+        const file = await entry.handle.getFile();
+        const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+        return { relativePath: entry.relativePath, size: file.size, sha256: Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("") };
+      }));
+      const response = await fetch("/api/photos/recycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceName: item.sourceName, files, confirmation: "移入本地回收站" }) });
+      const data = await response.json() as { cancelled?: boolean; recycleResult?: { status: string; message: string; results: Array<{ relativePath: string; status: string }> }; error?: string };
+      if (data.cancelled) return;
+      if (!response.ok || !data.recycleResult) throw new Error(data.error || "本地删除失败。");
+      if (data.recycleResult.results.some(result => result.relativePath === item.path && result.status === "recycled")) await removeRecycledPhoto(item);
+      else if (item.liveVideo && data.recycleResult.results.some(result => result.relativePath === item.liveVideo?.path && result.status === "recycled")) {
+        const next = photos.map(photo => photo.id === item.id ? { ...photo, liveVideo: null } : photo);
+        setPhotos(next); await dbSet('photo-library:' + item.sourceId, next.filter(photo => photo.sourceId === item.sourceId));
+      }
+      const catalogResponse = await fetch("/api/icloud/release/catalog", { cache: "no-store" }).catch(() => null);
+      if (catalogResponse?.ok) setReleaseCatalog(await catalogResponse.json() as ReleaseCatalog);
+      if (data.recycleResult.status === "recycled") setNotice(data.recycleResult.message + " iCloud 内容已保留。");
+      else setError(data.recycleResult.message + " iCloud 内容已保留。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "本地删除失败。"); }
+    finally { setReleasingAsset(null); }
+  }
+
+  async function deleteSelectedPhoto() {
+    if (!deleteItem || releasingAsset !== null) return;
+    const item = deleteItem;
+    if (deleteMode === "local") await recycleLocalPhoto(item);
+    else {
+      const asset = cloudAssetFor(item);
+      if (!asset) { setError("请先在 iCloud 备份中心完成释放计划复核和确认。"); return; }
+      await releaseFromIcloud(item, asset, deleteMode === "both");
+    }
+    setDeleteItem(null);
+  }
+
+  async function releaseFromIcloud(item: PhotoItem, asset: IcloudAsset, recycleLocal: boolean) {
     const key = `${asset.library}:${asset.id}`;
     setReleasingAsset(key); setError(""); setNotice("");
     try {
-      const recycleLocal = window.confirm("是否同时把本地备份移入 Windows 回收站？\n\n确定：云端和本地同时清理\n取消：只清理 iCloud，保留本地文件");
       const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], recycleLocal }) });
       const preview = await previewResponse.json() as { releaseResult?: { status: string; bytes: number }; localRecyclePlan?: { fileCount: number; bytes: number }; error?: string };
       if (!previewResponse.ok || preview.releaseResult?.status !== "matched") throw new Error(preview.error || "云端项目复核失败，没有执行删除。");
@@ -506,15 +600,13 @@ function PhotoLibrary({ username }: { username: string }) {
       if (confirmation === null) return;
       if (confirmation !== "移入最近删除") throw new Error("确认文字不正确，没有执行删除。");
       const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation, recycleLocal }) });
-      const data = await response.json() as { releaseResult?: { status: string; message: string; bytes: number }; recycleResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
+      const data = await response.json() as { releaseResult?: { status: string; message: string; bytes: number }; recycleResult?: { status: string; message: string; results: Array<{ relativePath: string; status: string }> }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
       if (!response.ok || data.releaseResult?.status !== "deleted") throw new Error(data.error || data.releaseResult?.message || "iCloud 删除失败。");
       setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
-      if (data.recycleResult?.status === "recycled") {
-        const nextPhotos = photos.filter(photo => photo.id !== item.id);
-        const nextSources = sources.map(source => source.id === item.sourceId ? { ...source, photoCount: Math.max(0, source.photoCount - 1), totalSize: Math.max(0, source.totalSize - item.size) } : source);
-        setPhotos(nextPhotos); setSources(nextSources);
-        await Promise.all([dbSet(`photo-library:${item.sourceId}`, nextPhotos.filter(photo => photo.sourceId === item.sourceId)), dbSet(SOURCES_KEY, nextSources)]);
+      if (data.recycleResult?.results?.some(result => result.status === "recycled" && result.relativePath.replaceAll("\\", "/").split("/").pop()?.toLowerCase() === item.name.toLowerCase())) {
+        await removeRecycledPhoto(item);
       }
+      if (data.recycleResult && data.recycleResult.status !== "recycled") setError("iCloud 删除已成功。" + data.recycleResult.message);
       setNotice(data.recycleResult ? `“${item.name}”已移入 iCloud“最近删除”。${data.recycleResult.message}` : `“${item.name}”已移入 iCloud“最近删除”，本地文件未删除。预计可释放 ${formatBytes(asset.originalBytes)}；彻底释放需清空“最近删除”。`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "iCloud 删除失败。"); }
     finally { setReleasingAsset(null); }
@@ -626,8 +718,19 @@ function PhotoLibrary({ username }: { username: string }) {
       <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
-    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { const cloudAsset = cloudAssetFor(item); const cloudKey = cloudAsset ? `${cloudAsset.library}:${cloudAsset.id}` : null; return <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => setViewerId(item.id)} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<nav className={styles.cardActions}>{cloudAsset && <button title="安全释放 iCloud，可选择同时移入本地回收站" aria-label="安全释放云端和本地文件" className={styles.cloudRelease} disabled={releasingAsset !== null} onClick={() => void releaseFromIcloud(item, cloudAsset)}>{releasingAsset === cloudKey ? "…" : "☁"}</button>}<button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
-    <footer><span>图片库只读取用户明确授权的本地文件夹</span><a href="/?library=video">返回视频库 →</a></footer>
-    {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} />}
+    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={styles.card} key={item.id}><div className={styles.preview}><PhotoThumb item={item} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<nav className={styles.cardActions}><button title="删除这张图片：仅本地、仅 iCloud 或两边都删除" aria-label="删除这张图片" className={styles.cloudRelease} disabled={releasingAsset !== null} onClick={() => { setDeleteMode("local"); setDeleteItem(item); void refreshReleaseCatalog(); }}>⌫</button><button title={item.liked ? "取消收藏" : "收藏"} aria-label={item.liked ? "取消收藏" : "收藏"} className={item.liked ? styles.marked : ""} onClick={() => toggleMark(item.id, "liked")}>{item.liked ? "♥" : "♡"}</button><button title={item.cleanup ? "移出待整理" : "加入待整理"} aria-label={item.cleanup ? "移出待整理" : "加入待整理"} className={item.cleanup ? styles.cleanupMarked : ""} onClick={() => toggleMark(item.id, "cleanup")}>{item.cleanup ? "✓" : "⌁"}</button></nav></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    <footer><span>图片来源来自你授权的本地文件夹；删除前需单独确认</span><a href="/?library=video">返回视频库 →</a></footer>
+    {deleteItem && <dialog ref={deleteDialogRef} className={styles.deleteDialog} aria-labelledby="delete-photo-title" onCancel={event => { if (releasingAsset !== null) event.preventDefault(); else setDeleteItem(null); }}>
+      <h2 id="delete-photo-title">删除这张图片</h2><p>{deleteItem.name}{deleteItem.liveVideo ? " · 包含配对实况视频" : ""}</p>
+      <fieldset disabled={releasingAsset !== null}>
+        <legend>选择删除范围</legend>
+        <label htmlFor="photo-delete-local" aria-label="仅删除本地"><input id="photo-delete-local" type="radio" name="photo-delete-mode" checked={deleteMode === "local"} onChange={() => setDeleteMode("local")} /><span><strong>仅删除本地</strong><small>移入 Windows 回收站，保留 iCloud 内容。</small></span></label>
+        <label htmlFor="photo-delete-icloud" aria-label="仅删除 iCloud"><input id="photo-delete-icloud" type="radio" name="photo-delete-mode" checked={deleteMode === "icloud"} disabled={releaseCatalogLoading || Boolean(releaseCatalogError) || !cloudAssetFor(deleteItem)} onChange={() => setDeleteMode("icloud")} /><span><strong>仅删除 iCloud</strong><small>移入 iCloud“最近删除”，保留本地原片。</small></span></label>
+        <label htmlFor="photo-delete-both" aria-label="两边都删除"><input id="photo-delete-both" type="radio" name="photo-delete-mode" checked={deleteMode === "both"} disabled={releaseCatalogLoading || Boolean(releaseCatalogError) || !cloudAssetFor(deleteItem)} onChange={() => setDeleteMode("both")} /><span><strong>两边都删除</strong><small>云端成功移入“最近删除”后，再将本地原片移入回收站。</small></span></label>
+      </fieldset>
+      {releaseCatalogLoading ? <p>正在刷新云端释放计划…</p> : releaseCatalogError ? <p>{releaseCatalogError}</p> : !cloudAssetFor(deleteItem) && <p>{releaseCatalog?.releasePlan?.status === "confirmed" ? "释放计划已确认，但此图片未能唯一匹配计划中的云端项目。请确认图片来源和本地文件大小，或重新生成释放计划。" : "请到 iCloud 备份中心复核并确认释放计划后，再操作 iCloud。"}</p>}
+      <div><button disabled={releasingAsset !== null} onClick={() => setDeleteItem(null)}>取消</button><button disabled={releasingAsset !== null || (deleteMode !== "local" && (releaseCatalogLoading || Boolean(releaseCatalogError) || !cloudAssetFor(deleteItem)))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? "正在处理…" : "继续"}</button></div>
+    </dialog>}
+    {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onDelete={mode => { setDeleteMode(mode); setDeleteItem(viewer); void refreshReleaseCatalog(); }} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
   </main>;
 }
