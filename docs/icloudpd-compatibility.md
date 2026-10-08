@@ -143,6 +143,26 @@ FRAMEBASE_DELETE_COMMIT=1
 
 FrameBase 业务层仍禁止向普通备份命令传入三个批量删除参数。兼容版源码与可执行文件位于被 Git 忽略的 `tools/`，所以每次从零构建时都必须手动恢复这一扩展，并运行 `tests/test_framebase_inventory.py` 以及 FrameBase 的 `tests/icloud-provider.test.mjs`。真实 Apple 账户删除不能作为自动化测试；测试必须 mock Apple `/records/modify` 或模拟兼容版机器输出。
 
+### 单张及批量复核的查找优化
+
+恢复上述精确删除扩展后，还需在兼容版源码根目录应用仓库中的 `docs/icloudpd-target-delete.patch`（`git apply --ignore-space-change <补丁绝对路径>`，兼容 Windows CRLF），然后重新运行测试及 PyInstaller 构建。该补丁随仓库保存，避免忽略目录下的优化随新工作副本丢失。
+
+随后应用 `docs/icloudpd-delete-nameerror.patch`。它修复精确删除分支在 `core_single_run` 中引用未定义 `filename_builder` 的问题：使用当前用户的文件名策略与 Unicode 配置创建同样的文件名处理器。新增完整 CLI 回归测试先读取模拟清单，再执行精确 dry-run，并通过 mock 删除接口验证提交分支；这两个分支均必须返回正确结果，不能仅测试元数据助手或扫描迭代器。
+
+- FrameBase 根据上次只读清单中同一图库的顺序传入 `lookupRank`。它只是查找提示，不能作为匹配或删除依据。
+- 对最多四个提示位置先扫描附近最多 300 项；目标未找到则回退到从头扫描，正向分页漏项时再反向补扫。目标全部找到后立即结束，不再遍历剩余图库，也不再为删除预先查询整库数量。
+- 所有路径继续核对精确 ID、图库、文件名、拍摄时间、媒体类型和原始资源大小；过期索引提示不会放宽校验。
+- 工具输出 `FRAMEBASE_DELETE_PROGRESS`，包含累计扫描数、剩余目标数及扫描方向。复核通过后台任务运行，页面每秒读取状态，刷新后可恢复进行中的复核。确认前始终为 dry-run。
+- 失败时保留会话失效、连接异常、目标未找到或元数据不一致的具体原因。较大的图库或 Apple 网络延迟仍可能耗时超过 100 秒，不能承诺固定秒数。
+
+Python 模拟测试遇到 Windows 系统代理干扰 VCR 录制匹配时，可仅在测试进程设置 `$env:NO_PROXY='*'`。这不会修改实际应用的代理配置。
+
+### 会话验证与删除认证
+
+`/icloud` 和图片库调用同一个 `/api/icloud/verify`，按当前 FrameBase 用户使用同一会话目录及同一份仅存于进程内的 Apple 密码。验证先执行 `--auth-only`，再以 `--recent 1 --only-print-filenames` 只读检查照片图库；只登录成功不能证明图库访问正常。两次检查都通过才显示验证成功。
+
+图片库删除窗口提供会话验证及 Apple 密码/验证码登录入口，登录完成后自动执行上述验证。验证不会提交删除，用户仍需重新复核并确认删除。错误分类必须使用明确的认证错误，不能仅因 traceback 或密码提示中含有 `password`、`authentication` 就把其他异常报告为会话失效。密码交互终端的提示可能与机器结果共用一行，删除解析器应从协议标记开始解析，并继续验证目标 ID 与图库，不能把完整终端输出显示给用户。
+
 ### 云端与本地同时清理
 
 逐项释放时，用户可以选择只把云端资产移入 iCloud“最近删除”，或在云端成功后继续把本地备份移入 Windows 回收站。顺序不可颠倒：

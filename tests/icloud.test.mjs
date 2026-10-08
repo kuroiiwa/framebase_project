@@ -264,7 +264,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /\/api\/icloud\/release\/plan/);
   assert.match(server, /icloud\.confirmReleasePlan/);
   assert.match(server, /icloudProvider\.deleteAssets/);
-  assert.match(server, /icloud\.recordReleasedAssets/);
+  assert.match(await readFile(new URL("../server/framebase-release-jobs.mjs", import.meta.url), "utf8"), /icloud\.recordReleasedAssets/);
   assert.match(server, /recycleBin\.recycle/);
   assert.match(server, /icloud\.prepareLocalRecycle/);
   assert.match(server, /\/api\/icloud\/release\/recycle\/retry/);

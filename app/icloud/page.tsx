@@ -240,7 +240,7 @@ function IcloudCenter({ username }: { username: string }) {
       const data = await response.json() as IcloudConfig & { verification?: { status: string; message: string }; error?: string };
       if (!response.ok) throw new Error(data.error || "无法验证 iCloud 会话");
       setConfig(current => mergeConfig(current, data));
-      if (data.verification?.status === "connected") setMessage("iCloud 会话验证成功。");
+      if (data.verification?.status === "connected") setMessage(data.verification.message);
       else setError(data.verification?.message || "现有会话不可用，需要重新登录 Apple ID。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法验证 iCloud 会话"); }
     finally { setBusy(null); }
@@ -491,7 +491,7 @@ function IcloudCenter({ username }: { username: string }) {
           <button className={styles.primary} disabled={busy !== null || !readyForConnection || !appleAccount.trim()}>{busy === "connection" ? "保存中…" : "保存连接配置"}</button>
         </form>
         <div className={styles.status}><i className={config?.connectionStatus === "connected" ? styles.statusOk : ""} /><strong>{config?.connectionStatus === "connected" ? "已连接" : config?.connectionStatus === "expired" ? "需要登录" : "尚未验证"}</strong><small>{config?.lastConnectionMessage || (readyForConnection ? "本地目录已经就绪" : "请先设置备份目录")}</small></div>
-        <div className={styles.actions}><button onClick={() => void verifyConnection()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available}>{busy === "verify" ? "正在检查…" : "验证已有会话"}</button>{config?.connectionStatus !== "connected" && <button className={styles.primary} onClick={() => void startAuthentication()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available || Boolean(auth && activeAuthStates.has(auth.status))}>{busy === "auth" ? "正在启动…" : "开始 Apple 登录"}</button>}</div>
+        <div className={styles.actions}><button onClick={() => void verifyConnection()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available}>{busy === "verify" ? "正在检查…" : "验证已有会话与照片图库"}</button>{config?.connectionStatus !== "connected" && <button className={styles.primary} onClick={() => void startAuthentication()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available || Boolean(auth && activeAuthStates.has(auth.status))}>{busy === "auth" ? "正在启动…" : "开始 Apple 登录"}</button>}</div>
         {auth && auth.status !== "idle" && <div className={styles.authBox}>
           <div><strong>{auth.status === "connected" ? "登录成功" : auth.status === "failed" ? "登录失败" : "Apple 登录"}</strong><span>{auth.message}</span></div>
           {auth.status === "waiting_password" && <form onSubmit={event => void submitAuthInput(event, "password")}><input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" placeholder="Apple ID 密码" aria-label="Apple ID 密码" /><button className={styles.primary} disabled={!password}>提交密码</button></form>}

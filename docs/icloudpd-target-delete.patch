@@ -1,0 +1,158 @@
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -888,6 +888,42 @@
+     }
+ 
+ 
++def framebase_target_photos(photo_album: PhotoAlbum, requested: Mapping[str, Mapping[str, Any]]) -> Iterable[PhotoAsset]:
++    """Read only until exact targets are found; recover Apple pagination gaps in reverse."""
++    pending = set(requested)
++    scanned = 0
++    previous_direction = os.environ.get("FRAMEBASE_DELETE_DIRECTION")
++    try:
++        ranks = sorted({max(0, asset["lookupRank"] - 100) for asset in requested.values()
++                        if isinstance(asset.get("lookupRank"), int) and not isinstance(asset.get("lookupRank"), bool) and asset["lookupRank"] >= 0})
++        # Probe small windows around cached positions; shifted indexes must fall back.
++        probes = [("ASCENDING", rank, 300) for rank in ranks] if len(ranks) <= 4 else []
++        scans = probes + [("ASCENDING", 0, None), ("DESCENDING", 0, None)]
++        for direction, start_rank, limit in scans:
++            if not pending:
++                break
++            os.environ["FRAMEBASE_DELETE_DIRECTION"] = direction
++            photo_album.offset = start_rank
++            scan_label = "HINT" if limit is not None else direction
++            print("FRAMEBASE_DELETE_PROGRESS " + json.dumps({"scanned": scanned, "remaining": len(pending), "direction": scan_label}), flush=True)
++            for window_index, photo in enumerate(photo_album):
++                scanned += 1
++                if scanned % 100 == 0:
++                    print("FRAMEBASE_DELETE_PROGRESS " + json.dumps({"scanned": scanned, "remaining": len(pending), "direction": scan_label}), flush=True)
++                if str(photo.id) in pending:
++                    pending.remove(str(photo.id))
++                    yield photo
++                    if not pending:
++                        return
++                if limit is not None and window_index + 1 >= limit:
++                    break
++    finally:
++        if previous_direction is None:
++            os.environ.pop("FRAMEBASE_DELETE_DIRECTION", None)
++        else:
++            os.environ["FRAMEBASE_DELETE_DIRECTION"] = previous_direction
++
++
+ def delete_photo(
+     logger: logging.Logger,
+     library_object: PhotoLibrary,
+@@ -1075,7 +1111,8 @@
+                     def sum_(inp: Iterable[int]) -> int:
+                         return sum(inp)
+ 
+-                    photos_count: int | None = compose(sum_, album_lengths)(albums)
++                    framebase_delete_assets = load_framebase_delete_request()
++                    photos_count: int | None = None if framebase_delete_assets else compose(sum_, album_lengths)(albums)
+                     if os.environ.get("FRAMEBASE_INVENTORY_JSON") == "1":
+                         print(
+                             "FRAMEBASE_INVENTORY_TOTAL "
+@@ -1089,7 +1126,10 @@
+                             )
+                         )
+                     for photo_album in albums:
+-                        photos_enumerator: Iterable[PhotoAsset] = photo_album
++                        photos_enumerator: Iterable[PhotoAsset] = (
++                            framebase_target_photos(photo_album, framebase_delete_assets)
++                            if framebase_delete_assets else photo_album
++                        )
+ 
+                         # Optional: Only download the x most recent photos.
+                         if user_config.recent is not None:
+@@ -1166,7 +1206,6 @@
+                         photos_counter = 0
+ 
+                         now = datetime.datetime.now(get_localzone())
+-                        framebase_delete_assets = load_framebase_delete_request()
+                         # photos_iterator = iter(photos_enumerator)
+ 
+                         download_photo = partial(downloader, icloud)
+@@ -1220,7 +1259,8 @@
+                                             result.update({"status": "matched", "bytes": actual_asset["originalBytes"]})
+                                         print(
+                                             "FRAMEBASE_DELETE "
+-                                            + json.dumps(result, ensure_ascii=False, separators=(",", ":"))
++                                            + json.dumps(result, ensure_ascii=False, separators=(",", ":")),
++                                            flush=True,
+                                         )
+                                     photos_counter += 1
+                                     status_exchange.get_progress().photos_counter = photos_counter
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -605,6 +605,10 @@
+         direction = "ASCENDING"
+         if os.environ.get("FRAMEBASE_INVENTORY_JSON") == "1":
+             requested_direction = os.environ.get("FRAMEBASE_INVENTORY_DIRECTION", "ASCENDING")
++            if requested_direction in ("ASCENDING", "DESCENDING"):
++                direction = requested_direction
++        if os.environ.get("FRAMEBASE_DELETE_REQUEST"):
++            requested_direction = os.environ.get("FRAMEBASE_DELETE_DIRECTION", "ASCENDING")
+             if requested_direction in ("ASCENDING", "DESCENDING"):
+                 direction = requested_direction
+         query: Dict[str, Any] = {
+--- a/tests/test_framebase_inventory.py
++++ b/tests/test_framebase_inventory.py
+@@ -10,7 +10,7 @@
+ from tests.helpers import path_from_project_root, run_icloudpd_test
+ from datetime import datetime, timezone
+ 
+-from icloudpd.base import delete_photo, framebase_asset_metadata, load_framebase_delete_request
++from icloudpd.base import delete_photo, framebase_asset_metadata, load_framebase_delete_request, framebase_target_photos
+ from pyicloud_ipd.item_type import AssetItemType
+ from pyicloud_ipd.raw_policy import RawTreatmentPolicy
+ from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
+@@ -100,3 +100,48 @@
+         self.assertEqual(record["recordName"], "asset-1")
+         self.assertEqual(record["recordChangeTag"], "change-1")
+         self.assertEqual(record["fields"]["isDeleted"]["value"], 1)
++
++
++class FrameBaseTargetScanTestCase(TestCase):
++    def test_stops_before_reading_next_page_after_all_targets_found(self):
++        class Album:
++            offset = 0
++            def __iter__(self):
++                yield Mock(id="target")
++                raise AssertionError("must not continue the whole-library scan")
++        self.assertEqual([photo.id for photo in framebase_target_photos(Album(), {"target": {}})], ["target"])
++
++    def test_reverse_scan_recovers_missing_forward_targets_without_duplicates(self):
++        class Album:
++            offset = 0
++            def __iter__(self):
++                yield Mock(id="first")
++                if os.environ.get("FRAMEBASE_DELETE_DIRECTION") == "DESCENDING":
++                    yield Mock(id="missing")
++                    raise AssertionError("must stop after final target")
++        actual = [photo.id for photo in framebase_target_photos(Album(), {"first": {}, "missing": {}})]
++        self.assertEqual(actual, ["first", "missing"])
++        self.assertNotIn("FRAMEBASE_DELETE_DIRECTION", os.environ)
++
++
++    def test_cached_rank_probes_target_window_without_scanning_from_start(self):
++        class Album:
++            offset = 0
++            def __iter__(self):
++                if self.offset != 1900:
++                    raise AssertionError("cached rank should skip earlier pages")
++                yield Mock(id="target")
++                raise AssertionError("stop immediately on exact target")
++        self.assertEqual([photo.id for photo in framebase_target_photos(Album(), {"target": {"lookupRank": 2000}})], ["target"])
++
++    def test_stale_cached_rank_falls_back_without_trusting_the_hint(self):
++        class Album:
++            offset = 0
++            def __iter__(self):
++                if self.offset == 1900:
++                    for index in range(300):
++                        yield Mock(id="wrong-" + str(index))
++                    raise AssertionError("probe must be bounded")
++                else:
++                    yield Mock(id="target")
++        self.assertEqual([photo.id for photo in framebase_target_photos(Album(), {"target": {"lookupRank": 2000}})], ["target"])

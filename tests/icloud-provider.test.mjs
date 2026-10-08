@@ -67,7 +67,9 @@ test("icloudpd provider verifies an existing session without placing a password 
       backupDirectory: join(root, "backup"),
     });
     assert.equal(result.status, "connected");
-    const verifyCall = calls.at(-1);
+    const verifyCall = calls.find(call => call.args.includes("--auth-only"));
+    assert.ok(calls.at(-1).args.includes("--only-print-filenames"));
+    assert.equal(calls.at(-1).args[calls.at(-1).args.indexOf("--recent") + 1], "1");
     assert.equal(verifyCall.executable, executablePath);
     assert.ok(verifyCall.args.includes("--auth-only"));
     assert.ok(verifyCall.args.includes("--cookie-directory"));
@@ -667,6 +669,40 @@ test("provider deletes only exact asset ids through the protected FrameBase adap
   }
 });
 
+test("deletion emits heartbeat and confirmed cloud results while the tool is still running", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-delete-progress-"));
+  const executablePath = join(root, "icloudpd.exe");
+  let finish;
+  let ready;
+  const opened = new Promise(resolve => { ready = resolve; });
+  const progress = [];
+  const line = 'FRAMEBASE_DELETE {"id":"one","library":"default","status":"deleted","bytes":100}\n';
+  try {
+    await writeFile(executablePath, "test");
+    await mkdir(join(root, "session"));
+    const provider = createIcloudPdProvider({ executablePath, progressInterval: 10, runCommand: async (_executable, args, options) => {
+      if (args.includes("--version")) return { stdout: "version:1.32.3", stderr: "" };
+      ready(options);
+      await new Promise(resolve => { finish = resolve; });
+      return { stdout: line, stderr: "" };
+    } });
+    const running = provider.deleteAssets({ jobKey: "alice", appleAccount: "test@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: root, commit: true, assets: [{ id: "one", library: "default", name: "one.jpg", created: "2023-12-01", originalBytes: 100 }], onProgress: value => progress.push(value) });
+    const options = await opened;
+    await new Promise(resolve => setTimeout(resolve, 35));
+    assert.ok(progress.length >= 2, "waiting for Apple must produce heartbeat feedback");
+    options.onStdout('FRAMEBASE_DELETE_PROGRESS {"scanned":100,"remaining":1,"direction":"DESCENDING"}\n');
+    assert.match(progress.at(-1).message, /反向补扫.*100/);
+    options.onStdout(line.slice(0, 25));
+    options.onStdout(line.slice(25));
+    assert.equal(progress.at(-1).deleted, 1);
+    assert.match(progress.at(-1).message, /正在结束复核/);
+    finish();
+    const result = await running;
+    assert.equal(result.count, 1, "streamed and final output must not double-count the same asset");
+    assert.equal(result.status, "deleted");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("icloudpd provider passes password and MFA only through the temporary pseudo-terminal", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-login-"));
   const executablePath = join(root, "icloudpd.exe");
@@ -709,4 +745,71 @@ test("icloudpd provider passes password and MFA only through the temporary pseud
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+test("preview explains missing targets and changed metadata instead of a generic failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-delete-reasons-"));
+  try {
+    const executablePath=join(root,"icloudpd.exe");
+    await writeFile(executablePath,"test"); await mkdir(join(root,"session"));
+    const provider=createIcloudPdProvider({executablePath,runCommand:async (_exe,args) => args.includes("--version") ? {stdout:"version:1.32.3"} : {stdout:'FRAMEBASE_DELETE {"id":"one","library":"default","status":"mismatch","fields":["originalBytes"]}\n'}});
+    const result=await provider.deleteAssets({jobKey:"alice",sessionDirectory:join(root,"session"),assets:["one","two"].map(id=>({id,library:"default",name:id+".jpg",created:"2023-12-01",originalBytes:100})),commit:false});
+    assert.equal(result.status,"partial");
+    assert.match(result.message,/未找到/); assert.match(result.message,/元数据不一致.*originalBytes/);
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
+
+test("session verification requires photo access after successful account authentication", async () => {
+  const root=await mkdtemp(join(tmpdir(),"framebase-photo-session-"));
+  try {
+    const executablePath=join(root,"icloudpd.exe");await writeFile(executablePath,"test");
+    const provider=createIcloudPdProvider({executablePath,runCommand:async(_exe,args)=>{
+      if(args.includes("--version"))return {stdout:"version:1.32.3"};
+      if(args.includes("--auth-only"))return {stdout:""};
+      assert.ok(args.includes("--only-print-filenames"));
+      assert.equal(args.some(value=>["--auto-delete","--delete-after-download","--keep-icloud-recent-days"].includes(value)),false);
+      throw Object.assign(new Error("failed"),{stderr:"None of providers gave password"});
+    }});
+    const result=await provider.verifyExistingSession({appleAccount:"test@example.com",domain:"cn",sessionDirectory:join(root,"session"),backupDirectory:root});
+    assert.equal(result.status,"needs_auth");
+  }finally {await rm(root,{recursive:true,force:true});}
+});
+
+test("tool exceptions mentioning password functions are not reported as expired sessions", async () => {
+  const root=await mkdtemp(join(tmpdir(),"framebase-tool-errors-"));
+  try {
+    const executablePath=join(root,"icloudpd.exe");await writeFile(executablePath,"test");
+    const provider=createIcloudPdProvider({executablePath,runCommand:async(_exe,args)=>{
+      if(args.includes("--version"))return {stdout:"version:1.32.3"};
+      throw Object.assign(new Error("failed"),{stderr:'Traceback: authentication.py password_provider\nTypeError: invalid metadata'});
+    }});
+    const result=await provider.verifyExistingSession({appleAccount:"test@example.com",domain:"cn",sessionDirectory:join(root,"session"),backupDirectory:root});
+    assert.equal(result.status,"tool_error");assert.match(result.message,/TypeError/);
+    assert.equal(result.message.includes("password_provider"),false);
+  }finally {await rm(root,{recursive:true,force:true});}
+});
+
+
+test("runtime session verification and deletion reuse the same user's in-memory credential and cookie directory", async () => {
+  const root=await mkdtemp(join(tmpdir(),"framebase-shared-session-"));
+  try {
+    const executablePath=join(root,"icloudpd.exe");await writeFile(executablePath,"test");
+    const calls=[];const writes=[];let loginData;let loginExit;
+    const provider=createIcloudPdProvider({executablePath,runCommand:async()=>({stdout:"version:1.32.3"}),spawnProcess:(_exe,args,options)=>{
+      const first=calls.length===0;calls.push({args,options});let data;let exit;
+      const child={onData:callback=>{data=callback;if(first)loginData=callback;},onExit:callback=>{exit=callback;if(first)loginExit=callback;},write:value=>writes.push(value),kill:()=>{}};
+      if(!first)queueMicrotask(()=>{data("iCloud Password for test@example.com:");if(options?.env?.FRAMEBASE_DELETE_REQUEST)data('FRAMEBASE_DELETE {"id":"one","library":"default","status":"matched","bytes":100}\n');exit({exitCode:0});});
+      return child;
+    }});
+    const context={appleAccount:"test@example.com",domain:"cn",sessionDirectory:join(root,"session"),backupDirectory:root};
+    await provider.startAuthentication("alice",context);loginData("iCloud Password for test@example.com:");provider.submitAuthenticationInput("alice","password","runtime-secret");loginExit({exitCode:0});
+    assert.equal((await provider.verifyRuntimeSession("alice",context)).status,"connected");
+    assert.equal((await provider.deleteAssets({...context,jobKey:"alice",assets:[{id:"one",library:"default",name:"one.jpg",created:"2023-12-01",originalBytes:100}],commit:false})).status,"matched");
+    assert.equal(calls.length,4);
+    for(const call of calls){assert.equal(call.args[call.args.indexOf("--cookie-directory")+1],context.sessionDirectory);assert.equal(call.args.includes("runtime-secret"),false);}
+    assert.equal(writes.length,4);
+    assert.equal(provider.hasRuntimeCredential("bob"),false);
+  }finally {await rm(root,{recursive:true,force:true});}
 });

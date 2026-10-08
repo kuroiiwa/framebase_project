@@ -1,0 +1,46 @@
+.button {
+  min-height: 42px;
+  padding: 10px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--white);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.button:hover:not(:disabled) { background: var(--paper); border-color: var(--muted); }
+.button:focus-visible { outline: 3px solid color-mix(in srgb, var(--lime) 60%, var(--ink)); outline-offset: 3px; }
+.button:disabled { opacity: .45; cursor: default; }
+.primaryButton { background: var(--lime); border-color: var(--lime); color: #20231f; }
+.primaryButton:hover:not(:disabled) { background: color-mix(in srgb, var(--lime) 88%, #20231f); border-color: transparent; }
+.dangerButton { background: #a73732; border-color: #a73732; color: #fff; }
+.dangerButton:hover:not(:disabled) { background: #902b27; border-color: #902b27; }
+.sessionPanel { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); color: var(--ink); font-size: 15px; line-height: 1.6; }
+.sessionPanel h3 { margin: 0 0 6px; font-size: 16px; font-weight: 700; }
+.sessionPanel p { margin: 8px 0; font-size: 14px; line-height: 1.65; color: var(--muted); overflow-wrap: anywhere; }
+.sessionActions { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 0; }
+.sessionPanel form { display: grid; gap: 10px; margin: 16px 0 0; }
+.sessionPanel form label { display: grid; gap: 8px; font-size: 15px; font-weight: 600; }
+.sessionPanel input { width: 100%; box-sizing: border-box; min-height: 42px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--white); color: var(--ink); font: inherit; }
+.sessionPanel input:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+.sessionPanel .success { color: var(--ink); padding-top: 8px; }
+.sessionPanel .error { color: #cf655c; padding-top: 8px; }
+.progress { font-size: 15px; line-height: 1.65; color: var(--ink); }
+.progress > strong { display: block; font-size: 16px; font-weight: 700; }
+.progress p { margin: 8px 0; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
+.progress dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 16px 0 0; }
+.progress dl > div { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--white); }
+.progress dt { font-size: 13px; line-height: 1.5; color: var(--muted); }
+.progress dd { margin: 8px 0 0; font-size: 20px; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.progress small { display: block; margin-top: 14px; font-size: 13px; line-height: 1.65; color: var(--muted); }
+@media (max-width: 420px) {
+  .sessionActions { flex-direction: column; }
+  .progress dl { gap: 6px; }
+  .progress dl > div { padding: 10px 8px; }
+  .progress dt { font-size: 13px; }
+  .progress dd { font-size: 18px; }
+}

@@ -1,0 +1,70 @@
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -1112,6 +1112,10 @@
+                         return sum(inp)
+ 
+                     framebase_delete_assets = load_framebase_delete_request()
++                    filename_builder = create_filename_builder(
++                        user_config.file_match_policy,
++                        build_filename_cleaner(user_config.keep_unicode_in_filenames),
++                    )
+                     photos_count: int | None = None if framebase_delete_assets else compose(sum_, album_lengths)(albums)
+                     if os.environ.get("FRAMEBASE_INVENTORY_JSON") == "1":
+                         print(
+--- a/tests/test_framebase_inventory.py
++++ b/tests/test_framebase_inventory.py
+@@ -3,7 +3,7 @@
+ import os
+ import tempfile
+ from unittest import TestCase
+-from unittest.mock import Mock
++from unittest.mock import Mock, patch
+ 
+ import pytest
+ 
+@@ -47,6 +47,45 @@
+         self.assertGreater(item["originalBytes"], 0)
+         self.assertIn("created", item)
+         self.assertIn("id", item)
++
++    def test_exact_preview_and_mocked_commit_execute_the_full_cli_target_branch(self) -> None:
++        args = [
++            "--username", "jdoe@gmail.com", "--password", "password1",
++            "--recent", "1", "--no-progress-bar", "--only-print-filenames",
++            "--size", "original", "--live-photo-size", "original", "--align-raw", "original",
++        ]
++        fixture = os.path.join(self.fixtures_path, "test_framebase_inventory")
++        _, inventory = run_icloudpd_test(self.assertEqual, self.root_path, fixture,
++            "listing_photos.yml", [], [], args,
++            additional_env={"FRAMEBASE_INVENTORY_JSON": "1"})
++        self.assertEqual(inventory.exit_code, 0)
++        asset = json.loads(next(line for line in inventory.output.splitlines()
++            if line.startswith("FRAMEBASE_INVENTORY ")).removeprefix("FRAMEBASE_INVENTORY "))
++        asset.update({"library": "PrimarySync", "lookupRank": 0})
++        with tempfile.NamedTemporaryFile("w", encoding="utf8", delete=False) as request_file:
++            json.dump({"version": 1, "assets": [asset]}, request_file)
++            request_path = request_file.name
++        try:
++            for commit in (False, True):
++                env = {"FRAMEBASE_DELETE_REQUEST": request_path}
++                if commit:
++                    env["FRAMEBASE_DELETE_COMMIT"] = "1"
++                with patch("icloudpd.base.delete_photo") as delete:
++                    _, result = run_icloudpd_test(self.assertEqual, self.root_path, fixture,
++                        "listing_photos.yml", [], [], args, additional_env=env)
++                    self.assertEqual(result.exit_code, 0, result.output)
++                    records = [json.loads(line.removeprefix("FRAMEBASE_DELETE "))
++                        for line in result.output.splitlines() if line.startswith("FRAMEBASE_DELETE ")]
++                    self.assertEqual(len(records), 1)
++                    self.assertEqual(records[0]["status"], "deleted" if commit else "matched", records[0])
++                    self.assertEqual(records[0]["id"], asset["id"])
++                    if commit:
++                        delete.assert_called_once()
++                        self.assertTrue(callable(delete.call_args.args[3]))
++                    else:
++                        delete.assert_not_called()
++        finally:
++            os.unlink(request_path)
+ 
+     def test_inventory_keeps_assets_with_incomplete_download_fields(self) -> None:
+         photo = Mock()

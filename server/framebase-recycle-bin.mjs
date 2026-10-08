@@ -17,7 +17,8 @@ const recycleScript = [
 
 export function createRecycleBin({ platform = process.platform, runCommand = runExecutable } = {}) {
   async function recycle(files) {
-    const requested = Array.isArray(files) ? files.filter(file => file && typeof file.path === "string" && typeof file.relativePath === "string" && Number(file.size) > 0).slice(0, 16) : [];
+    if (Array.isArray(files) && files.length > 200) throw new Error("每次最多回收 200 个原文件（100 张实况照片）。");
+    const requested = Array.isArray(files) ? files.filter(file => file && typeof file.path === "string" && typeof file.relativePath === "string" && Number(file.size) > 0) : [];
     if (!requested.length) return { status: "empty", message: "没有需要移入回收站的本地文件。", results: [], fileCount: 0, bytes: 0 };
     if (platform !== "win32") return { status: "unsupported", message: "当前系统暂不支持安全移入回收站。", results: requested.map(file => ({ ...file, status: "failed", reason: "unsupported" })), fileCount: 0, bytes: 0 };
     const results = [];

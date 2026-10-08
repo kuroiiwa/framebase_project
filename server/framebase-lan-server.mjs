@@ -11,7 +11,8 @@ import { createAccounts } from "./framebase-accounts.mjs";
 import { createIcloudManager } from "./framebase-icloud.mjs";
 import { createIcloudPdProvider } from "./icloud-providers/icloudpd-provider.mjs";
 import { createRecycleBin } from "./framebase-recycle-bin.mjs";
-import { preparePhotoRecycle } from "./framebase-photo-recycle.mjs";
+import { preparePhotoRecycle, preparePhotoBatchRecycle } from "./framebase-photo-recycle.mjs";
+import { createReleaseDeleteJobs } from "./framebase-release-jobs.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeStartedAt = new Date().toISOString();
@@ -71,6 +72,7 @@ const icloudProvider = createIcloudPdProvider({
   ),
 });
 const icloudBackupUsers = new Set();
+const releaseDeleteJobs = createReleaseDeleteJobs({ icloud, provider: icloudProvider, recycleBin });
 const icloudFullBackupJobs = new Map();
 const icloudTimelineJobs = new Map();
 const mobileSessions = new Map();
@@ -455,7 +457,7 @@ async function handlePhotoRecycle(request, response) {
   const selectedPath = await pickWindowsFolder(name);
   if (!selectedPath) return json(response, 200, { cancelled: true });
   if (basename(selectedPath).toLowerCase() !== name.toLowerCase()) return json(response, 409, { error: "请选择当前图片所属的来源文件夹。" });
-  const plan = await preparePhotoRecycle(selectedPath, body.files);
+  const plan = body.groups ? await preparePhotoBatchRecycle(selectedPath, body.groups) : await preparePhotoRecycle(selectedPath, body.files);
   // Recheck after the native folder dialog, during which another task may start.
   if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username) || icloud.readReleaseProgress(current.username).status === "running") return json(response, 409, { error: "备份或复核正在运行，请结束后再删除。" });
   const recycleResult = await recycleBin.recycle(plan.files);
@@ -694,23 +696,41 @@ async function handleIcloud(request, response, url) {
     return json(response, 200, { releasePlan, releaseHistory, timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason } });
   }
   if (request.method === "POST" && (url.pathname === "/api/icloud/release/delete/preview" || url.pathname === "/api/icloud/release/delete")) {
+    if (releaseDeleteJobs.read(current.username).status === "running") return json(response, 409, { error: "当前用户已有云端删除任务，请等待结果，勿重复提交。" });
     if (icloudBackupUsers.has(current.username) || icloudFullBackupJobs.has(current.username)) return json(response, 409, { error: "备份任务运行时不能释放云端项目。" });
     const body = await readJsonBody(request);
     const plan = await icloud.readReleasePlan(current.username);
     if (!plan || plan.status !== "confirmed" || body.planId !== plan.id) return json(response, 409, { error: "释放计划尚未确认或已经失效。" });
     const requestedKeys = new Set(Array.isArray(body.assetKeys) ? body.assetKeys.filter(key => typeof key === "string").slice(0, 100) : []);
-    const assets = plan.assets.filter(asset => requestedKeys.has(`${asset.library}:${asset.id}`));
+    let assets = plan.assets.filter(asset => requestedKeys.has(`${asset.library}:${asset.id}`));
     if (!assets.length || assets.length !== requestedKeys.size) return json(response, 400, { error: "选择的项目不在已确认释放计划中。" });
+    // Inventory positions are lookup hints only: the adapter still verifies ID and
+    // every guarded field, and falls back to full scans when the index has shifted.
+    const lookupTimeline = await icloud.readTimeline(current.username);
+    const libraryRanks = new Map();
+    const rankByKey = new Map();
+    for (const asset of lookupTimeline.assets || []) {
+      const rank = libraryRanks.get(asset.library) || 0;
+      rankByKey.set(`${asset.library}:${asset.id}`, rank);
+      libraryRanks.set(asset.library, rank + 1);
+    }
+    assets = assets.map(asset => ({ ...asset, lookupRank: rankByKey.get(`${asset.library}:${asset.id}`) }));
     const recycleLocal = body.recycleLocal === true;
-    const localRecyclePlan = recycleLocal ? await icloud.prepareLocalRecycle(current.username, assets) : { files: [], fileCount: 0, bytes: 0 };
-    const context = await icloud.connectionContext(current.username);
-    const preview = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: false });
-    if (url.pathname.endsWith("/preview") || preview.status !== "matched") return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview, localRecyclePlan: { fileCount: localRecyclePlan.fileCount, bytes: localRecyclePlan.bytes } });
+    if (url.pathname.endsWith("/preview")) {
+      if (body.background === true) return json(response, 202, { deleteJob: releaseDeleteJobs.start(current.username, { assets, recycleLocal, preview: true }) });
+      const localRecyclePlan = recycleLocal ? await icloud.prepareLocalRecycle(current.username, assets) : { fileCount: 0, bytes: 0 };
+      const context = await icloud.connectionContext(current.username);
+      const preview = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: false });
+      return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview, localRecyclePlan: { fileCount: localRecyclePlan.fileCount, bytes: localRecyclePlan.bytes } });
+    }
     if (body.confirmation !== "移入最近删除") return json(response, 400, { error: "请输入“移入最近删除”确认。" });
-    const released = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: true });
-    const recycleResult = released.status === "deleted" && recycleLocal ? await recycleBin.recycle(localRecyclePlan.files) : null;
-    const releaseHistory = await icloud.recordReleasedAssets(current.username, assets, released, recycleResult);
-    return json(response, released.status === "deleted" ? 200 : 409, { releaseResult: released, recycleResult, releaseHistory, timeline: await icloud.readTimeline(current.username) });
+    const deleteJob = releaseDeleteJobs.start(current.username, { assets, recycleLocal });
+    if (body.background === true) return json(response, 202, { deleteJob });
+    const completedJob = await releaseDeleteJobs.wait(current.username, deleteJob.id);
+    return json(response, completedJob.status === "completed" || completedJob.status === "partial" ? 200 : 409, completedJob.result || { error: completedJob.message });
+  }
+  if (request.method === "GET" && url.pathname === "/api/icloud/release/delete/status") {
+    return json(response, 200, { deleteJob: releaseDeleteJobs.read(current.username) });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/release/recycle/retry") {
     const body = await readJsonBody(request);

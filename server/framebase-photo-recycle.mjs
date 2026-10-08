@@ -30,3 +30,17 @@ export async function preparePhotoRecycle(root, requested) {
   }
   return { files, fileCount: files.length, bytes: files.reduce((sum, file) => sum + file.size, 0) };
 }
+
+export async function preparePhotoBatchRecycle(root, groups) {
+  if (!Array.isArray(groups) || !groups.length || groups.length > 100) throw invalid("每次可批量处理 1–100 张图片。");
+  const files = [];
+  const seen = new Set();
+  for (const group of groups) {
+    const plan = await preparePhotoRecycle(root, group);
+    for (const file of plan.files) {
+      if (seen.has(file.path.toLowerCase())) throw invalid("批量选择中包含重复文件，请重新选择。");
+      seen.add(file.path.toLowerCase()); files.push(file);
+    }
+  }
+  return { files, fileCount: files.length, bytes: files.reduce((sum, file) => sum + file.size, 0) };
+}

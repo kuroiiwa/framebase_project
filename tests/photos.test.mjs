@@ -86,3 +86,15 @@ test("photo library remains isolated from the existing video library", async () 
   assert.doesNotMatch(photoExtensions, /"mp4"|"mov"|"m4v"/);
   assert.doesNotMatch(videos, /"heic"|"jpg"|"jpeg"/);
 });
+
+
+test("bulk cloud selection deduplicates assets and keeps unmatched photos", async () => {
+  const { collectCloudSelection } = await import("../app/photos/bulk-selection.ts");
+  const a = { id: "one", library: "default" };
+  const b = { id: "one", library: "shared" };
+  const photos = [a, a, b, null];
+  const result = collectCloudSelection(photos, item => item);
+  assert.deepEqual(result.assets, [a, b]);
+  assert.equal(result.matched.length, 3);
+  assert.deepEqual(result.skipped, [null]);
+});
