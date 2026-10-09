@@ -552,11 +552,14 @@ async function handleIcloud(request, response, url) {
     if (existing?.status === "running") return json(response, 202, { timelineJob: existing });
     const context = await icloud.connectionContext(current.username);
     const username = current.username;
+    const timelineLog = debugLogs.start(username, "timeline_scan");
     const job = { status: "running", phase: "starting", message: "正在准备 iCloud 元数据扫描…", library: null, libraryIndex: 0, libraryCount: 0, itemCount: 0, elapsedSeconds: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    job.debugLog = timelineLog.info;
     icloudTimelineJobs.set(username, job);
     void (async () => {
       try {
-        const result = await icloudProvider.scanTimeline({ ...context, jobKey: username, onProgress: progress => Object.assign(job, progress, { updatedAt: new Date().toISOString() }) });
+        const result = await icloudProvider.scanTimeline({ ...context, jobKey: username, debugLog: timelineLog, onProgress: progress => Object.assign(job, progress, { updatedAt: new Date().toISOString() }) });
+        timelineLog.write("finished", { status: result.status, message: result.message, total: result.total });
         if (result.status !== "ready") {
           if (result.status === "needs_auth") await icloud.recordConnectionCheck(username, result);
           Object.assign(job, { status: "failed", phase: "failed", message: result.message, resultStatus: result.status, updatedAt: new Date().toISOString() });
@@ -565,6 +568,7 @@ async function handleIcloud(request, response, url) {
         const timeline = await icloud.recordTimeline(username, result);
         Object.assign(job, { status: "completed", phase: "completed", message: result.message, itemCount: timeline.total?.itemCount || 0, timeline: { scannedAt: timeline.scannedAt, staleAt: timeline.staleAt, staleReason: timeline.staleReason, assetCount: timeline.assetCount, total: timeline.total, years: timeline.years, quarters: timeline.quarters, months: timeline.months }, updatedAt: new Date().toISOString() });
       } catch {
+        timelineLog.write("finished", { status: "error", message: "时间统计任务意外停止" });
         Object.assign(job, { status: "failed", phase: "failed", message: "时间统计任务意外停止，请重新验证连接后重试。", updatedAt: new Date().toISOString() });
       }
     })();

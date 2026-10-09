@@ -29,6 +29,7 @@
 
 
 
+.rotationControls{display:grid;grid-template-columns:1fr 1fr;gap:8px}.rotationControls button{text-align:center}.viewerSidebar button.viewerMarked{border-color:#a3c979;background:#35482b;color:#e4f6d2}.viewerSidebar h3{font-size:15px}.viewerSidebar button{font-size:14px}.viewerSidebar small{font-size:12px}
 .selectionToolbar{display:flex;align-items:center;flex-wrap:wrap;gap:16px;margin:18px 0;padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--white);font-size:15px;line-height:1.5}
 .selectionSummary{display:grid;gap:3px;min-width:0}.selectionSummary strong{font-size:16px;font-weight:700}.selectionSummary span{font-size:14px;color:var(--muted)}.selectionActions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-left:auto}
 .deleteDialog{position:fixed;inset:0;margin:auto;width:min(600px,calc(100vw - 32px));height:fit-content;max-height:calc(100dvh - 40px);box-sizing:border-box;padding:0;overflow:hidden;border:1px solid var(--line);border-radius:20px;background:var(--white);color:var(--ink);font-family:inherit;font-size:15px;line-height:1.6;box-shadow:0 24px 90px #0006}

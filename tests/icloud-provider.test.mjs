@@ -558,7 +558,13 @@ test("provider builds exact year, quarter, and month summaries from read-only in
       runCommand: async (_executable, args, options) => {
         calls.push({ args, options });
         if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
-        if (args.includes("--list-libraries")) return { stdout: "SharedSync\n", stderr: "" };
+        if (args.includes("--list-libraries")) {
+          assert.equal(options.env.FRAMEBASE_INVENTORY_JSON, "1");
+          assert.equal(options.env.FRAMEBASE_VERIFY_SESSION, "1");
+          assert.equal(options.env.FRAMEBASE_DELETE_REQUEST, undefined);
+          assert.equal(options.env.FRAMEBASE_DELETE_COMMIT, undefined);
+          return { stdout: 'FRAMEBASE_INDEXING {"indexingState":"FAILED","readProbe":"readable","count":3}\nSharedSync\n', stderr: "" };
+        }
         if (options?.env?.FRAMEBASE_INVENTORY_DIRECTION === "DESCENDING") return { stdout: [
           'FRAMEBASE_INVENTORY_TOTAL {"count":3,"library":"SharedSync"}',
           'FRAMEBASE_INVENTORY {"id":"c","created":"2023-12-04T10:00:00+08:00","mediaType":"photo","originalBytes":300,"livePhoto":false,"raw":true}',
@@ -583,7 +589,7 @@ test("provider builds exact year, quarter, and month summaries from read-only in
     assert.ok(progress.some(update => update.phase === "reading" && update.libraryIndex === 1 && update.libraryCount === 1));
     assert.ok(progress.some(update => update.message.includes("正在反向补扫")));
     assert.ok(progress.some(update => update.phase === "completed" && update.itemCount === 3));
-    const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1");
+    const inventoryCall = calls.find(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1" && !call.args.includes("--list-libraries"));
     assert.ok(inventoryCall.args.includes("--only-print-filenames"));
     assert.equal(inventoryCall.args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
     assert.equal(calls.filter(call => call.options?.env?.FRAMEBASE_INVENTORY_JSON === "1").some(call => call.options.env.FRAMEBASE_INVENTORY_DIRECTION === "DESCENDING"), true);

@@ -659,7 +659,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, onProgress = () => undefined }) {
+  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, debugLog, onProgress = () => undefined }) {
     const startedAt = Date.now();
     const report = update => { try { onProgress({ elapsedSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)), ...update }); } catch { /* Progress reporting must not stop the scan. */ } };
     report({ phase: "starting", message: "正在准备 iCloud 元数据扫描…", libraryIndex: 0, libraryCount: 0, itemCount: 0 });
@@ -672,14 +672,17 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--cookie-directory", sessionDirectory, "--directory", backupDirectory, "--username", appleAccount,
       "--size", "original", "--live-photo-size", "original", "--align-raw", "original", "--only-print-filenames",
     ];
-    const inventoryEnv = { ...process.env, FRAMEBASE_INVENTORY_JSON: "1" };
+    const inventoryEnv = { ...process.env, FRAMEBASE_INVENTORY_JSON: "1", FRAMEBASE_VERIFY_SESSION: "1" };
     delete inventoryEnv.FRAMEBASE_DELETE_REQUEST;
     delete inventoryEnv.FRAMEBASE_DELETE_COMMIT;
-    const runInventory = (args, direction = "ASCENDING") => {
+    const runInventory = async (args, direction = "ASCENDING") => {
       const env = { ...inventoryEnv, FRAMEBASE_INVENTORY_DIRECTION: direction };
-      return password
-        ? runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env, maxOutput: 128 * 1024 * 1024 })
-        : runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env });
+      debugLog?.write("timeline_inventory_start", { direction, library: args.includes("--library") ? args[args.indexOf("--library") + 1] : "default", executablePath, providerInfo });
+      const result = password
+        ? await runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env, maxOutput: 128 * 1024 * 1024 })
+        : await runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env });
+      logToolDiagnostic(debugLog, "timeline_inventory_exit", result);
+      return result;
     };
     const empty = key => ({ key, photoCount: 0, videoCount: 0, livePhotoCount: 0, rawCount: 0, originalBytes: 0, itemCount: 0 });
     const increment = (map, key, item) => {
@@ -694,10 +697,13 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     try {
       report({ phase: "discovering", message: "正在读取 iCloud 图库列表…", libraryIndex: 0, libraryCount: 0, itemCount: 0 });
       const libraryArgs = baseArgs.filter(argument => argument !== "--only-print-filenames");
+      debugLog?.write("timeline_discovery_start", { executablePath, providerInfo });
       const librariesResult = password
-        ? await runWithRuntimePassword([...libraryArgs, "--list-libraries"], password, 180_000)
-        : await runCommand(executablePath, [...libraryArgs, "--list-libraries"], { timeout: 180_000, maxBuffer: 1024 * 1024 });
-      const libraries = [...new Set(String(librariesResult.stdout || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
+        ? await runWithRuntimePassword([...libraryArgs, "--list-libraries"], password, 180_000, undefined, { env: inventoryEnv })
+        : await runCommand(executablePath, [...libraryArgs, "--list-libraries"], { timeout: 180_000, maxBuffer: 1024 * 1024, env: inventoryEnv });
+      logToolDiagnostic(debugLog, "timeline_discovery_exit", librariesResult);
+      const libraries = [...new Set(String(librariesResult.stdout || "").split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith("FRAMEBASE_")))];
+      debugLog?.write("timeline_libraries", { libraries });
       const targets = libraries.length ? libraries.slice(0, 32) : [null];
       const itemsById = new Map();
       const incompleteLibraries = [];
@@ -742,6 +748,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         const inventorySummary = parseInventory(result.stdout, library);
         const expectedCount = inventorySummary.expectedCount;
         const firstPassCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+        debugLog?.write("timeline_inventory_summary", { library: libraryLabel, ...inventorySummary, completedCount: firstPassCount });
         if (!inventorySummary.sawTotal) {
           incompleteLibraries.push({ library: libraryLabel, expectedCount: null, completedCount: firstPassCount, missingTotal: true });
         } else if (expectedCount > firstPassCount) {
@@ -800,6 +807,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         : `已只读统计 ${total.itemCount} 个 iCloud 媒体项目。`;
       return { status: "ready", message, scannedAt: new Date().toISOString(), total, years: newestFirst(years), quarters: newestFirst(quarters), months: newestFirst(months), assets: [...itemsById.values()], providerInfo };
     } catch (error) {
+      logToolDiagnostic(debugLog, "timeline_tool_failure", error);
       return { ...safeMessage(error), years: [], quarters: [], months: [], providerInfo };
     }
   }

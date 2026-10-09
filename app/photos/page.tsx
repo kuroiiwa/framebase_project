@@ -366,7 +366,8 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
   </button>;
 }
 
-function PhotoViewer({ item, previous, next, onClose, onDelete, cloudAvailable, cloudLoading, cloudMessage, releaseBusy }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void; onDelete: (mode: "local" | "icloud" | "both") => void; cloudAvailable: boolean; cloudLoading: boolean; cloudMessage: string; releaseBusy: boolean }) {
+function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCleanup, cloudAvailable, cloudLoading, cloudMessage, releaseBusy }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void; onDelete: (mode: "local" | "icloud" | "both") => void; onFavorite: () => void; onCleanup: () => void; cloudAvailable: boolean; cloudLoading: boolean; cloudMessage: string; releaseBusy: boolean }) {
+  const [previewItem] = useState(item);
   const [initialUrl] = useState<string | null>(() => {
     const thumbnail = readThumbnailCache(item);
     return thumbnail ? URL.createObjectURL(thumbnail) : null;
@@ -377,11 +378,25 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, cloudAvailable, 
   const [liveUrl, setLiveUrl] = useState<string | null>(null);
   const [liveFailed, setLiveFailed] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const mediaRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const changeZoom = (factor: number) => setZoom(value => Math.min(8, Math.max(1, value * factor)));
   const fitImage = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+  const rotateImage = (direction: number) => { setRotation(value => (value + direction + 360) % 360); setPan({ x: 0, y: 0 }); };
+  const rotatedFit = rotation % 180 !== 0 && imageSize.width && imageSize.height && viewportSize.width && viewportSize.height
+    ? Math.min(viewportSize.width / imageSize.height, viewportSize.height / imageSize.width) / Math.min(viewportSize.width / imageSize.width, viewportSize.height / imageSize.height)
+    : 1;
+  useEffect(() => {
+    const media = mediaRef.current;
+    if (!media) return;
+    const observer = new ResizeObserver(entries => { const box = entries[0].contentRect; setViewportSize({ width: box.width, height: box.height }); });
+    observer.observe(media);
+    return () => observer.disconnect();
+  }, []);
   useEffect(() => {
     const media = mediaRef.current;
     if (!media || playingLive) return;
@@ -395,7 +410,7 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, cloudAvailable, 
   useEffect(() => {
     let cancelled = false;
     let objectUrl = "";
-    void createPreviewObjectUrl(item, () => cancelled).then(createdUrl => {
+    void createPreviewObjectUrl(previewItem, () => cancelled).then(createdUrl => {
       if (!createdUrl) return;
       if (cancelled) URL.revokeObjectURL(createdUrl);
       else {
@@ -405,7 +420,7 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, cloudAvailable, 
       }
     }).catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); if (initialUrl) URL.revokeObjectURL(initialUrl); };
-  }, [initialUrl, item]);
+  }, [initialUrl, previewItem]);
   useEffect(() => {
     if (!playingLive || !item.liveVideo || liveUrl) return;
     let cancelled = false;
@@ -439,13 +454,15 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, cloudAvailable, 
       dragRef.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
       event.currentTarget.setPointerCapture(event.pointerId);
     }} onPointerMove={event => { const drag = dragRef.current; if (drag) setPan({ x: drag.panX + event.clientX - drag.x, y: drag.panY + event.clientY - drag.y }); }} onPointerUp={() => { dragRef.current = null; }} onPointerCancel={() => { dragRef.current = null; }}>
-      {playingLive && liveUrl ? <video src={liveUrl} controls autoPlay playsInline preload="metadata" aria-label={item.name + " 实况视频"} onError={() => { setLiveFailed(true); setPlayingLive(false); }} onEnded={() => setPlayingLive(false)} /> : url && !failed ? <img src={url} alt={item.name} draggable={false} style={{ transform: "translate(" + (zoom === 1 ? 0 : pan.x) + "px," + (zoom === 1 ? 0 : pan.y) + "px) scale(" + zoom + ")" }} onDoubleClick={() => { if (zoom > 1) fitImage(); else setZoom(2); }} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}
+      {playingLive && liveUrl ? <video src={liveUrl} controls autoPlay playsInline preload="metadata" aria-label={item.name + " 实况视频"} onError={() => { setLiveFailed(true); setPlayingLive(false); }} onEnded={() => setPlayingLive(false)} /> : url && !failed ? <img src={url} alt={item.name} draggable={false} style={{ transform: `translate(${zoom === 1 ? 0 : pan.x}px,${zoom === 1 ? 0 : pan.y}px) scale(${zoom * rotatedFit}) rotate(${rotation}deg)` }} onLoad={event => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} onDoubleClick={() => { if (zoom > 1) fitImage(); else setZoom(2); }} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}
       {item.liveVideo && <button className={styles.liveToggle} onClick={() => { setLiveFailed(false); setPlayingLive(value => !value); }}>{playingLive ? liveUrl ? "显示照片" : "正在读取实况…" : "▶ 播放实况"}</button>}
       {liveFailed && <span className={styles.liveError}>实况视频无法播放，请检查 Windows HEVC 解码支持。</span>}
     </div><figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}{item.liveVideo ? " · 实况 " + item.liveVideo.name : ""}</span></figcaption></figure>
     <button className={styles.viewerNext} onClick={next} aria-label="下一张">›</button>
     <aside className={styles.viewerSidebar} aria-label="图片操作">
       <h2>图片操作</h2><p>{item.name}</p>
+      <section><h3>收藏与整理</h3><button aria-pressed={item.liked} className={item.liked ? styles.viewerMarked : ""} onClick={onFavorite}>{item.liked ? "♥ 已收藏 · 取消收藏" : "♡ 收藏图片"}</button><button aria-pressed={item.cleanup} className={item.cleanup ? styles.viewerMarked : ""} onClick={onCleanup}>{item.cleanup ? "✓ 已加入待整理 · 移除" : "加入待整理"}</button></section>
+      <section><h3>旋转</h3><div className={styles.rotationControls}><button disabled={playingLive || !url || failed} onClick={() => rotateImage(-90)} aria-label="向左旋转 90 度">↶ 向左</button><button disabled={playingLive || !url || failed} onClick={() => rotateImage(90)} aria-label="向右旋转 90 度">↷ 向右</button></div><button disabled={playingLive || rotation === 0} onClick={() => { setRotation(0); fitImage(); }}>复位方向</button><small>仅调整本次查看方向</small></section>
       <section><h3>缩放</h3><div className={styles.zoomControls}><button disabled={playingLive || zoom <= 1} onClick={() => changeZoom(1 / 1.25)} aria-label="缩小">−</button><output>{Math.round(zoom * 100)}%</output><button disabled={playingLive || zoom >= 8} onClick={() => changeZoom(1.25)} aria-label="放大">＋</button></div><button disabled={playingLive} onClick={fitImage}>适应窗口</button><small>滚轮缩放 · 双击放大/复位 · 放大后拖动<br />键盘 + / − 缩放，0 复位</small></section>
       <section><h3>删除范围</h3><button disabled={releaseBusy} onClick={() => onDelete("local")}>仅删除本地</button><button disabled={releaseBusy || cloudLoading || !cloudAvailable} onClick={() => onDelete("icloud")}>仅删除 iCloud</button><button disabled={releaseBusy || cloudLoading || !cloudAvailable} onClick={() => onDelete("both")}>两边都删除</button><small>本地移入 Windows 回收站，云端移入“最近删除”。{item.liveVideo ? "包含配对实况视频。" : ""}</small><p className={styles.viewerCloudStatus}>{cloudLoading ? "正在读取云端匹配状态…" : cloudAvailable ? "此图片已完成精确云端匹配。" : cloudMessage}</p></section>
     </aside>
@@ -810,6 +827,14 @@ function PhotoLibrary({ username }: { username: string }) {
     });
   }
 
+  function markSelectedForCleanup() {
+    const selected = new Set(selectedIds);
+    const updated = photos.map(item => selected.has(item.id) ? { ...item, cleanup: true } : item);
+    for (const sourceId of new Set(photos.filter(item => selected.has(item.id)).map(item => item.sourceId))) persistMarks(updated, sourceId);
+    setPhotos(updated);
+    setNotice(`已将 ${photos.filter(item => selected.has(item.id)).length} 张图片加入待整理。`);
+  }
+
   const formats = useMemo(() => [...new Set(photos.map(item => item.extension))].sort(), [photos]);
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
@@ -827,9 +852,10 @@ function PhotoLibrary({ username }: { username: string }) {
   const currentPage = Math.min(page, pageCount);
   const visible = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
   const viewerIndex = viewerId ? filtered.findIndex(item => item.id === viewerId) : -1;
-  const viewer = viewerIndex >= 0 ? filtered[viewerIndex] : null;
+  const viewer = viewerId ? photos.find(item => item.id === viewerId) : null;
   const moveViewer = useCallback((direction: -1 | 1) => {
-    if (!filtered.length || viewerIndex < 0) return;
+    if (!filtered.length) return;
+    if (viewerIndex < 0) { setViewerId(filtered[direction === 1 ? 0 : filtered.length - 1].id); return; }
     setViewerId(filtered[(viewerIndex + direction + filtered.length) % filtered.length].id);
   }, [filtered, viewerIndex]);
   const selectedPhotos = photos.filter(item => selectedIds.includes(item.id));
@@ -865,7 +891,7 @@ function PhotoLibrary({ username }: { username: string }) {
     </section>
     <section className={styles.selectionToolbar} aria-label="批量选择图片">
       <button className={actionStyles.button} disabled={releasingAsset !== null} onClick={() => { setSelectionMode(value => !value); setSelectedIds([]); }}>{selectionMode ? "退出多选" : "批量选择"}</button>
-      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择</span></div><div className={styles.selectionActions}><button className={actionStyles.button} disabled={releasingAsset !== null} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={releasingAsset !== null || !selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => { setDeleteItem(null); setBulkDeleteItems(selectedPhotos); setDeleteMode("local"); setBatchLocalProgress(null); setDeleteJob(null); void refreshReleaseCatalog(); }}>删除选中的 {selectedPhotos.length} 张</button></div></>}
+      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择</span></div><div className={styles.selectionActions}><button className={actionStyles.button} disabled={releasingAsset !== null} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={releasingAsset !== null || !selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={actionStyles.button} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={markSelectedForCleanup}>加入待整理</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => { setDeleteItem(null); setBulkDeleteItems(selectedPhotos); setDeleteMode("local"); setBatchLocalProgress(null); setDeleteJob(null); void refreshReleaseCatalog(); }}>删除选中的 {selectedPhotos.length} 张</button></div></>}
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
     {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} disabled={releasingAsset !== null} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => { setBulkDeleteItems([]); setBatchLocalProgress(null); setDeleteJob(null); setDeleteMode("local"); setDeleteItem(item); void refreshReleaseCatalog(); }} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
@@ -886,6 +912,6 @@ function PhotoLibrary({ username }: { username: string }) {
       {deleteJob && deleteJob.status !== "idle" && <section className={styles.deleteProgress}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} /></section>}
       </div><div className={styles.deleteActions}><button className={actionStyles.button} disabled={releasingAsset !== null} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode !== "local" && (!cloudDeleteAvailable))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : "继续"}</button></div>
     </dialog>}
-    {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onDelete={mode => { setBulkDeleteItems([]); setBatchLocalProgress(null); setDeleteJob(null); setDeleteMode(mode); setDeleteItem(viewer); void refreshReleaseCatalog(); }} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
+    {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onFavorite={() => toggleMark(viewer.id, "liked")} onCleanup={() => toggleMark(viewer.id, "cleanup")} onDelete={mode => { setBulkDeleteItems([]); setBatchLocalProgress(null); setDeleteJob(null); setDeleteMode(mode); setDeleteItem(viewer); void refreshReleaseCatalog(); }} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
   </main>;
 }

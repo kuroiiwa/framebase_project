@@ -7,6 +7,29 @@ import { createDebugLogs, logToolDiagnostic } from "../server/framebase-debug-lo
 import { createReleaseDeleteJobs } from "../server/framebase-release-jobs.mjs";
 import { createIcloudPdProvider } from "../server/icloud-providers/icloudpd-provider.mjs";
 
+test("timeline discovery failure retains a diagnostic exit code without credentials", async () => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-timeline-debug-"));
+  try {
+    const executablePath = join(root, "tool.exe");
+    await writeFile(executablePath, "fixture");
+    const logs = createDebugLogs({ projectRoot: root });
+    const log = logs.start("alice", "timeline_scan");
+    const provider = createIcloudPdProvider({ executablePath, runCommand: async (_executable, args, options) => {
+      if (args.includes("--version")) return { stdout: "version:1.32.3" };
+      assert.ok(args.includes("--list-libraries"));
+      assert.equal(options.env.FRAMEBASE_VERIFY_SESSION, "1");
+      throw Object.assign(new Error("password=hidden alice@example.com"), { code: 1, stdout: "", stderr: "" });
+    } });
+    const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: root, backupDirectory: root, debugLog: log });
+    assert.equal(result.status, "error");
+    const content = logs.read("alice", log.info.id).toString("utf8");
+    assert.match(content, /timeline_discovery_start/);
+    assert.match(content, /timeline_tool_failure/);
+    assert.match(content, /"code":1/);
+    assert.doesNotMatch(content, /hidden|alice@example.com/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("diagnostic field names are not mistaken for traceback exceptions", () => {
   let data;
   logToolDiagnostic({ write: (_event, value) => { data = value; } }, "failure", {
