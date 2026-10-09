@@ -40,6 +40,15 @@ test("a small stable Apple index gap stops repeated reverse scans", async () => 
     assert.equal(result.total.itemCount, 4670);
     assert.match(result.message, /10 个不可枚举记录/);
     assert.equal(reverseCalls, 1);
+    // During unfinished indexing, the same stable gap is not a complete recount.
+    const unfinished = createIcloudPdProvider({ executablePath, runCommand: async (_executable, args) => {
+      if (args.includes("--version")) return { stdout: "version:1.32.3\n" };
+      if (args.includes("--list-libraries")) return { stdout: "" };
+      return { stdout: ['FRAMEBASE_INDEXING {"indexingState":"RUNNING","readProbe":"readable"}', 'FRAMEBASE_INVENTORY_TOTAL {"count":4680}', ...inventory].join("\n") };
+    } });
+    const incomplete = await unfinished.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup") });
+    assert.equal(incomplete.status, "incomplete");
+    assert.match(incomplete.message, /已保留上次统计/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -753,7 +762,7 @@ test("preview explains missing targets and changed metadata instead of a generic
   try {
     const executablePath=join(root,"icloudpd.exe");
     await writeFile(executablePath,"test"); await mkdir(join(root,"session"));
-    const provider=createIcloudPdProvider({executablePath,runCommand:async (_exe,args) => args.includes("--version") ? {stdout:"version:1.32.3"} : {stdout:'FRAMEBASE_DELETE {"id":"one","library":"default","status":"mismatch","fields":["originalBytes"]}\n'}});
+    const provider=createIcloudPdProvider({executablePath,runCommand:async (_exe,args) => args.includes("--version") ? {stdout:"version:1.32.3"} : {stdout:'FRAMEBASE_DELETE {"id":"one","library":"default","status":"mismatch","fields":["originalBytes"]}\nFRAMEBASE_DELETE_DONE {"total":2,"processed":1}\n'}});
     const result=await provider.deleteAssets({jobKey:"alice",sessionDirectory:join(root,"session"),assets:["one","two"].map(id=>({id,library:"default",name:id+".jpg",created:"2023-12-01",originalBytes:100})),commit:false});
     assert.equal(result.status,"partial");
     assert.match(result.message,/未找到/); assert.match(result.message,/元数据不一致.*originalBytes/);
@@ -812,4 +821,42 @@ test("runtime session verification and deletion reuse the same user's in-memory 
     assert.equal(writes.length,4);
     assert.equal(provider.hasRuntimeCredential("bob"),false);
   }finally {await rm(root,{recursive:true,force:true});}
+});
+
+
+test("empty successful process output cannot imply missing cloud assets", async () => {
+ const root=await mkdtemp(join(tmpdir(),"framebase-incomplete-delete-"));
+ try {
+  const executablePath=join(root,"icloudpd.exe");await writeFile(executablePath,"test");await mkdir(join(root,"session"));
+  const provider=createIcloudPdProvider({executablePath,runCommand:async (_exe,args)=>({stdout:args.includes("--version")?"version:1.32.3":""})});
+  const result=await provider.deleteAssets({jobKey:"alice",sessionDirectory:join(root,"session"),assets:[{id:"one",library:"default",name:"one.jpg",created:"2023-12-01",originalBytes:100}],commit:false});
+  assert.equal(result.status,"incomplete");assert.equal(result.results.length,0);assert.doesNotMatch(result.message,/未找到/);
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test("machine network diagnostics survive disabled tool logging without exposing output", async () => {
+ const root=await mkdtemp(join(tmpdir(),"framebase-safe-network-"));
+ try {
+  const executablePath=join(root,"icloudpd.exe");await writeFile(executablePath,"test");
+  const provider=createIcloudPdProvider({executablePath,runCommand:async(_exe,args)=>{
+   if(args.includes("--version"))return {stdout:"version:1.32.3"};
+   throw Object.assign(new Error("exit 1"),{stdout:'FRAMEBASE_ERROR {"status":"network_error","reason":"PyiCloudConnectionErrorException"}\nFRAMEBASE_ERROR {"status":"error","reason":"cli_failed"}\n'});
+  }});
+  const result=await provider.verifyExistingSession({appleAccount:"test@example.com",domain:"cn",sessionDirectory:join(root,"session"),backupDirectory:root});
+  assert.equal(result.status,"network_error");assert.match(result.message,/网络或代理/);assert.doesNotMatch(result.message,/cli_failed|test@example/);
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+
+
+test("Apple indexing errors preserve the plan and do not imply missing photos", async () => {
+ const root=await mkdtemp(join(tmpdir(),"framebase-indexing-"));
+ try {
+  const executablePath=join(root,"icloudpd.exe");await writeFile(executablePath,"test");
+  const provider=createIcloudPdProvider({executablePath,runCommand:async(_exe,args)=>{
+   if(args.includes("--version"))return {stdout:"version:1.32.3"};
+   throw Object.assign(new Error("exit 1"),{stdout:'FRAMEBASE_ERROR {"status":"photos_error","reason":"photos_indexing"}\n'});
+  }});
+  const result=await provider.verifyExistingSession({appleAccount:"test@example.com",domain:"cn",sessionDirectory:join(root,"session"),backupDirectory:root});
+  assert.equal(result.status,"indexing");assert.match(result.message,/无需因此重新生成/);assert.doesNotMatch(result.message,/未找到|失效/);
+ }finally{await rm(root,{recursive:true,force:true});}
 });

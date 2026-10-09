@@ -1,0 +1,128 @@
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -303,7 +303,7 @@
+             error.indexing_state = indexing_state
+             error.indexing_zone = self.zone_id.get("zoneName")
+             framebase_request = os.environ.get("FRAMEBASE_VERIFY_SESSION") == "1" or bool(os.environ.get("FRAMEBASE_DELETE_REQUEST"))
+-            if indexing_state == "FAILED" and framebase_request:
++            if framebase_request and (indexing_state == "FAILED" or (indexing_state == "RUNNING" and bool(os.environ.get("FRAMEBASE_DELETE_REQUEST")))):
+                 try:
+                     props = self.WHOLE_COLLECTION
+                     probe = PhotoAlbum(self.params, self.session, self.service_endpoint, "", props["list_type"], props["obj_type"], query_filter=props["query_filter"], page_size=2, zone_id=self.zone_id)
+@@ -314,6 +314,7 @@
+                     if count <= 0 or not paired:
+                         raise ValueError("Read-only indexing probe did not return paired photo metadata")
+                     self.framebase_read_probe_count = count
++                    self.framebase_indexing_state = indexing_state
+                     print("FRAMEBASE_INDEXING " + json.dumps({"indexingState": indexing_state, "zoneName": self.zone_id.get("zoneName"), "readProbe": "readable", "count": count}), flush=True)
+                     return
+                 except Exception as probe_error:
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -935,6 +935,31 @@
+             os.environ["FRAMEBASE_DELETE_DIRECTION"] = previous_direction
+ 
+ 
++
++def framebase_targets_with_deleted(library: PhotoLibrary, photo_album: PhotoAlbum, requested: Mapping[str, Mapping[str, Any]]) -> Iterable[PhotoAsset]:
++    """Confirm exact trash assets before considering any active-library mutation."""
++    pending = dict(requested)
++    started = time.monotonic()
++    recent = library.recently_deleted
++    recent_count = len(recent)
++    if recent_count > 0:
++        trash_targets = {key: {field: value for field, value in asset.items() if field != "lookupRank"} for key, asset in pending.items()}
++        for photo in framebase_target_photos(recent, trash_targets, max_scan=recent_count + 100, max_seconds=20):
++            pending.pop(str(photo.id), None)
++            photo.framebase_already_deleted = True
++            yield photo
++    if not pending:
++        return
++    if getattr(library, "framebase_indexing_state", None) == "RUNNING":
++        error = PyiCloudServiceNotActivatedException("Apple iCloud Photo Library has not finished indexing yet", None)
++        error.indexing_state = "RUNNING"
++        error.indexing_zone = library.zone_id.get("zoneName")
++        raise error
++    fallback_count = getattr(library, "framebase_read_probe_count", None)
++    remaining_seconds = max(0, 90 - (time.monotonic() - started)) if fallback_count is not None else None
++    yield from framebase_target_photos(photo_album, pending, max_scan=fallback_count + 100 if fallback_count is not None else None, max_seconds=remaining_seconds)
++
++
+ def delete_photo(
+     logger: logging.Logger,
+     library_object: PhotoLibrary,
+@@ -1157,9 +1182,7 @@
+                         )
+                     for photo_album in albums:
+                         photos_enumerator: Iterable[PhotoAsset] = (
+-                            framebase_target_photos(photo_album, framebase_delete_assets,
+-                                max_scan=getattr(library_object, "framebase_read_probe_count", 0) + 100 if hasattr(library_object, "framebase_read_probe_count") else None,
+-                                max_seconds=90 if hasattr(library_object, "framebase_read_probe_count") else None)
++                            framebase_targets_with_deleted(library_object, photo_album, framebase_delete_assets)
+                             if framebase_delete_assets else photo_album
+                         )
+ 
+@@ -1282,6 +1305,8 @@
+                                         result = {"id": str(item.id), "library": actual_library}
+                                         if mismatches:
+                                             result.update({"status": "mismatch", "fields": mismatches})
++                                        elif getattr(item, "framebase_already_deleted", False) is True:
++                                            result.update({"status": "deleted" if os.environ.get("FRAMEBASE_DELETE_COMMIT") == "1" else "matched", "bytes": 0, "alreadyDeleted": True, "cloudState": "recently_deleted"})
+                                         elif os.environ.get("FRAMEBASE_DELETE_COMMIT") == "1":
+                                             delete_photo(logger, library_object, item, filename_builder)
+                                             result.update({"status": "deleted", "bytes": actual_asset["originalBytes"]})
+--- /dev/null
++++ b/tests/test_framebase_deleted_targets.py
+@@ -0,0 +1,32 @@
++from unittest.mock import Mock, patch
++import pytest
++from icloudpd.base import framebase_targets_with_deleted
++from pyicloud_ipd.exceptions import PyiCloudServiceNotActivatedException
++
++
++def test_recently_deleted_target_never_reaches_active_scan():
++    library = Mock(framebase_indexing_state="RUNNING", zone_id={"zoneName": "PrimarySync"})
++    library.recently_deleted = [Mock(id="target")]
++    with patch("icloudpd.base.framebase_target_photos", return_value=iter(library.recently_deleted)) as scan:
++        items = list(framebase_targets_with_deleted(library, object(), {"target": {"lookupRank": 42}}))
++    assert len(items) == 1 and items[0].framebase_already_deleted is True
++    assert scan.call_count == 1
++    assert "lookupRank" not in scan.call_args.args[1]["target"]
++
++
++def test_running_index_blocks_unconfirmed_active_targets():
++    library = Mock(framebase_indexing_state="RUNNING", zone_id={"zoneName": "PrimarySync"})
++    library.recently_deleted = []
++    with patch("icloudpd.base.framebase_target_photos") as scan:
++        with pytest.raises(PyiCloudServiceNotActivatedException):
++            list(framebase_targets_with_deleted(library, object(), {"target": {}}))
++    scan.assert_not_called()
++
++
++def test_finished_index_can_search_active_assets_after_empty_trash():
++    class Library:
++        recently_deleted = []
++    with patch("icloudpd.base.framebase_target_photos", return_value=iter([Mock(id="active")])) as scan:
++        items = list(framebase_targets_with_deleted(Library(), object(), {"active": {}}))
++    assert len(items) == 1
++    assert scan.call_args.args[1] == {"active": {}}
+--- a/tests/test_framebase_inventory.py
++++ b/tests/test_framebase_inventory.py
+@@ -6,7 +6,7 @@
+ import runpy
+ from contextlib import redirect_stdout
+ from unittest import TestCase
+-from unittest.mock import Mock, patch
++from unittest.mock import Mock, patch, PropertyMock
+ 
+ import pytest
+ 
+@@ -74,7 +74,7 @@
+                 env = {"FRAMEBASE_DELETE_REQUEST": request_path}
+                 if commit:
+                     env["FRAMEBASE_DELETE_COMMIT"] = "1"
+-                with patch("icloudpd.base.delete_photo") as delete:
++                with patch("icloudpd.base.delete_photo") as delete, patch("pyicloud_ipd.services.photos.PhotoLibrary.recently_deleted", new_callable=PropertyMock, return_value=[]):
+                     _, result = run_icloudpd_test(self.assertEqual, self.root_path, fixture,
+                         "listing_photos.yml", [], [], args, additional_env=env)
+                     self.assertEqual(result.exit_code, 0, result.output)

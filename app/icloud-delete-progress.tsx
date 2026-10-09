@@ -1,8 +1,10 @@
 "use client";
 
+import { DebugLogLink, type DebugLog } from "./icloud-debug-log";
 import styles from "./media-actions.module.css";
 
 export type CloudDeleteJob = {
+  debugLog?: DebugLog;
   preview?: boolean; id?: string; status: "idle" | "running" | "completed" | "partial" | "failed";
   phase?: string; name?: string; message?: string; startedAt?: number; elapsedSeconds?: number;
   processed?: number; deleted?: number; total?: number;
@@ -34,6 +36,7 @@ export function CloudDeleteProgress({ job, elapsedSeconds }: { job: CloudDeleteJ
     <strong>{job.status === "running" ? job.preview || job.phase === "preview" ? "确认前：正在复核云端项目" : "已确认，云端删除任务执行中" : job.status === "completed" ? job.preview ? "云端复核通过，尚未删除" : "删除完成" : job.status === "partial" ? "部分操作完成" : "删除未完成"}</strong>
     <p>{job.name}</p><p>{job.message}</p>
     <dl><div><dt>已耗时</dt><dd>{elapsedSeconds ?? job.elapsedSeconds ?? 0} 秒</dd></div><div><dt>云端已返回结果</dt><dd>{job.processed || 0} / {job.total || 1}</dd></div><div><dt>已确认移入最近删除</dt><dd>{job.deleted || 0} / {job.total || 1}</dd></div></dl>
+    <DebugLogLink log={job.debugLog} />
     {job.status === "running" && <small>Apple 尚未返回结果时不显示估算百分比。任务在后台继续，请勿重复提交。</small>}
   </div>;
 }

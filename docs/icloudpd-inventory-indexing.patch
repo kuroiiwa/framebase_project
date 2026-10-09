@@ -1,0 +1,37 @@
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -302,8 +302,9 @@
+             )
+             error.indexing_state = indexing_state
+             error.indexing_zone = self.zone_id.get("zoneName")
+-            framebase_request = os.environ.get("FRAMEBASE_VERIFY_SESSION") == "1" or bool(os.environ.get("FRAMEBASE_DELETE_REQUEST"))
+-            if framebase_request and (indexing_state == "FAILED" or (indexing_state == "RUNNING" and bool(os.environ.get("FRAMEBASE_DELETE_REQUEST")))):
++            inventory_request = os.environ.get("FRAMEBASE_INVENTORY_JSON") == "1"
++            framebase_request = inventory_request or os.environ.get("FRAMEBASE_VERIFY_SESSION") == "1" or bool(os.environ.get("FRAMEBASE_DELETE_REQUEST"))
++            if framebase_request and (indexing_state == "FAILED" or (indexing_state == "RUNNING" and (inventory_request or bool(os.environ.get("FRAMEBASE_DELETE_REQUEST"))))):
+                 try:
+                     props = self.WHOLE_COLLECTION
+                     probe = PhotoAlbum(self.params, self.session, self.service_endpoint, "", props["list_type"], props["obj_type"], query_filter=props["query_filter"], page_size=2, zone_id=self.zone_id)
+--- a/tests/test_framebase_indexing_probe.py
++++ b/tests/test_framebase_indexing_probe.py
+@@ -16,7 +16,7 @@
+     return session
+ 
+ 
+-@pytest.mark.parametrize("flag", ["FRAMEBASE_VERIFY_SESSION", "FRAMEBASE_DELETE_REQUEST"])
++@pytest.mark.parametrize("flag", ["FRAMEBASE_VERIFY_SESSION", "FRAMEBASE_DELETE_REQUEST", "FRAMEBASE_INVENTORY_JSON"])
+ def test_failed_index_allows_only_successful_read_probe(flag, capsys):
+     session = make_session()
+     with patch.dict("os.environ", {flag: "1"}, clear=True):
+@@ -54,3 +54,11 @@
+             PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
+     assert raised.value.read_probe_error == "TimeoutError"
+ 
++
++def test_running_index_allows_readonly_inventory_probe(capsys):
++    session = make_session(state="RUNNING")
++    with patch.dict("os.environ", {"FRAMEBASE_INVENTORY_JSON": "1"}, clear=True):
++        PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
++    assert '"readProbe": "readable"' in capsys.readouterr().out
++    assert session.post.call_count == 3
++    assert all("/records/query" in call.args[0] for call in session.post.call_args_list)

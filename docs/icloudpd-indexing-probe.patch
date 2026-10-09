@@ -1,0 +1,92 @@
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -302,6 +302,21 @@
+             )
+             error.indexing_state = indexing_state
+             error.indexing_zone = self.zone_id.get("zoneName")
++            framebase_request = os.environ.get("FRAMEBASE_VERIFY_SESSION") == "1" or bool(os.environ.get("FRAMEBASE_DELETE_REQUEST"))
++            if indexing_state == "FAILED" and framebase_request:
++                try:
++                    props = self.WHOLE_COLLECTION
++                    probe = PhotoAlbum(self.params, self.session, self.service_endpoint, "", props["list_type"], props["obj_type"], query_filter=props["query_filter"], page_size=2, zone_id=self.zone_id)
++                    count = len(probe)
++                    records = probe.photos_request().json()["records"]
++                    masters = {item["recordName"] for item in records if item.get("recordType") == "CPLMaster" and isinstance(item.get("recordName"), str) and item["recordName"]}
++                    paired = any(item.get("recordType") == "CPLAsset" and item.get("fields", {}).get("masterRef", {}).get("value", {}).get("recordName") in masters for item in records)
++                    if count <= 0 or not paired:
++                        raise ValueError("Read-only indexing probe did not return paired photo metadata")
++                    print("FRAMEBASE_INDEXING " + json.dumps({"indexingState": indexing_state, "zoneName": self.zone_id.get("zoneName"), "readProbe": "readable", "count": count}), flush=True)
++                    return
++                except Exception as probe_error:
++                    error.read_probe_error = type(probe_error).__name__
+             raise error
+ 
+     @property
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -1002,6 +1002,7 @@
+                 detail["reason"] = "photos_indexing_failed"
+             detail["indexingState"] = state
+             detail["zoneName"] = getattr(error, "indexing_zone", None)
++            detail["readProbeError"] = getattr(error, "read_probe_error", None)
+         print("FRAMEBASE_ERROR " + json.dumps(detail), flush=True)
+ 
+ 
+--- /dev/null
++++ b/tests/test_framebase_indexing_probe.py
+@@ -0,0 +1,55 @@
++import json
++from unittest.mock import Mock, patch
++import pytest
++from pyicloud_ipd.services.photos import PhotoLibrary
++from pyicloud_ipd.exceptions import PyiCloudServiceNotActivatedException
++
++
++def make_session(state="FAILED", count=42, paired=True):
++    session = Mock()
++    replies = [
++        {"records": [{"fields": {"state": {"value": state}}}]},
++        {"batch": [{"records": [{"fields": {"itemCount": {"value": count}}}]}]},
++        {"records": [{"recordType": "CPLMaster", "recordName": "master"}, {"recordType": "CPLAsset", "fields": {"masterRef": {"value": {"recordName": "master" if paired else "unknown"}}}}]},
++    ]
++    session.post.side_effect = [Mock(json=Mock(return_value=item)) for item in replies]
++    return session
++
++
++@pytest.mark.parametrize("flag", ["FRAMEBASE_VERIFY_SESSION", "FRAMEBASE_DELETE_REQUEST"])
++def test_failed_index_allows_only_successful_read_probe(flag, capsys):
++    session = make_session()
++    with patch.dict("os.environ", {flag: "1"}, clear=True):
++        PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
++    detail = json.loads(capsys.readouterr().out.split("FRAMEBASE_INDEXING ")[1])
++    assert detail["count"] == 42
++    assert detail["indexingState"] == "FAILED"
++    assert session.post.call_count == 3
++    assert all("/records/query" in call.args[0] for call in session.post.call_args_list)
++
++
++@pytest.mark.parametrize("count,paired", [(0, True), (42, False)])
++def test_failed_probe_stays_blocked(count, paired):
++    session = make_session(count=count, paired=paired)
++    with patch.dict("os.environ", {"FRAMEBASE_DELETE_REQUEST": "1"}, clear=True):
++        with pytest.raises(PyiCloudServiceNotActivatedException) as raised:
++            PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
++    assert raised.value.read_probe_error == "ValueError"
++
++
++@pytest.mark.parametrize("state,env", [("RUNNING", {"FRAMEBASE_VERIFY_SESSION": "1"}), ("FAILED", {})])
++def test_no_general_bypass_for_active_indexing_or_other_tools(state, env):
++    session = make_session(state=state)
++    with patch.dict("os.environ", env, clear=True):
++        with pytest.raises(PyiCloudServiceNotActivatedException):
++            PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
++    assert session.post.call_count == 1
++
++
++def test_network_failure_in_probe_stays_blocked():
++    session = make_session()
++    session.post.side_effect = [Mock(json=Mock(return_value={"records": [{"fields": {"state": {"value": "FAILED"}}}]})), TimeoutError()]
++    with patch.dict("os.environ", {"FRAMEBASE_VERIFY_SESSION": "1"}, clear=True):
++        with pytest.raises(PyiCloudServiceNotActivatedException) as raised:
++            PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
++    assert raised.value.read_probe_error == "TimeoutError"

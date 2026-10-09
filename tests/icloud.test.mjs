@@ -6,6 +6,36 @@ import { join } from "node:path";
 import test from "node:test";
 import { createIcloudManager } from "../server/framebase-icloud.mjs";
 
+test("successful cloud recount clears persisted deletion warning", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "framebase-recount-"));
+  try {
+    const manager = createIcloudManager({ projectRoot });
+    const timeline = { scannedAt: "2026-10-08T00:00:00Z", total: { key: "total", itemCount: 1, photoCount: 1, originalBytes: 100 }, years: [], quarters: [], months: [] };
+    await manager.recordTimeline("alice", timeline);
+    const path = join(projectRoot, ".framebase-icloud", "alice", "timeline.json");
+    await writeFile(path, JSON.stringify({ ...JSON.parse(await readFile(path, "utf8")), staleAt: "2026-10-10T00:00:00Z", staleReason: "云端内容已发生变化" }));
+    assert.ok((await manager.readTimeline("alice")).staleAt);
+    await manager.recordTimeline("alice", { ...timeline, scannedAt: "2026-10-10T01:00:00Z" });
+    const fresh = await manager.readTimeline("alice");
+    assert.equal(fresh.staleAt, null);
+    assert.equal(fresh.staleReason, null);
+    assert.equal(fresh.scannedAt, "2026-10-10T01:00:00Z");
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
+test("an already deleted cloud asset records local recycling without new cloud release bytes", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "framebase-existing-trash-"));
+  try {
+    const manager = createIcloudManager({ projectRoot });
+    const asset = { id: "trash", library: "PrimarySync", name: "IMG_0050.JPG", created: "2015-10-05T16:05:27+08:00", mediaType: "photo", extension: "jpg", originalBytes: 100 };
+    const history = await manager.recordReleasedAssets("alice", [asset], { results: [{ id: asset.id, library: asset.library, status: "deleted", alreadyDeleted: true, bytes: 0 }] }, { status: "recycled", results: [{ relativePath: asset.name, size: 100, status: "recycled" }] });
+    assert.equal(history.movedCount, 0);
+    assert.equal(history.movedBytes, 0);
+    assert.equal(history.recycledFileCount, 1);
+    assert.equal(history.recycledBytes, 100);
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
 test("confirmed release catalogs retain every matched asset beyond the first 500", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "framebase-large-release-"));
   try {
@@ -269,4 +299,18 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /icloud\.prepareLocalRecycle/);
   assert.match(server, /\/api\/icloud\/release\/recycle\/retry/);
   assert.match(server, /ShowDialog\(\$owner\)/);
+});
+
+
+test("indexing and network errors do not invalidate a verified Apple session", async () => {
+ const projectRoot=await mkdtemp(join(tmpdir(),"framebase-session-status-"));
+ try {
+  const manager=createIcloudManager({projectRoot});
+  await manager.recordConnectionCheck("alice",{status:"connected",message:"verified"});
+  for(const status of ["indexing","network_error","tool_error"]){
+   const result=await manager.recordConnectionCheck("alice",{status,message:status});
+   assert.equal(result.connectionStatus,"connected");assert.equal(result.lastConnectionMessage,status);
+  }
+  assert.equal((await manager.recordConnectionCheck("alice",{status:"needs_auth",message:"expired"})).connectionStatus,"expired");
+ }finally{await rm(projectRoot,{recursive:true,force:true});}
 });

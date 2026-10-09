@@ -1,3 +1,4 @@
+import { logToolDiagnostic, readIndexingDiagnostic } from "../framebase-debug-logs.mjs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -21,6 +22,17 @@ function runExecutable(executablePath, args, options = {}) {
 
 function safeMessage(error) {
   const combined = `${error?.stdout || ""}\n${error?.stderr || ""}\n${error?.message || ""}`;
+  for (const line of combined.split(/\r?\n/)) {
+    const marker = line.indexOf("FRAMEBASE_ERROR ");
+    if (marker < 0) continue;
+    try {
+      const detail = JSON.parse(line.slice(marker + "FRAMEBASE_ERROR ".length));
+      if (detail.status === "photos_error" && (detail.reason === "photos_indexing_failed" || detail.indexingState === "FAILED")) return { status: "indexing_failed", message: "Apple 照片图库索引返回 FAILED（失败），当前无法精确复核或删除。请先打开 iCloud 网页版照片检查图库是否正常加载、是否提示修复或需要确认；若持续失败，请联系 Apple 支持。现有释放计划保留，本次未执行删除；重新登录 FrameBase 或重建计划无法修复 Apple 索引。" };
+      if (detail.status === "photos_error" && detail.reason === "photos_indexing") return { status: "indexing", message: "Apple 照片图库尚未完成索引更新，暂时无法精确复核。现有释放计划保留，无需因此重新生成；请稍后验证图库并重试。" };
+      const messages = { needs_auth: "Apple 登录或验证码验证未通过，请重新登录 Apple。", network_error: "未能连接 Apple iCloud 服务，云端复核没有完成；请检查网络或代理后重试。", photos_error: "Apple 照片图库访问失败，未完成复核；这不代表目标图片不存在。", error: "iCloud 工具执行失败，未完成云端复核，请重试。" };
+      if (messages[detail.status]) return { status: detail.status, message: messages[detail.status] };
+    } catch { /* Never expose untrusted diagnostic output. */ }
+  }
   if (/none of providers gave password|PyiCloud(?:NoStoredPassword|FailedLogin|2SARequired|2FARequired)Exception|(?:invalid|incorrect|missing) (?:password|credentials)|(?:authentication|login|session) (?:failed|expired|required)|two-(?:factor|step) authentication required|(?:2fa|verification code) required|401.*unauthorized/i.test(combined)) {
     return { status: "needs_auth", message: "尚未登录，或 Apple 验证会话已经失效。" };
   }
@@ -191,7 +203,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function verifyExistingSession({ appleAccount, domain, sessionDirectory, backupDirectory }) {
+  async function verifyExistingSession({ appleAccount, domain, sessionDirectory, backupDirectory, debugLog }) {
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", providerInfo };
     await mkdir(sessionDirectory, { recursive: true });
@@ -207,15 +219,23 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--username", appleAccount,
     ];
     try {
-      await runCommand(executablePath, args, { timeout: 45_000 });
-      await runCommand(executablePath, [...args.filter(argument => argument !== "--auth-only"), "--recent", "1", "--only-print-filenames"], { timeout: 45_000 });
+      const options = { timeout: 45_000, env: { ...process.env, FRAMEBASE_VERIFY_SESSION: "1" } };
+      debugLog?.write("verify_stage", { stage: "account", executablePath, providerInfo, timeoutMs: 45000 });
+      await runCommand(executablePath, args, options);
+      debugLog?.write("verify_stage", { stage: "photo_library" });
+      const result = await runCommand(executablePath, [...args.filter(argument => argument !== "--auth-only"), "--recent", "1", "--only-print-filenames"], options);
+      logToolDiagnostic(debugLog, "verify_tool_exit", result);
+      const indexing = readIndexingDiagnostic(result);
+      if (indexing) return { status: "connected", message: "Apple 会话与图库读取验证通过。索引状态虽为 FAILED，但照片数量和元数据可读取；删除仍需精确复核所选资产。", indexing, providerInfo };
       return { status: "connected", message: "Apple iCloud 会话和照片图库访问均已验证。", providerInfo };
     } catch (error) {
+      logToolDiagnostic(debugLog, "verify_tool_failure", error);
       return { ...safeMessage(error), providerInfo };
     }
   }
 
   async function verifyRuntimeSession(jobKey, context) {
+    const debugLog = context.debugLog;
     const password = sessionSecrets.get(jobKey);
     if (!password) return verifyExistingSession(context);
     const providerInfo = await info();
@@ -232,10 +252,17 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--username", context.appleAccount,
     ];
     try {
-      await runWithRuntimePassword(args, password, 45_000);
-      await runWithRuntimePassword([...args.filter(argument => argument !== "--auth-only"), "--recent", "1", "--only-print-filenames"], password, 45_000);
+      const options = { env: { ...process.env, FRAMEBASE_VERIFY_SESSION: "1" } };
+      debugLog?.write("verify_stage", { stage: "account", executablePath, providerInfo, timeoutMs: 45000 });
+      await runWithRuntimePassword(args, password, 45_000, undefined, options);
+      debugLog?.write("verify_stage", { stage: "photo_library" });
+      const result = await runWithRuntimePassword([...args.filter(argument => argument !== "--auth-only"), "--recent", "1", "--only-print-filenames"], password, 45_000, undefined, options);
+      logToolDiagnostic(debugLog, "verify_tool_exit", result);
+      const indexing = readIndexingDiagnostic(result);
+      if (indexing) return { status: "connected", message: "Apple 会话与图库读取验证通过。索引状态虽为 FAILED，但照片数量和元数据可读取；删除仍需精确复核所选资产。", indexing, providerInfo };
       return { status: "connected", message: "Apple iCloud 会话和照片图库访问均已验证。", providerInfo };
     } catch (error) {
+      logToolDiagnostic(debugLog, "verify_tool_failure", error);
       return { ...safeMessage(error), providerInfo };
     }
   }
@@ -646,6 +673,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--size", "original", "--live-photo-size", "original", "--align-raw", "original", "--only-print-filenames",
     ];
     const inventoryEnv = { ...process.env, FRAMEBASE_INVENTORY_JSON: "1" };
+    delete inventoryEnv.FRAMEBASE_DELETE_REQUEST;
+    delete inventoryEnv.FRAMEBASE_DELETE_COMMIT;
     const runInventory = (args, direction = "ASCENDING") => {
       const env = { ...inventoryEnv, FRAMEBASE_INVENTORY_DIRECTION: direction };
       return password
@@ -676,7 +705,13 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const parseInventory = (output, library) => {
         let expectedCount = 0;
         let sawTotal = false;
+        let indexingUnfinished = false;
         for (const line of String(output || "").split(/\r?\n/)) {
+          if (line.startsWith("FRAMEBASE_INDEXING ")) {
+            try { indexingUnfinished ||= JSON.parse(line.slice("FRAMEBASE_INDEXING ".length))?.indexingState !== "FINISHED"; }
+            catch { indexingUnfinished = true; }
+            continue;
+          }
           if (line.startsWith("FRAMEBASE_INVENTORY_TOTAL ")) {
             try {
               const count = Number(JSON.parse(line.slice("FRAMEBASE_INVENTORY_TOTAL ".length))?.count);
@@ -691,7 +726,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             if (item?.id && item?.created) itemsById.set(`${library || "default"}:${item.id}`, { ...item, library: library || "default" });
           } catch { /* Ignore malformed provider output without exposing it. */ }
         }
-        return { expectedCount, sawTotal };
+        return { expectedCount, sawTotal, indexingUnfinished };
       };
       for (let libraryOffset = 0; libraryOffset < targets.length; libraryOffset += 1) {
         const library = targets[libraryOffset];
@@ -717,10 +752,11 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             report({ phase: "reading", message: `${libraryLabel} 首轮返回 ${beforeRecovery}/${expectedCount} 项，正在反向补扫 ${recoveryLabel}…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
             const recoveryArgs = recoveryLimit < expectedCount ? [...inventoryArgs, "--recent", String(recoveryLimit)] : inventoryArgs;
             const reverseResult = await runInventory(recoveryArgs, "DESCENDING");
-            parseInventory(reverseResult.stdout, library);
+            const reverseSummary = parseInventory(reverseResult.stdout, library);
+            inventorySummary.indexingUnfinished ||= reverseSummary.indexingUnfinished;
             const recoveredCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
             if (recoveredCount >= expectedCount) break;
-            if (recoveredCount === beforeRecovery && isTolerableInventoryGap(expectedCount, recoveredCount)) {
+            if (!inventorySummary.indexingUnfinished && recoveredCount === beforeRecovery && isTolerableInventoryGap(expectedCount, recoveredCount)) {
               acceptedStableGap = true;
               indexDiscrepancies.push({ library: libraryLabel, expectedCount, completedCount: recoveredCount });
               report({ phase: "reading", message: `${libraryLabel} 已确认 ${recoveredCount} 个可枚举项目；Apple 索引另有 ${expectedCount - recoveredCount} 个不可枚举记录，停止重复补扫。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
@@ -768,9 +804,10 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function deleteAssets({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, assets, commit = false, onProgress = () => undefined }) {
+  async function deleteAssets({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, assets, commit = false, onProgress = () => undefined, debugLog }) {
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", results: [], providerInfo };
+    debugLog?.write("tool", { executablePath, providerInfo, commit });
     const requested = Array.isArray(assets) ? assets.filter(asset => asset?.id && asset?.library && asset?.name && asset?.created && Number(asset?.originalBytes) > 0).slice(0, 100) : [];
     if (!requested.length) return { status: "invalid", message: "没有可安全匹配的 iCloud 项目。", results: [], providerInfo };
     const password = sessionSecrets.get(jobKey);
@@ -789,6 +826,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     let libraryIndex = 0;
     let libraryCount = 0;
     let scanMessage = "";
+    let incompleteScan = false;
     const publish = () => onProgress({ phase, message: results.length >= requested.length ? "目标项目已返回云端结果，正在结束复核…" : scanMessage || (commit ? "正在读取 Apple 图库、核对目标资产并提交删除…" : "正在读取 Apple 图库并精确核对目标资产…"), processed: results.length, total: requested.length, deleted: results.filter(result => result.status === "deleted").length, libraryIndex, libraryCount, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000) });
     publish();
     const heartbeat = setInterval(publish, safeProgressInterval);
@@ -804,7 +842,27 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       for (const [library, libraryAssets] of byLibrary) {
         libraryIndex += 1;
         let pendingOutput = "";
+        let scanCompleted = false;
+        let indexingFallback = false;
+        const seenProtocolLines = new Set();
         const accept = line => {
+          const protocolStart = line.indexOf("FRAMEBASE_");
+          if (protocolStart < 0) return;
+          line = line.slice(protocolStart);
+          if (seenProtocolLines.has(line)) return;
+          seenProtocolLines.add(line);
+          const indexing = readIndexingDiagnostic({ stdout: line });
+          if (indexing) { indexingFallback = true; scanMessage = `索引状态为 ${indexing.indexingState}，只读查询通过；正在检查最近删除并精确复核目标…`; publish(); return; }
+          if (line.includes("FRAMEBASE_DELETE_LIMIT ")) {
+            scanMessage = "只读复核已达到查找时间上限，正在汇总已精确匹配的结果；未匹配项目不会删除。";
+            publish(); return;
+          }
+          const doneStart = line.indexOf("FRAMEBASE_DELETE_DONE ");
+          if (doneStart >= 0) {
+            try { const done = JSON.parse(line.slice(doneStart + "FRAMEBASE_DELETE_DONE ".length)); if (done.total === libraryAssets.length) scanCompleted = true; debugLog?.write("scan_done", { library, total: done.total, processed: done.processed }); }
+            catch { /* Ignore invalid completion records. */ }
+            return;
+          }
           // In a password-backed PTY the prompt can precede a protocol record on
           // the same line. Parse only the machine record, never expose the prompt.
           const progressStart = line.indexOf("FRAMEBASE_DELETE_PROGRESS ");
@@ -812,6 +870,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             try {
               const progress = JSON.parse(line.slice(progressStart + "FRAMEBASE_DELETE_PROGRESS ".length));
               if (Number.isFinite(progress.scanned) && Number.isFinite(progress.remaining)) {
+                debugLog?.write("scan_progress", { library, scanned: progress.scanned, remaining: progress.remaining, direction: progress.direction });
                 scanMessage = `${progress.direction === "HINT" ? "正在已知索引附近快速查找" : progress.direction === "DESCENDING" ? "正在反向补扫未找到的目标" : "正在精确查找目标"}：已扫描 ${progress.scanned} 项，剩余 ${progress.remaining} 个目标…`;
                 publish();
               }
@@ -823,20 +882,29 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           try {
             const parsed = JSON.parse(line.slice(resultStart + "FRAMEBASE_DELETE ".length));
             if (!libraryAssets.some(asset => asset.id === parsed.id && asset.library === parsed.library) || results.some(result => result.id === parsed.id && result.library === parsed.library)) return;
-            results.push(parsed); publish();
+            results.push(parsed); debugLog?.write("asset_result", parsed); publish();
           } catch { /* Ignore malformed adapter output. */ }
         };
         const onStdout = chunk => { pendingOutput += stripTerminalCodes(chunk); const lines = pendingOutput.split(/\r?\n/); pendingOutput = lines.pop() || ""; for (const line of lines) accept(line); };
         await writeFile(requestPath, JSON.stringify({ version: 1, assets: libraryAssets }), { encoding: "utf8", mode: 0o600 });
         const env = { ...process.env, PYTHONUNBUFFERED: "1", FRAMEBASE_DELETE_REQUEST: requestPath, ...(commit ? { FRAMEBASE_DELETE_COMMIT: "1" } : {}) };
+        if (!commit) delete env.FRAMEBASE_DELETE_COMMIT;
         const args = [...baseArgs, ...(library !== "default" ? ["--library", library] : [])];
         if (args.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe deletion arguments");
+        debugLog?.write("tool_start", { library, targetCount: libraryAssets.length, timeoutMs: 60 * 60_000 });
         const result = password
           ? await runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env, onStdout })
           : await runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 16 * 1024 * 1024, env, onStdout });
+        logToolDiagnostic(debugLog, "tool_exit", result);
         for (const line of String(result.stdout || "").split(/\r?\n/)) {
           accept(line);
         }
+        debugLog?.write("library_scan", { library, scanCompleted, resultCount: results.length });
+        if ((!scanCompleted || indexingFallback) && libraryAssets.some(asset => !results.some(result => result.id === asset.id && result.library === asset.library))) incompleteScan = true;
+      }
+      if (incompleteScan) {
+        const confirmed = results.filter(result => result.status === (commit ? "deleted" : "matched")).length;
+        return { status: "incomplete", message: `${commit ? "已确认移入最近删除" : "已精确匹配"} ${confirmed}/${requested.length} 个云端项目。工具未返回完整的云端复核结果，不能判断未返回目标是否存在；未匹配项目不会删除，请勿重复提交已确认删除的项目。`, results, providerInfo };
       }
       const byId = new Map(results.map(result => [`${result.library}:${result.id}`, result]));
       const complete = requested.map(asset => byId.get(`${asset.library}:${asset.id}`) || { id: asset.id, library: asset.library, status: "missing", bytes: 0 });
@@ -846,8 +914,9 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       const mismatches = complete.filter(result => result.status === "mismatch");
       const fields = [...new Set(mismatches.flatMap(result => Array.isArray(result.fields) ? result.fields : []))].join("、");
       const detail = `${missing ? ` ${missing} 个目标在 Apple 图库中未找到，可能已删除或分页未返回；请重新统计并复核释放计划。` : ""}${mismatches.length ? ` ${mismatches.length} 个目标元数据不一致（${fields || "资产信息"}），为保护原片未删除；请重新复核释放计划。` : ""}`;
-      return { status: succeeded.length === requested.length ? (commit ? "deleted" : "matched") : "partial", message: (commit ? `已将 ${succeeded.length} 个精确匹配项目移入 iCloud“最近删除”。` : `已精确匹配 ${succeeded.length}/${requested.length} 个云端项目。`) + detail, results: complete, count: succeeded.length, bytes, providerInfo };
+      return { status: succeeded.length === requested.length ? (commit ? "deleted" : "matched") : "partial", message: (commit ? `已将 ${succeeded.length} 个精确匹配项目移入 iCloud“最近删除”。` : `已精确匹配 ${succeeded.length}/${requested.length} 个云端项目。`) + detail + (complete.some(result => result.alreadyDeleted) ? " 已在云端最近删除中的项目不会重复删除，可按所选范围回收本地副本。" : ""), results: complete, count: succeeded.length, bytes, providerInfo };
     } catch (error) {
+      logToolDiagnostic(debugLog, "delete_tool_failure", error);
       return { ...safeMessage(error), results, providerInfo };
     } finally {
       clearInterval(heartbeat);

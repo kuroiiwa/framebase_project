@@ -5,6 +5,7 @@
 import { useEffect, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
 import ThemeSelector from "../theme-selector";
+import { RecentDebugLogs, DebugLogLink, type DebugLog } from "../icloud-debug-log";
 import styles from "./icloud.module.css";
 
 type IcloudConfig = {
@@ -108,6 +109,7 @@ function IcloudCenter({ username }: { username: string }) {
     void fetch("/api/icloud/timeline/status", { cache: "no-store" }).then(response => response.json() as Promise<{ timelineJob: TimelineJob }>).then(data => {
       setTimelineJob(data.timelineJob);
       if (data.timelineJob.status === "running") setBusy("scan");
+      else if (data.timelineJob.status === "failed") setError(`重新统计未完成，上次统计及云端变化提示已保留。${data.timelineJob.message}`);
     }).catch(() => undefined);
   }, []);
 
@@ -120,7 +122,7 @@ function IcloudCenter({ username }: { username: string }) {
         catch { if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob.timeline } : current); }
         setSelectedPeriods([]); setMessage(data.timelineJob.message); setBusy(null);
       } else if (data.timelineJob.status === "failed") {
-        setError(data.timelineJob.message); setBusy(null);
+        setError(`重新统计未完成，上次统计及云端变化提示已保留。${data.timelineJob.message}`); setBusy(null);
       }
     }).catch(() => undefined);
     const timer = setInterval(poll, 1000);
@@ -233,11 +235,13 @@ function IcloudCenter({ username }: { username: string }) {
     finally { setBusy(null); }
   }
 
+  const [verificationLog, setVerificationLog] = useState<DebugLog>();
   async function verifyConnection() {
     setBusy("verify"); setError(""); setMessage("");
     try {
       const response = await fetch("/api/icloud/verify", { method: "POST" });
-      const data = await response.json() as IcloudConfig & { verification?: { status: string; message: string }; error?: string };
+      const data = await response.json() as IcloudConfig & { debugLog?: DebugLog; verification?: { status: string; message: string }; error?: string };
+      setVerificationLog(data.debugLog);
       if (!response.ok) throw new Error(data.error || "无法验证 iCloud 会话");
       setConfig(current => mergeConfig(current, data));
       if (data.verification?.status === "connected") setMessage(data.verification.message);
@@ -330,7 +334,7 @@ function IcloudCenter({ username }: { username: string }) {
         catch { if (data.timelineJob.timeline) setConfig(current => current ? { ...current, timeline: data.timelineJob.timeline } : current); }
         setSelectedPeriods([]); setMessage(data.timelineJob.message); setBusy(null);
       } else if (data.timelineJob.status === "failed") {
-        setError(data.timelineJob.message); setBusy(null);
+        setError(`重新统计未完成，上次统计及云端变化提示已保留。${data.timelineJob.message}`); setBusy(null);
       }
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取 iCloud 时间统计"); setBusy(null); }
   }
@@ -475,6 +479,7 @@ function IcloudCenter({ username }: { username: string }) {
     {message && <div className={styles.notice} role="status">{message}<button onClick={() => setMessage("")}>×</button></div>}
 
     <section className={styles.content}>
+      <details className={`${styles.card} ${styles.diagnostics}`}><summary>运行诊断日志 · 查看地址与下载</summary><RecentDebugLogs /></details>
       <article className={styles.card}>
         <div className={styles.cardHead}><span>1</span><div><h2>选择备份位置</h2><p>选择一个上级文件夹，FrameBase 会自动创建 <code>FrameBase-iCloud\{username}</code>。</p></div></div>
         <div className={styles.currentPath}><small>当前用户的备份目录</small><strong>{config?.backupDirectory || "尚未设置"}</strong></div>
@@ -491,6 +496,7 @@ function IcloudCenter({ username }: { username: string }) {
           <button className={styles.primary} disabled={busy !== null || !readyForConnection || !appleAccount.trim()}>{busy === "connection" ? "保存中…" : "保存连接配置"}</button>
         </form>
         <div className={styles.status}><i className={config?.connectionStatus === "connected" ? styles.statusOk : ""} /><strong>{config?.connectionStatus === "connected" ? "已连接" : config?.connectionStatus === "expired" ? "需要登录" : "尚未验证"}</strong><small>{config?.lastConnectionMessage || (readyForConnection ? "本地目录已经就绪" : "请先设置备份目录")}</small></div>
+        <DebugLogLink log={verificationLog} />
         <div className={styles.actions}><button onClick={() => void verifyConnection()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available}>{busy === "verify" ? "正在检查…" : "验证已有会话与照片图库"}</button>{config?.connectionStatus !== "connected" && <button className={styles.primary} onClick={() => void startAuthentication()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available || Boolean(auth && activeAuthStates.has(auth.status))}>{busy === "auth" ? "正在启动…" : "开始 Apple 登录"}</button>}</div>
         {auth && auth.status !== "idle" && <div className={styles.authBox}>
           <div><strong>{auth.status === "connected" ? "登录成功" : auth.status === "failed" ? "登录失败" : "Apple 登录"}</strong><span>{auth.message}</span></div>

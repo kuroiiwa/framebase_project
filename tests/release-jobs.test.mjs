@@ -2,6 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createReleaseDeleteJobs } from "../server/framebase-release-jobs.mjs";
 
+test("an exactly confirmed recently deleted cloud asset permits local recycling", async () => {
+  const asset = { id: "trash", library: "PrimarySync", name: "IMG_0050.JPG", localFiles: ["IMG_0050.JPG"] };
+  let recycled;
+  const jobs = createReleaseDeleteJobs({
+    icloud: { connectionContext: async () => ({}), prepareLocalRecycle: async () => ({ files: [{ relativePath: "IMG_0050.JPG" }] }), recordReleasedAssets: async () => ({}), readTimeline: async () => ({}) },
+    provider: { deleteAssets: async () => ({ status: "deleted", message: "云端已在最近删除中", results: [{ id: asset.id, library: asset.library, status: "deleted", alreadyDeleted: true, bytes: 0 }] }) },
+    recycleBin: { recycle: async files => { recycled = files; return { status: "recycled", message: "本地已回收" }; } },
+  });
+  const started = jobs.start("alice", { assets: [asset], recycleLocal: true });
+  const done = await jobs.wait("alice", started.id);
+  assert.equal(done.status, "completed");
+  assert.deepEqual(recycled, [{ relativePath: "IMG_0050.JPG" }]);
+});
+
 test("confirmed deletion reports live progress before completion and makes only one guarded commit", async () => {
   let resolveCloud;
   let onProgress;

@@ -1,0 +1,108 @@
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -313,6 +313,7 @@
+                     paired = any(item.get("recordType") == "CPLAsset" and item.get("fields", {}).get("masterRef", {}).get("value", {}).get("recordName") in masters for item in records)
+                     if count <= 0 or not paired:
+                         raise ValueError("Read-only indexing probe did not return paired photo metadata")
++                    self.framebase_read_probe_count = count
+                     print("FRAMEBASE_INDEXING " + json.dumps({"indexingState": indexing_state, "zoneName": self.zone_id.get("zoneName"), "readProbe": "readable", "count": count}), flush=True)
+                     return
+                 except Exception as probe_error:
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -888,25 +888,36 @@
+     }
+ 
+ 
+-def framebase_target_photos(photo_album: PhotoAlbum, requested: Mapping[str, Mapping[str, Any]]) -> Iterable[PhotoAsset]:
++def framebase_target_photos(photo_album: PhotoAlbum, requested: Mapping[str, Mapping[str, Any]], max_scan: int | None = None, max_seconds: float | None = None) -> Iterable[PhotoAsset]:
+     """Read only until exact targets are found; recover Apple pagination gaps in reverse."""
+     pending = set(requested)
+     scanned = 0
++    deadline = time.monotonic() + max_seconds if max_seconds is not None else None
+     previous_direction = os.environ.get("FRAMEBASE_DELETE_DIRECTION")
+     try:
+         ranks = sorted({max(0, asset["lookupRank"] - 100) for asset in requested.values()
+                         if isinstance(asset.get("lookupRank"), int) and not isinstance(asset.get("lookupRank"), bool) and asset["lookupRank"] >= 0})
+         # Probe small windows around cached positions; shifted indexes must fall back.
+-        probes = [("ASCENDING", rank, 300) for rank in ranks] if len(ranks) <= 4 else []
+-        scans = probes + [("ASCENDING", 0, None), ("DESCENDING", 0, None)]
+-        for direction, start_rank, limit in scans:
++        windows: list[tuple[int, int]] = []
++        for rank in ranks:
++            if windows and rank <= windows[-1][0] + windows[-1][1] and rank + 300 - windows[-1][0] <= 600:
++                start, length = windows[-1]
++                windows[-1] = (start, max(length, rank + 300 - start))
++            else:
++                windows.append((rank, 300))
++        probes = [("ASCENDING", start, length) for start, length in windows[:4]]
++        scans = probes + [("ASCENDING", 0, max_scan), ("DESCENDING", 0, max_scan)]
++        for scan_index, (direction, start_rank, limit) in enumerate(scans):
+             if not pending:
+                 break
+             os.environ["FRAMEBASE_DELETE_DIRECTION"] = direction
+             photo_album.offset = start_rank
+-            scan_label = "HINT" if limit is not None else direction
++            scan_label = "HINT" if scan_index < len(probes) else direction
+             print("FRAMEBASE_DELETE_PROGRESS " + json.dumps({"scanned": scanned, "remaining": len(pending), "direction": scan_label}), flush=True)
+             for window_index, photo in enumerate(photo_album):
++                if deadline is not None and time.monotonic() >= deadline:
++                    print("FRAMEBASE_DELETE_LIMIT " + json.dumps({"reason": "time_limit", "scanned": scanned, "remaining": len(pending)}), flush=True)
++                    return
+                 scanned += 1
+                 if scanned % 100 == 0:
+                     print("FRAMEBASE_DELETE_PROGRESS " + json.dumps({"scanned": scanned, "remaining": len(pending), "direction": scan_label}), flush=True)
+@@ -1146,7 +1157,9 @@
+                         )
+                     for photo_album in albums:
+                         photos_enumerator: Iterable[PhotoAsset] = (
+-                            framebase_target_photos(photo_album, framebase_delete_assets)
++                            framebase_target_photos(photo_album, framebase_delete_assets,
++                                max_scan=getattr(library_object, "framebase_read_probe_count", 0) + 100 if hasattr(library_object, "framebase_read_probe_count") else None,
++                                max_seconds=90 if hasattr(library_object, "framebase_read_probe_count") else None)
+                             if framebase_delete_assets else photo_album
+                         )
+ 
+--- /dev/null
++++ b/tests/test_framebase_target_bounds.py
+@@ -0,0 +1,40 @@
++from unittest.mock import Mock, patch
++from icloudpd.base import framebase_target_photos
++
++
++def test_five_nearby_hints_are_merged_instead_of_skipping_all_hints():
++    class Album:
++        offset = 0
++        def __iter__(self):
++            assert self.offset == 1900
++            for index in range(5):
++                yield Mock(id=str(index))
++            raise AssertionError("must stop after all exact targets")
++    requested = {str(i): {"lookupRank": 2000 + i} for i in range(5)}
++    assert len(list(framebase_target_photos(Album(), requested))) == 5
++
++
++def test_repeating_pages_are_bounded_in_both_directions(capsys):
++    reads = []
++    class Album:
++        offset = 0
++        def __iter__(self):
++            while True:
++                reads.append(1)
++                yield Mock(id="unrelated")
++    assert list(framebase_target_photos(Album(), {"target": {}}, max_scan=3)) == []
++    assert len(reads) == 6
++    output = capsys.readouterr().out
++    assert "ASCENDING" in output and "DESCENDING" in output
++    assert "HINT" not in output
++
++
++def test_time_limit_stops_lookup_and_returns_diagnostic(capsys):
++    class Album:
++        offset = 0
++        def __iter__(self):
++            yield Mock(id="unrelated")
++            raise AssertionError("time limit must stop")
++    with patch("icloudpd.base.time.monotonic", side_effect=[0, 91]):
++        assert list(framebase_target_photos(Album(), {"target": {}}, max_seconds=90)) == []
++    assert "FRAMEBASE_DELETE_LIMIT" in capsys.readouterr().out

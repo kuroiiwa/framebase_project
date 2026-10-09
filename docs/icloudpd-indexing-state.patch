@@ -1,0 +1,61 @@
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -297,9 +297,12 @@
+         response = request.json()
+         indexing_state = response["records"][0]["fields"]["state"]["value"]
+         if indexing_state != "FINISHED":
+-            raise PyiCloudServiceNotActivatedException(
++            error = PyiCloudServiceNotActivatedException(
+                 ("Apple iCloud Photo Library has not finished indexing yet"), None
+             )
++            error.indexing_state = indexing_state
++            error.indexing_zone = self.zone_id.get("zoneName")
++            raise error
+ 
+     @property
+     def albums(self) -> Dict[str, "PhotoAlbum"]:
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -995,7 +995,14 @@
+     """Report a safe category even when only-print-filenames disables logging."""
+     if os.environ.get("FRAMEBASE_DELETE_REQUEST") or os.environ.get("FRAMEBASE_VERIFY_SESSION"):
+         reason = "photos_indexing" if isinstance(error, PyiCloudServiceNotActivatedException) and "has not finished indexing" in str(error) else type(error).__name__
+-        print("FRAMEBASE_ERROR " + json.dumps({"status": status, "reason": reason}), flush=True)
++        detail = {"status": status, "reason": reason}
++        if reason == "photos_indexing":
++            state = getattr(error, "indexing_state", None)
++            if state == "FAILED":
++                detail["reason"] = "photos_indexing_failed"
++            detail["indexingState"] = state
++            detail["zoneName"] = getattr(error, "indexing_zone", None)
++        print("FRAMEBASE_ERROR " + json.dumps(detail), flush=True)
+ 
+ 
+ def core_single_run(
+--- /dev/null
++++ b/tests/test_framebase_indexing_state.py
+@@ -0,0 +1,24 @@
++import json
++from unittest.mock import Mock, patch
++import pytest
++from pyicloud_ipd.services.photos import PhotoLibrary
++from pyicloud_ipd.exceptions import PyiCloudServiceNotActivatedException
++from icloudpd.base import framebase_report_error
++
++@pytest.mark.parametrize("state,reason", [("RUNNING", "photos_indexing"), ("FAILED", "photos_indexing_failed")])
++def test_indexing_state_survives_diagnostic(state, reason, capsys):
++    session = Mock()
++    session.post.return_value.json.return_value = {"records": [{"fields": {"state": {"value": state}}}]}
++    with pytest.raises(PyiCloudServiceNotActivatedException) as raised:
++        PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")
++    with patch.dict("os.environ", {"FRAMEBASE_VERIFY_SESSION": "1"}):
++        framebase_report_error(raised.value, "photos_error")
++    detail = json.loads(capsys.readouterr().out.split("FRAMEBASE_ERROR ")[1])
++    assert detail["reason"] == reason
++    assert detail["indexingState"] == state
++    assert detail["zoneName"] == "PrimarySync"
++
++def test_finished_index_is_ready():
++    session = Mock()
++    session.post.return_value.json.return_value = {"records": [{"fields": {"state": {"value": "FINISHED"}}}]}
++    PhotoLibrary("https://example.invalid", {}, session, {"zoneName": "PrimarySync"}, "private")

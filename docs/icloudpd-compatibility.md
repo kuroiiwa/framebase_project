@@ -65,7 +65,9 @@ PR #1367 修改了两处：
    .\.venv\Scripts\python.exe -m pytest tests/test_photos_zone_discovery.py tests/test_listing_libraries.py -q
    ```
 
-5. 从源码根目录构建单文件 Windows 程序：
+5. 最后应用 `docs/icloudpd-inventory-indexing.patch`（在 recently-deleted 补丁之后）。它让只读时间统计在 FAILED / RUNNING 状态下先检查总数和成对元数据是否可读；不会放宽删除权限。Node 统计端在索引未完成时禁止接受小范围缺失，只有完整枚举成功才保存新统计、清除云端变化标记。失败时保留旧统计和标记，并明确显示重新统计失败原因。
+
+   从源码根目录构建单文件 Windows 程序：
 
    ```powershell
    .\.venv\Scripts\pyinstaller.exe --noconfirm --clean `
@@ -148,6 +150,34 @@ FrameBase 业务层仍禁止向普通备份命令传入三个批量删除参数�
 恢复上述精确删除扩展后，还需在兼容版源码根目录应用仓库中的 `docs/icloudpd-target-delete.patch`（`git apply --ignore-space-change <补丁绝对路径>`，兼容 Windows CRLF），然后重新运行测试及 PyInstaller 构建。该补丁随仓库保存，避免忽略目录下的优化随新工作副本丢失。
 
 随后应用 `docs/icloudpd-delete-nameerror.patch`。它修复精确删除分支在 `core_single_run` 中引用未定义 `filename_builder` 的问题：使用当前用户的文件名策略与 Unicode 配置创建同样的文件名处理器。新增完整 CLI 回归测试先读取模拟清单，再执行精确 dry-run，并通过 mock 删除接口验证提交分支；这两个分支均必须返回正确结果，不能仅测试元数据助手或扫描迭代器。
+
+最后应用 `docs/icloudpd-delete-completion.patch`。Windows 打包入口必须通过 `sys.exit(main())` 传播 CLI 返回的失败码；否则内部返回 1 仍会表现为进程成功。文件名模式关闭 logger 后，认证、网络及图库异常须输出脱敏 `FRAMEBASE_ERROR`；复核结束须输出 `FRAMEBASE_DELETE_DONE`。Provider 只有收到完成标记才可将未返回的目标判断为 `missing`；既无目标结果也无完成标记时应报告 `incomplete`，不能宣称目标不存在。会话验证通过 `FRAMEBASE_VERIFY_SESSION=1` 启用同样的脱敏错误协议。回归测试必须覆盖打包入口退出码、静默网络失败与正常完整复核。
+
+Apple 返回 `Apple iCloud Photo Library has not finished indexing yet` 时，适配器输出 `photos_indexing`，Provider 报告 `indexing`。此时保留释放计划，等 Apple 完成索引后再验证图库、重试复核；不能绕过图库就绪检查或将这种状态当成“图片不存在”“Apple 会话失效”。网络、工具及索引错误均不应将已连接会话强制改成需要登录，只有明确的 `needs_auth` 才标记为过期。
+
+### 区分索引失败与尚未完成
+
+原始工具将 `CheckIndexingState` 的所有非 `FINISHED` 值统一抛为“尚未完成”。2026-10-09 的只读诊断发现当前账户主区域 `PrimarySync` 实际返回 `FAILED`，因此原先仅建议稍后重试的提示不充分。这是远端索引状态，不能通过重新生成本地释放计划修复，也不能绕过索引检查进行删除。
+
+在上述补丁之后应用 [icloudpd-indexing-state.patch](icloudpd-indexing-state.patch)，然后重新打包兼容程序。补丁将索引状态和区域名称保留在异常及 `FRAMEBASE_ERROR` 诊断中。`FAILED` 输出 `photos_indexing_failed`，FrameBase 显示 `indexing_failed`；其他非完成状态继续显示 `indexing`。日志记录 `indexingState`、`zoneName`，不记录凭据。
+
+索引失败时应打开对应区域的 iCloud 网页版照片，检查照片能否正常加载，以及是否出现初始化、修复或确认提示。不能仅凭 `FAILED` 判定图库不可读取或要求联系 Apple 支持；还需查询实际照片元数据。
+
+### FAILED 状态的受限只读探测
+
+后续只读诊断证实，在 `PrimarySync` 索引状态仍为 `FAILED` 时，照片数量接口返回 4679 项，首批 `CPLAsset` 与 `CPLMaster` 关联元数据也能读取。需要在索引状态补丁之后应用 [icloudpd-indexing-probe.patch](icloudpd-indexing-probe.patch)，然后重新打包。
+
+回退仅用于带 `FRAMEBASE_VERIFY_SESSION=1` 或 `FRAMEBASE_DELETE_REQUEST` 的 FrameBase 操作，且仅针对 `FAILED`。初始化先查询正数项目总量和两项照片的首批元数据，要求资产记录能关联到原片记录。请求失败、零数量、元数据缺失或索引处于其他未完成状态仍会阻断。不会对工具的普通备份和其他命令全局关闭检查。
+
+探测通过输出 `FRAMEBASE_INDEXING`，记录状态、区域和查询数量。会话验证会说明“索引状态虽为 FAILED，但照片数量和元数据可读取”。目标复核继续执行原有资产编号、图库、文件名、时间、类型、原片大小的逐项匹配。只有匹配通过的目标才可能提交删除；只读探测本身不会删除。回退模式下未返回全部目标，即使收到扫描结束标记也报告 `incomplete`，不能用不可靠索引推断照片已经消失。
+
+最后应用 [icloudpd-target-bounds.patch](icloudpd-target-bounds.patch)。它合并相邻的缓存索引查找窗口，避免 5 个相邻目标因超过旧的 4 窗口限制而直接退回整库扫描。回退模式下，每个方向最多读取查询总量加 100 项，目标查找使用 90 秒时间预算，在读取返回后检查；单次网络请求仍可能额外等待其自身超时。超过预算或项目上限时返回已确认结果及 `incomplete`，不将未返回项目推断为不存在。普通工具命令继续保留原行为。
+
+### 官网已删除的项目
+
+再应用 [icloudpd-recently-deleted.patch](icloudpd-recently-deleted.patch) 并重建兼容程序。删除/复核先精确查找“最近删除”中的目标，仍检查资产编号、图库、名称、拍摄时间、类型和大小。已确认的项目输出 `alreadyDeleted: true`、`cloudState: recently_deleted`，不再次提交云端删除。选择“两边都删除”时重新校验本地原片后将其移入 Windows 回收站；不计入本次新释放的云端容量。
+
+索引为 `RUNNING` 时，允许受限只读探测和最近删除查询；未确认已在最近删除中的项目仍阻止主动云端删除。永久删除、超过保留期、或查询未找到的项目不视为已删除，可由用户使用现有“仅删除本地”操作独立回收。
 
 - FrameBase 根据上次只读清单中同一图库的顺序传入 `lookupRank`。它只是查找提示，不能作为匹配或删除依据。
 - 对最多四个提示位置先扫描附近最多 300 项；目标未找到则回退到从头扫描，正向分页漏项时再反向补扫。目标全部找到后立即结束，不再遍历剩余图库，也不再为删除预先查询整库数量。

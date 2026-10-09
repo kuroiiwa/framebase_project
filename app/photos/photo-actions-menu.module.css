@@ -1,0 +1,6 @@
+.trigger{position:absolute;z-index:4;top:8px;right:8px;display:grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid #ffffff80;border-radius:50%;background:#ffffffed;color:#38444d;font-size:24px;line-height:1;cursor:pointer;box-shadow:0 2px 8px #0003}
+.trigger:hover{background:#fff}.trigger:focus-visible{outline:2px solid #1682ff;outline-offset:3px}
+.menu{position:fixed;inset:auto;margin:0;box-sizing:border-box;padding:8px;border:1px solid var(--line);border-radius:12px;background:var(--white);color:var(--ink);box-shadow:0 10px 32px #0003;max-height:calc(100dvh - 24px);overflow:auto}
+.menu button{display:flex;align-items:center;gap:12px;width:100%;min-height:42px;padding:9px 12px;border:0;border-radius:7px;background:transparent;color:var(--ink);text-align:left;font:inherit;font-size:15px;cursor:pointer}
+.menu button>span{display:grid;place-items:center;width:20px;flex:0 0 20px;color:#0782ff;font-size:21px;line-height:1}
+.menu button:hover,.menu button:focus-visible{outline:none;background:color-mix(in srgb,#0782ff 12%,var(--white))}.menu button:disabled{opacity:.4;cursor:default}.menu hr{margin:6px 8px;border:0;border-top:1px solid var(--line)}.menu .danger,.menu .danger>span{color:#d93343}.menu .danger:hover,.menu .danger:focus-visible{background:color-mix(in srgb,#d93343 10%,var(--white))}

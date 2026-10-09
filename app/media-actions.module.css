@@ -44,3 +44,11 @@
   .progress dt { font-size: 13px; }
   .progress dd { font-size: 18px; }
 }
+
+.debugLog { margin-top: 16px; border-top: 1px solid var(--border, #aaa5); padding-top: 12px; font-size: 15px; overflow-wrap: anywhere; }
+.debugLog > summary { cursor: pointer; font-size: 15px; font-weight: 600; line-height: 1.6; }
+.debugLog > summary:focus-visible { outline: 2px solid currentColor; outline-offset: 4px; border-radius: 4px; }
+.debugLog[open] > summary { margin-bottom: 12px; }
+.debugLog code { font-size: 14px; user-select: text; }
+.debugLog .button { margin: 0 8px 8px 0; display: inline-block; }
+.debugLog small { display: block; font-size: 14px; }

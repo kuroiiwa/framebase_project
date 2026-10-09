@@ -1,3 +1,4 @@
+import { createDebugLogs } from "./framebase-debug-logs.mjs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
@@ -61,6 +62,7 @@ const runtimeCommit = (() => {
 const configPath = join(projectRoot, ".framebase-lan.json");
 const thumbnailDirectory = join(projectRoot, ".framebase-thumbnails");
 const accounts = createAccounts(join(projectRoot, ".framebase-accounts.json"));
+const debugLogs = createDebugLogs({ projectRoot, runtime: { version: runtimePackageVersion, commit: runtimeCommit, startedAt: runtimeStartedAt } });
 const icloud = createIcloudManager({ projectRoot });
 const recycleBin = createRecycleBin();
 const bundledIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe");
@@ -72,7 +74,7 @@ const icloudProvider = createIcloudPdProvider({
   ),
 });
 const icloudBackupUsers = new Set();
-const releaseDeleteJobs = createReleaseDeleteJobs({ icloud, provider: icloudProvider, recycleBin });
+const releaseDeleteJobs = createReleaseDeleteJobs({ icloud, provider: icloudProvider, recycleBin, debugLogs });
 const icloudFullBackupJobs = new Map();
 const icloudTimelineJobs = new Map();
 const mobileSessions = new Map();
@@ -469,6 +471,14 @@ async function handleIcloud(request, response, url) {
   const current = requirePc(request, response);
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
+  if (request.method === "GET" && url.pathname === "/api/icloud/debug/logs") return json(response, 200, { logs: debugLogs.list(current.username) });
+  if (request.method === "GET" && url.pathname.startsWith("/api/icloud/debug/logs/")) {
+    const id = url.pathname.slice("/api/icloud/debug/logs/".length);
+    const content = debugLogs.read(current.username, id);
+    if (!content) return json(response, 404, { error: "日志不存在或已过期。" });
+    response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": `attachment; filename="framebase-${id}.log"`, "Cache-Control": "no-store" });
+    return response.end(content);
+  }
   if (request.method === "GET" && url.pathname === "/api/icloud/config") {
     const [config, scan, backup, fullBackupStored, backupCoverage, timeline, backupHistoryStored, releasePlan, releaseHistory, providerInfo] = await Promise.all([icloud.read(current.username), icloud.readScan(current.username), icloud.readBackup(current.username), icloud.readFullBackup(current.username), icloud.readBackupCoverage(current.username), icloud.readTimeline(current.username), icloud.readBackupHistory(current.username), icloud.readReleasePlan(current.username), icloud.readReleaseHistory(current.username), icloudProvider.info()]);
     let fullBackup = fullBackupStored;
@@ -514,12 +524,16 @@ async function handleIcloud(request, response, url) {
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/verify") {
     const context = await icloud.connectionContext(current.username);
-    const verification = await icloudProvider.verifyRuntimeSession(current.username, context);
+    const log = debugLogs.start(current.username, "verify_session");
+    let verification;
+    try { verification = await icloudProvider.verifyRuntimeSession(current.username, { ...context, debugLog: log }); log.write("finished", verification); }
+    catch (error) { log.write("exception", { type: error?.name, code: error?.code }); throw error; }
     const config = await icloud.recordConnectionCheck(current.username, verification);
     return json(response, 200, {
       ...config,
       providerInfo: { id: verification.providerInfo.id, available: verification.providerInfo.available, version: verification.providerInfo.version },
       verification: { status: verification.status, message: verification.message },
+      debugLog: log.info,
     });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/scan") {
@@ -720,10 +734,13 @@ async function handleIcloud(request, response, url) {
       if (body.background === true) return json(response, 202, { deleteJob: releaseDeleteJobs.start(current.username, { assets, recycleLocal, preview: true }) });
       const localRecyclePlan = recycleLocal ? await icloud.prepareLocalRecycle(current.username, assets) : { fileCount: 0, bytes: 0 };
       const context = await icloud.connectionContext(current.username);
-      const preview = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: false });
+      const log = debugLogs.start(current.username, "cloud_delete_preview", { assets });
+      const preview = await icloudProvider.deleteAssets({ ...context, jobKey: current.username, assets, commit: false, debugLog: log });
+      log.write("finished", preview);
+      preview.debugLog = log.info;
       return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview, localRecyclePlan: { fileCount: localRecyclePlan.fileCount, bytes: localRecyclePlan.bytes } });
     }
-    if (body.confirmation !== "移入最近删除") return json(response, 400, { error: "请输入“移入最近删除”确认。" });
+    if (body.confirmation !== true && body.confirmation !== "移入最近删除") return json(response, 400, { error: "请点击确认后再提交删除。" });
     const deleteJob = releaseDeleteJobs.start(current.username, { assets, recycleLocal });
     if (body.background === true) return json(response, 202, { deleteJob });
     const completedJob = await releaseDeleteJobs.wait(current.username, deleteJob.id);

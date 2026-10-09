@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { DebugLogLink, type DebugLog } from "./icloud-debug-log";
 import styles from "./media-actions.module.css";
 
 type AuthState = { status: string; message: string };
@@ -8,6 +9,7 @@ const activeStates = new Set(["starting", "waiting_password", "waiting_mfa", "ve
 
 export default function AppleSessionControls({ disabled = false, onVerified, onBusyChange }: { disabled?: boolean; onVerified?: () => void; onBusyChange?: (busy: boolean) => void }) {
   const [auth, setAuth] = useState<AuthState | null>(null);
+  const [debugLog, setDebugLog] = useState<DebugLog>();
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -17,9 +19,10 @@ export default function AppleSessionControls({ disabled = false, onVerified, onB
     setBusy(true); setError(""); setMessage("正在验证 Apple 会话和照片图库访问…");
     try {
       const response = await fetch("/api/icloud/verify", { method: "POST" });
-      const data = await response.json() as { verification?: AuthState; error?: string };
+      const data = await response.json() as { verification?: AuthState; debugLog?: DebugLog; error?: string };
+      setDebugLog(data.debugLog);
       if (!response.ok || data.verification?.status !== "connected") throw new Error(data.error || data.verification?.message || "会话或图库访问未通过，请重新登录 Apple。");
-      setMessage("会话和照片图库验证通过。可重新点击“继续”复核，验证不会自动删除图片。");
+      setMessage(`${data.verification.message} 可重新点击“继续”复核，验证不会自动删除图片。`);
       onVerified?.();
     } catch (reason) { setMessage(""); setError(reason instanceof Error ? reason.message : "会话验证失败。"); }
     finally { setBusy(false); }
@@ -96,5 +99,6 @@ export default function AppleSessionControls({ disabled = false, onVerified, onB
     {authStatus === "waiting_mfa" && <form onSubmit={event => void submit(event, "mfa")}><label>六位验证码 <input inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={code} onChange={event => setCode(event.target.value)} required disabled={disabled || busy} /></label><button className={`${styles.button} ${styles.primaryButton}`} disabled={disabled || busy}>提交验证码</button></form>}
     {active && <button className={styles.button} type="button" disabled={disabled || busy} onClick={() => void cancel()}>取消 Apple 登录</button>}
     {message && <p className={styles.success} role="status">{message}</p>}{error && <p className={styles.error} role="alert">{error}</p>}
+    <DebugLogLink log={debugLog} />
   </section>;
 }

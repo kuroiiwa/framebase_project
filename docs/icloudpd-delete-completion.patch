@@ -1,0 +1,128 @@
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -991,6 +991,13 @@
+     return f"Skipping {filename}, only downloading {photo_video_phrase}. (Item type was: {photo.item_type})"
+ 
+ 
++def framebase_report_error(error: Exception, status: str) -> None:
++    """Report a safe category even when only-print-filenames disables logging."""
++    if os.environ.get("FRAMEBASE_DELETE_REQUEST") or os.environ.get("FRAMEBASE_VERIFY_SESSION"):
++        reason = "photos_indexing" if isinstance(error, PyiCloudServiceNotActivatedException) and "has not finished indexing" in str(error) else type(error).__name__
++        print("FRAMEBASE_ERROR " + json.dumps({"status": status, "reason": reason}), flush=True)
++
++
+ def core_single_run(
+     logger: logging.Logger,
+     status_exchange: StatusExchange,
+@@ -1340,6 +1347,8 @@
+                             except StopIteration:
+                                 break
+ 
++                        if framebase_delete_assets:
++                            print("FRAMEBASE_DELETE_DONE " + json.dumps({"total": len(framebase_delete_assets), "processed": photos_counter}), flush=True)
+                         if global_config.only_print_filenames:
+                             return 0
+                         else:
+@@ -1376,6 +1385,7 @@
+                     else:
+                         pass
+         except PyiCloudFailedLoginException as error:
++            framebase_report_error(error, "needs_auth")
+             logger.info(error)
+             dump_responses(logger.debug, captured_responses)
+             if PasswordProvider.WEBUI in global_config.password_providers:
+@@ -1384,6 +1394,7 @@
+             else:
+                 return 1
+         except PyiCloudFailedMFAException as error:
++            framebase_report_error(error, "needs_auth")
+             logger.info(str(error))
+             dump_responses(logger.debug, captured_responses)
+             if global_config.mfa_provider == MFAProvider.WEBUI:
+@@ -1397,6 +1408,7 @@
+             PyiCloudAPIResponseException,
+             PyiCloudConnectionErrorException,
+         ) as error:
++            framebase_report_error(error, "network_error" if isinstance(error, (PyiCloudConnectionErrorException, PyiCloudServiceUnavailableException)) else "photos_error")
+             logger.info(error)
+             dump_responses(logger.debug, captured_responses)
+             # webui will display error and wait for password again
+--- a/src/starters/icloudpd.py
++++ b/src/starters/icloudpd.py
+@@ -1,6 +1,17 @@
+ #!/usr/bin/env python
+-
++import json
++import os
++import sys
+ from icloudpd.cli import cli
+ 
++
++def main() -> int:
++    result = cli()
++    code = result if isinstance(result, int) else 0
++    if code and (os.environ.get("FRAMEBASE_DELETE_REQUEST") or os.environ.get("FRAMEBASE_VERIFY_SESSION")):
++        print("FRAMEBASE_ERROR " + json.dumps({"status": "error", "reason": "cli_failed"}), flush=True)
++    return code
++
++
+ if __name__ == "__main__":
+-    cli()
++    sys.exit(main())
+--- a/tests/test_framebase_inventory.py
++++ b/tests/test_framebase_inventory.py
+@@ -2,6 +2,9 @@
+ import logging
+ import os
+ import tempfile
++import io
++import runpy
++from contextlib import redirect_stdout
+ from unittest import TestCase
+ from unittest.mock import Mock, patch
+ 
+@@ -11,6 +14,7 @@
+ from datetime import datetime, timezone
+ 
+ from icloudpd.base import delete_photo, framebase_asset_metadata, load_framebase_delete_request, framebase_target_photos
++from pyicloud_ipd.exceptions import PyiCloudConnectionErrorException, PyiCloudFailedLoginException, PyiCloudServiceNotActivatedException
+ from pyicloud_ipd.item_type import AssetItemType
+ from pyicloud_ipd.raw_policy import RawTreatmentPolicy
+ from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
+@@ -76,6 +80,7 @@
+                     self.assertEqual(result.exit_code, 0, result.output)
+                     records = [json.loads(line.removeprefix("FRAMEBASE_DELETE "))
+                         for line in result.output.splitlines() if line.startswith("FRAMEBASE_DELETE ")]
++                    self.assertIn("FRAMEBASE_DELETE_DONE ", result.output)
+                     self.assertEqual(len(records), 1)
+                     self.assertEqual(records[0]["status"], "deleted" if commit else "matched", records[0])
+                     self.assertEqual(records[0]["id"], asset["id"])
+@@ -86,6 +91,28 @@
+                         delete.assert_not_called()
+         finally:
+             os.unlink(request_path)
++
++    def test_silent_network_and_auth_failures_report_safe_machine_errors(self) -> None:
++        args = ["--username", "jdoe@gmail.com", "--password", "password1", "--recent", "1", "--no-progress-bar", "--only-print-filenames"]
++        for error, expected in [(PyiCloudConnectionErrorException("private diagnostics"), "network_error"), (PyiCloudFailedLoginException("private diagnostics"), "needs_auth"), (PyiCloudServiceNotActivatedException("Apple iCloud Photo Library has not finished indexing yet", None), "photos_error")]:
++            with patch("icloudpd.base.authenticator", side_effect=error):
++                _, result = run_icloudpd_test(self.assertEqual, self.root_path,
++                    os.path.join(self.fixtures_path, "test_framebase_inventory"),
++                    "listing_photos.yml", [], [], args,
++                    additional_env={"FRAMEBASE_VERIFY_SESSION": "1"})
++            self.assertEqual(result.exit_code, 1)
++            diagnostic = json.loads(next(line for line in result.output.splitlines() if line.startswith("FRAMEBASE_ERROR ")).removeprefix("FRAMEBASE_ERROR "))
++            self.assertEqual(diagnostic["status"], expected)
++            if isinstance(error, PyiCloudServiceNotActivatedException):
++                self.assertEqual(diagnostic["reason"], "photos_indexing")
++            self.assertNotIn("private diagnostics", result.output)
++
++    def test_executable_starter_preserves_failed_cli_exit_code(self) -> None:
++        starter = os.path.join(os.path.dirname(self.root_path), "src", "starters", "icloudpd.py")
++        with patch("icloudpd.cli.cli", return_value=1), patch.dict(os.environ, {"FRAMEBASE_VERIFY_SESSION": "1"}), redirect_stdout(io.StringIO()):
++            with self.assertRaises(SystemExit) as failed:
++                runpy.run_path(starter, run_name="__main__")
++            self.assertEqual(failed.exception.code, 1)
+ 
+     def test_inventory_keeps_assets_with_incomplete_download_fields(self) -> None:
+         photo = Mock()

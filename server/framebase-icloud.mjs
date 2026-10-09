@@ -554,10 +554,11 @@ export function createIcloudManager({ projectRoot }) {
     const deletedAssets = cleanTimelineAssets(requestedAssets).filter(asset => deletedKeys.has(`${asset.library}:${asset.id}`) && !previouslyDeleted.has(`${asset.library}:${asset.id}`));
     if (!deletedAssets.length) return current;
     const completedAt = new Date().toISOString();
-    const movedBytes = deletedAssets.reduce((sum, asset) => sum + asset.originalBytes, 0);
+    const newlyDeletedAssets = deletedAssets.filter(asset => !(result.results || []).some(item => item.id === asset.id && item.library === asset.library && item.alreadyDeleted));
+    const movedBytes = newlyDeletedAssets.reduce((sum, asset) => sum + asset.originalBytes, 0);
     const recycled = Array.isArray(recycleResult?.results) ? recycleResult.results.filter(item => item.status === "recycled") : [];
     const recycledBytes = recycled.reduce((sum, item) => sum + Math.max(0, Number(item.size) || 0), 0);
-    const history = { version: 2, movedCount: current.movedCount + deletedAssets.length, movedBytes: current.movedBytes + movedBytes, recycledFileCount: current.recycledFileCount + recycled.length, recycledBytes: current.recycledBytes + recycledBytes, lastReleasedAt: completedAt, events: [...current.events, { id: randomUUID(), completedAt, count: deletedAssets.length, bytes: movedBytes, recycledFileCount: recycled.length, recycledBytes, recycleStatus: recycleResult?.status || "not_requested", recycleResults: Array.isArray(recycleResult?.results) ? recycleResult.results : [], assets: deletedAssets.map(asset => ({ id: asset.id, library: asset.library, name: asset.name })) }].slice(-500) };
+    const history = { version: 2, movedCount: current.movedCount + newlyDeletedAssets.length, movedBytes: current.movedBytes + movedBytes, recycledFileCount: current.recycledFileCount + recycled.length, recycledBytes: current.recycledBytes + recycledBytes, lastReleasedAt: completedAt, events: [...current.events, { id: randomUUID(), completedAt, count: deletedAssets.length, bytes: movedBytes, recycledFileCount: recycled.length, recycledBytes, recycleStatus: recycleResult?.status || "not_requested", recycleResults: Array.isArray(recycleResult?.results) ? recycleResult.results : [], assets: deletedAssets.map(asset => ({ id: asset.id, library: asset.library, name: asset.name })) }].slice(-500) };
     await atomicJson(username, releaseHistoryPath(username), history);
     await removeRecycledFromManifest(username, recycleResult?.results);
     try {
@@ -743,7 +744,7 @@ export function createIcloudManager({ projectRoot }) {
     const current = await read(username);
     const config = {
       ...current,
-      connectionStatus: result.status === "connected" ? "connected" : "expired",
+      connectionStatus: result.status === "connected" ? "connected" : result.status === "needs_auth" ? "expired" : current.connectionStatus,
       lastConnectionCheckAt: new Date().toISOString(),
       lastConnectionMessage: result.message,
       updatedAt: new Date().toISOString(),
