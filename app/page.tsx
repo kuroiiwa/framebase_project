@@ -12,6 +12,7 @@ import AdminDashboard from "./admin-dashboard";
 import ConfirmationDialog, { type ConfirmationRequest } from "./confirmation-dialog";
 import CloudDeleteWindow from "./cloud-delete-window";
 import { waitForCloudDelete, type CloudDeleteJob } from "./icloud-delete-progress";
+import { collectCloudSelection } from "./photos/bulk-selection";
 
 type FsPermission = "granted" | "denied" | "prompt";
 type FileHandle = {
@@ -79,7 +80,8 @@ type StoryboardCacheRecord = { key: string; size: number; lastAccess: number };
 type HealthIssue = { video: VideoItem; kind: "unavailable" | "changed" | "empty" | "preview"; detail: string };
 type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number; localFiles: string[] };
 type ReleaseCatalog = { releasePlan: { id: string | null; status: string; assets: IcloudAsset[] } | null; releaseHistory: { movedCount: number; movedBytes: number; recycledFileCount: number; recycledBytes: number; lastReleasedAt: string | null }; timeline: { staleAt: string | null; staleReason: string | null } };
-type VideoCloudDeleteJob = CloudDeleteJob & { result?: { releaseResult?: { status: string; message: string }; localRecyclePlan?: { fileCount: number; bytes: number }; recycleResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"] } };
+type VideoCloudSelection = { assets: IcloudAsset[]; matched: Array<{ item: VideoItem; asset: IcloudAsset }>; skipped: VideoItem[] };
+type VideoCloudDeleteJob = CloudDeleteJob & { result?: { releaseResult?: { status: string; message: string; results?: Array<{ id: string; library: string; status: string }> }; localRecyclePlan?: { fileCount: number; bytes: number }; recycleResult?: { status: string; message: string; results?: Array<{ relativePath: string; status: string }> }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"] } };
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg"]);
 const DB_STORE = "cache";
@@ -423,6 +425,8 @@ function Library({ username }: { username: string }) {
   const [popularitySeed, setPopularitySeed] = useState(0);
   const [pageSize, setPageSize] = useState<PageSize>(50);
   const [currentPage, setCurrentPage] = useState(1);
+  const videoPaginationRef = useRef<HTMLElement>(null);
+  const [videoPaginationVisible, setVideoPaginationVisible] = useState(true);
   const [layout, setLayout] = useState<LayoutMode>("comfortable");
   const [fontSize, setFontSize] = useState<FontSize>("medium");
   const [customTags, setCustomTags] = useState<CustomTag[]>([]);
@@ -521,44 +525,73 @@ function Library({ username }: { username: string }) {
     return created.getFullYear() === modified.getFullYear() && created.getMonth() === modified.getMonth() ? candidates[0] : null;
   }, [releaseCatalog]);
 
-  async function releaseVideoFromIcloud(video: VideoItem, asset: IcloudAsset) {
+  async function releaseSelectedVideosFromIcloud() {
+    if (releasingAsset !== null || !selectedVideos.length) return;
+    if (selectedVideos.length > 100) { setError("每批最多安全释放 100 个视频，请减少选择后再试。"); return; }
+    const selection = collectCloudSelection(selectedVideos, cloudAssetFor);
+    if (!selection.matched.length) { setError("选中视频没有可精确匹配的已确认 iCloud 项目，请先在备份中心复核并确认释放计划。"); return; }
+    const first = selection.matched[0];
+    await releaseVideoFromIcloud(first.item, first.asset, selection);
+  }
+
+  async function releaseVideoFromIcloud(video: VideoItem, asset: IcloudAsset, batch?: VideoCloudSelection) {
     if (releasingAsset !== null) return;
-    const key = `${asset.library}:${asset.id}`;
-    setReleasingAsset(key); setError(null); setNotice(null);
+    const selection = batch || { assets: [asset], matched: [{ item: video, asset }], skipped: [] };
+    if (!selection.assets.length || selection.matched.length + selection.skipped.length > 100) return;
+    const keys = selection.assets.map(item => `${item.library}:${item.id}`);
+    const name = batch ? `批量安全释放 ${selection.assets.length} 个云端视频` : video.name;
+    const bytes = selection.assets.reduce((sum, item) => sum + item.originalBytes, 0);
+    const summary = batch ? `已选 ${selection.matched.length + selection.skipped.length} 个视频，精确匹配 ${selection.assets.length} 个云端项目；跳过 ${selection.skipped.length} 个未匹配视频。\n\n处理范围：\n${selection.matched.slice(0, 5).map(({ item }) => `${item.sourceName} / ${item.path}`).join("\n")}${selection.matched.length > 5 ? `\n另有 ${selection.matched.length - 5} 个视频。` : ""}${selection.skipped.length ? `\n\n跳过：${selection.skipped.slice(0, 5).map(item => item.name).join("、")}${selection.skipped.length > 5 ? "等" : ""}，不会删除。` : ""}` : `“${video.name}”`;
+    setReleasingAsset(batch ? "batch" : keys[0]); setError(null); setNotice(null);
     try {
-      const scope = await requestCloudConfirmation({ title: "选择视频清理范围", message: `“${video.name}”将从 iCloud 移入“最近删除”。是否同时将本地备份移入 Windows 回收站？`, choices: [{ label: "仅清理 iCloud", value: "cloud" }, { label: "云端和本地同时清理", value: "both", danger: true }] });
+      const scope = await requestCloudConfirmation({ title: "选择视频清理范围", message: `${summary}\n\n将从 iCloud 移入“最近删除”。是否同时将本地备份移入 Windows 回收站？`, choices: [{ label: "仅清理 iCloud", value: "cloud" }, { label: "云端和本地同时清理", value: "both", danger: true }] });
       if (scope === null) return;
       const recycleLocal = scope === "both";
       videoDeleteAbort.current = new AbortController();
-      setVideoDeleteJob({ status: "running", preview: true, phase: "preview", name: video.name, startedAt: Date.now(), message: "正在启动后台复核，尚未执行删除…" });
-      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], recycleLocal, background: true }) });
+      setVideoDeleteJob({ status: "running", preview: true, phase: "preview", name, total: selection.assets.length, startedAt: Date.now(), message: "正在启动后台复核，尚未执行删除…" });
+      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: keys, recycleLocal, background: true }) });
       const previewStarted = await previewResponse.json() as { deleteJob?: VideoCloudDeleteJob; error?: string };
       if (!previewResponse.ok || !previewStarted.deleteJob?.id) throw new Error(previewStarted.error || "云端视频复核未能启动。");
       setVideoDeleteJob(previewStarted.deleteJob);
       const reviewed = await waitForCloudDelete<VideoCloudDeleteJob>(previewStarted.deleteJob.id, setVideoDeleteJob, videoDeleteAbort.current.signal);
       const preview = reviewed.result;
-      if (reviewed.status !== "completed" || preview?.releaseResult?.status !== "matched") throw new Error(reviewed.message || "云端视频复核失败，没有执行删除。");
-      const localSummary = recycleLocal ? `同时将 ${preview.localRecyclePlan?.fileCount || 0} 个本地原文件（${formatBytes(preview.localRecyclePlan?.bytes || 0)}）移入 Windows 回收站。` : "本地视频会保留。";
-      const confirmation = await requestCloudConfirmation({ title: "确认清理视频", message: `已精确匹配“${video.name}”。云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。${localSummary}`, choices: [{ label: "确认删除", value: "confirm", danger: true }] });
+      const verifiedKeys = new Set((preview?.releaseResult?.results || []).filter(result => result.status === "matched").map(result => `${result.library}:${result.id}`));
+      const verifiedAssets = selection.assets.filter(item => verifiedKeys.has(`${item.library}:${item.id}`));
+      if (!verifiedAssets.length) throw new Error(reviewed.message || "云端视频复核失败，没有执行删除。");
+      const commitKeys = verifiedAssets.map(item => `${item.library}:${item.id}`);
+      const unverifiedCount = selection.assets.length - verifiedAssets.length;
+      const verifiedBytes = unverifiedCount ? verifiedAssets.reduce((sum, item) => sum + item.originalBytes, 0) : bytes;
+      const reviewSummary = unverifiedCount ? `仅 ${verifiedAssets.length}/${selection.assets.length} 个云端项目复核通过，另 ${unverifiedCount} 个未通过或未返回结果，将保留且不提交删除。\n${reviewed.message || ""}\n\n本次仅处理：\n${selection.matched.filter(({ asset }) => verifiedKeys.has(`${asset.library}:${asset.id}`)).slice(0, 5).map(({ item }) => `${item.sourceName} / ${item.path}`).join("\n")}\n` : "复核通过。";
+      const localSummary = recycleLocal ? unverifiedCount ? "仅回收这些复核通过项目的对应本地原文件；提交时会重新校验。" : `同时将 ${preview?.localRecyclePlan?.fileCount || 0} 个本地原文件（${formatBytes(preview?.localRecyclePlan?.bytes || 0)}）移入 Windows 回收站。` : "本地视频会保留。";
+      const confirmation = await requestCloudConfirmation({ title: unverifiedCount ? "确认仅清理复核通过的视频" : "确认清理视频", message: `${summary}\n\n${reviewSummary}\n将 ${verifiedAssets.length} 个云端项目移入“最近删除”，预计 ${formatBytes(verifiedBytes)}。${localSummary}${recycleLocal ? "仅在云端确认删除成功后回收对应本地文件。" : ""}`, choices: [{ label: unverifiedCount ? `仅释放复核通过的 ${verifiedAssets.length} 个` : "确认删除", value: "confirm", danger: true }] });
       if (confirmation !== "confirm") { setVideoDeleteJob(null); return; }
-      setVideoDeleteJob({ status: "running", phase: "preparing", name: video.name, startedAt: Date.now(), message: "已确认，正在启动后台删除…" });
-      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation: true, recycleLocal, background: true }) });
+      setVideoDeleteJob({ status: "running", phase: "preparing", name: batch ? `批量安全释放 ${verifiedAssets.length} 个云端视频` : name, total: verifiedAssets.length, startedAt: Date.now(), message: "已确认，正在启动后台删除…" });
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: commitKeys, confirmation: true, recycleLocal, background: true }) });
       const started = await response.json() as { deleteJob?: VideoCloudDeleteJob; error?: string };
       if (!response.ok || !started.deleteJob?.id) throw new Error(started.error || "删除任务未能启动。");
       setVideoDeleteJob(started.deleteJob);
       const completed = await waitForCloudDelete<VideoCloudDeleteJob>(started.deleteJob.id, setVideoDeleteJob, videoDeleteAbort.current.signal);
       const data = completed.result;
-      if (data?.releaseResult?.status !== "deleted") throw new Error(completed.message || "iCloud 删除未完成。");
-      setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
-      if (data.recycleResult?.status === "recycled") {
-        const nextVideos = videoLibraryRef.current.videos.filter(item => item.id !== video.id);
-        const nextSources = videoLibraryRef.current.sources.map(source => source.id === video.sourceId ? { ...source, videoCount: nextVideos.filter(item => item.sourceId === source.id).length, totalSize: nextVideos.filter(item => item.sourceId === source.id).reduce((sum, item) => sum + item.size, 0) } : source);
+      if (!data?.releaseResult) throw new Error(completed.message || "iCloud 删除未完成。");
+      const deletedKeys = new Set((data.releaseResult.results || []).filter(result => result.status === "deleted").map(result => `${result.library}:${result.id}`));
+      const recycledPaths = new Set((data.recycleResult?.results || []).filter(result => result.status === "recycled").map(result => result.relativePath.replaceAll("\\", "/").toLowerCase()));
+      const successful = selection.matched.filter(({ asset }) => deletedKeys.has(`${asset.library}:${asset.id}`));
+      const recycledIds = new Set(recycleLocal ? successful.filter(({ item, asset }) => asset.localFiles.some(path => path.replaceAll("\\", "/").toLowerCase() === item.path.replaceAll("\\", "/").toLowerCase() && recycledPaths.has(path.replaceAll("\\", "/").toLowerCase()))).map(({ item }) => item.id) : []);
+      setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => !deletedKeys.has(`${candidate.library}:${candidate.id}`)) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
+      if (recycledIds.size) {
+        const affectedSources = new Set(selection.matched.filter(({ item }) => recycledIds.has(item.id)).map(({ item }) => item.sourceId));
+        const nextVideos = videoLibraryRef.current.videos.filter(item => !recycledIds.has(item.id));
+        const nextSources = videoLibraryRef.current.sources.map(source => affectedSources.has(source.id) ? { ...source, videoCount: nextVideos.filter(item => item.sourceId === source.id).length, totalSize: nextVideos.filter(item => item.sourceId === source.id).reduce((sum, item) => sum + item.size, 0) } : source);
         setVideos(nextVideos); setSources(nextSources);
-        setSelected(current => new Set([...current].filter(id => id !== video.id)));
-        setPlayer(current => current?.id === video.id ? null : current);
-        await Promise.all([dbSet(`library:${video.sourceId}`, nextVideos.filter(item => item.sourceId === video.sourceId).map(storedVideo)), dbSet("source-folders", nextSources)]);
+        setPlayer(current => current && recycledIds.has(current.id) ? null : current);
+        await Promise.all([...affectedSources].map(sourceId => dbSet(`library:${sourceId}`, nextVideos.filter(item => item.sourceId === sourceId).map(storedVideo))).concat(dbSet("source-folders", nextSources)));
       }
-      setNotice(data.recycleResult ? `“${video.name}”已移入 iCloud“最近删除”。${data.recycleResult.message}` : `“${video.name}”已移入 iCloud“最近删除”，本地视频未删除。预计可释放 ${formatBytes(asset.originalBytes)}。`);
+      const finishedIds = new Set(recycleLocal ? recycledIds : successful.map(({ item }) => item.id));
+      setSelected(current => new Set([...current].filter(id => !finishedIds.has(id))));
+      const resultSummary = `云端已确认删除 ${deletedKeys.size}/${verifiedAssets.length} 个项目${recycleLocal ? `，本地已回收 ${recycledIds.size} 个所选视频` : "，本地视频保留"}；保留 ${unverifiedCount} 个未通过复核的云端项目，跳过 ${selection.skipped.length} 个未匹配视频。`;
+      setVideoDeleteJob(current => current ? { ...current, message: `${current.message || ""}\n${resultSummary}` } : current);
+      setNotice(resultSummary);
+      if (completed.status !== "completed") setError(completed.message || "部分视频未完成，失败项已保留。");
     } catch (reason) {
       if (videoDeleteAbort.current?.signal.aborted) return;
       const message = reason instanceof Error ? reason.message : "iCloud 删除失败。";
@@ -1073,6 +1106,15 @@ function Library({ username }: { username: string }) {
   const nextVideo = queuePosition >= 0 ? videos.find(video => video.id === availableQueue[queuePosition + 1]) : undefined;
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const visiblePage = Math.min(currentPage, totalPages);
+  useEffect(() => {
+    const target = videoPaginationRef.current;
+    if (!target || !("IntersectionObserver" in window)) return;
+    const observer = new IntersectionObserver(entries => {
+      setVideoPaginationVisible(entries.some(entry => entry.isIntersecting));
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [loading, totalPages, filtered.length]);
   const pageStart = (visiblePage - 1) * pageSize;
   const paginatedVideos = filtered.slice(pageStart, pageStart + pageSize);
   const filteredIds = new Set(filtered.map(video => video.id));
@@ -1324,7 +1366,7 @@ function Library({ username }: { username: string }) {
             <p>{filtered.length.toLocaleString()} 个视频 <span>· {filtered.length ? `当前显示 ${pageStart + 1}–${Math.min(pageStart + pageSize, filtered.length)}` : "当前视图"}{query || format !== "all" || resolutionFilter !== "all" || durationFilter !== "all" || selectedTagIds.size ? " · 已筛选" : ""}</span></p>
             <div className="selection-actions">
               <button className="select-all" disabled={loading || !filtered.length} title={`选中当前筛选结果中的全部 ${filtered.length} 个视频（包含所有分页）`} onClick={() => { setSelecting(true); selectionAnchor.current = null; setSelected(new Set(filtered.map(video => video.id))); }}>全部选中</button>
-              {selecting && <><button onClick={() => { selectionAnchor.current = null; setSelected(current => new Set([...current, ...paginatedVideos.map(v => v.id)])); }}>全选本页</button><button onClick={() => { selectionAnchor.current = null; setSelected(current => { const next = new Set(current); paginatedVideos.forEach(video => { if (next.has(video.id)) next.delete(video.id); else next.add(video.id); }); return next; }); }}>反选本页</button><button disabled={!selected.size} onClick={() => { setSelected(new Set()); selectionAnchor.current = null; }}>取消全部</button><span>已选 {selected.size} 个</span>{selected.size > 0 && <button className="danger-text" onClick={() => setConfirmDelete(true)}>删除</button>}</>}
+              {selecting && <><button onClick={() => { selectionAnchor.current = null; setSelected(current => new Set([...current, ...paginatedVideos.map(v => v.id)])); }}>全选本页</button><button onClick={() => { selectionAnchor.current = null; setSelected(current => { const next = new Set(current); paginatedVideos.forEach(video => { if (next.has(video.id)) next.delete(video.id); else next.add(video.id); }); return next; }); }}>反选本页</button><button disabled={!selected.size} onClick={() => { setSelected(new Set()); selectionAnchor.current = null; }}>取消全部</button><span>已选 {selected.size} 个</span><button className="bulk-cloud-release" disabled={!selectedVideos.length || selectedVideos.length > 100 || releasingAsset !== null || releaseCatalog?.releasePlan?.status !== "confirmed"} title={selectedVideos.length > 100 ? "每批最多 100 个视频" : releaseCatalog?.releasePlan?.status !== "confirmed" ? "请先在 iCloud 备份中心复核并确认释放计划" : "仅处理精确匹配项目，每批最多 100 个"} onClick={() => void releaseSelectedVideosFromIcloud()}>批量安全释放 iCloud</button>{selected.size > 0 && <button className="danger-text" onClick={() => setConfirmDelete(true)}>删除</button>}</>}
               <button className="select" aria-pressed={selecting} onClick={() => { setSelecting(value => !value); setSelected(new Set()); selectionAnchor.current = null; }}>{selecting ? "退出选择" : "选择"}</button>
             </div>
           </section>
@@ -1361,7 +1403,7 @@ function Library({ username }: { username: string }) {
             </section>
           ) : <section className="no-results"><strong>没有符合条件的视频</strong><p>试试清除搜索词或调整筛选条件。</p><button onClick={() => { setQuery(""); setFormat("all"); setResolutionFilter("all"); setDurationFilter("all"); setSelectedTagIds(new Set()); setTab("all"); setCurrentPage(1); }}>清除筛选</button></section>}
 
-          {!loading && filtered.length > 0 && <nav className="pagination" aria-label="视频分页">
+          {!loading && filtered.length > 0 && <nav ref={videoPaginationRef} className="pagination" aria-label="视频分页">
             <label>每页<select value={pageSize} onChange={event => { setPageSize(Number(event.target.value) as PageSize); setCurrentPage(1); }} aria-label="每页视频数量"><option value={20}>20</option><option value={50}>50</option><option value={100}>100</option></select>个</label>
             <div>
               <button onClick={() => setCurrentPage(1)} disabled={visiblePage === 1} aria-label="第一页">«</button>
@@ -1376,6 +1418,12 @@ function Library({ username }: { username: string }) {
       )}
 
       <footer className="footer"><span><i /> 本地模式 · 文件不会上传</span><span>预览缓存在浏览器中 <button onClick={clearCache}>清除缓存</button></span></footer>
+
+      {totalPages > 1 && !loading && !videoPaginationVisible && !player && !cloudConfirmation && !confirmDelete && !healthOpen && !drawCard && !shortcutHelp && <nav className={`floating-video-pagination ${videoDeleteJob ? "with-delete-task" : ""}`} aria-label="悬浮视频翻页">
+        <button className="secondary" disabled={visiblePage === 1} onClick={() => setCurrentPage(Math.max(1, visiblePage - 1))}>← 上一页</button>
+        <span aria-live="polite">{visiblePage} / {totalPages}</span>
+        <button className="secondary" disabled={visiblePage === totalPages} onClick={() => setCurrentPage(Math.min(totalPages, visiblePage + 1))}>下一页 →</button>
+      </nav>}
 
       {drawCard && <div className="modal-backdrop">
         <section className="draw-modal" role="dialog" aria-modal="true" aria-label="随机抽卡结果">

@@ -664,7 +664,7 @@ test("provider deletes only exact asset ids through the protected FrameBase adap
         const request = JSON.parse(await readFile(options.env.FRAMEBASE_DELETE_REQUEST, "utf8"));
         calls.push({ args, options, request });
         const asset = request.assets[0];
-        return { stdout: `FRAMEBASE_DELETE ${JSON.stringify({ id: asset.id, library: asset.library, status: options.env.FRAMEBASE_DELETE_COMMIT === "1" ? "deleted" : "matched", bytes: asset.originalBytes })}\n`, stderr: "" };
+        return { stdout: `FRAMEBASE_DELETE ${JSON.stringify({ id: asset.id, library: asset.library, status: options.env.FRAMEBASE_DELETE_COMMIT === "1" ? "deleted" : "matched", bytes: asset.originalBytes, lookupAssetRecordName: "fresh-asset-record" })}\n`, stderr: "" };
       },
     });
     const asset = { id: "asset-1", library: "SharedSync", name: "IMG_0001.HEIC", created: "2024-03-02T10:00:00+08:00", mediaType: "photo", originalBytes: 4096 };
@@ -679,6 +679,10 @@ test("provider deletes only exact asset ids through the protected FrameBase adap
     assert.equal(calls[0].args.some(argument => ["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"].includes(argument)), false);
     assert.equal(calls[0].options.env.FRAMEBASE_DELETE_COMMIT, undefined);
     assert.equal(calls[1].options.env.FRAMEBASE_DELETE_COMMIT, "1");
+    assert.equal(calls[0].request.assets[0].lookupAssetRecordName, undefined);
+    assert.equal(calls[1].request.assets[0].lookupAssetRecordName, "fresh-asset-record", "commit reuses the confirmed preview's record name and still refetches cloud metadata");
+    await provider.deleteAssets({ ...context, appleAccount: "another@example.com", commit: false });
+    assert.equal(calls[2].request.assets[0].lookupAssetRecordName, undefined, "lookup hints must stay isolated between Apple accounts");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

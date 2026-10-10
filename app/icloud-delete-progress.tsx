@@ -33,7 +33,7 @@ export async function waitForCloudDelete<T extends CloudDeleteJob>(id: string, o
 
 export function CloudDeleteProgress({ job, elapsedSeconds }: { job: CloudDeleteJob; elapsedSeconds?: number }) {
   return <div className={styles.progress} role="status" aria-live="polite">
-    <strong>{job.status === "running" ? job.preview || job.phase === "preview" ? "确认前：正在复核云端项目" : "已确认，云端删除任务执行中" : job.status === "completed" ? job.preview ? "云端复核通过，尚未删除" : "删除完成" : job.status === "partial" ? "部分操作完成" : "删除未完成"}</strong>
+    <strong>{job.status === "running" ? job.preview || job.phase === "preview" ? "确认前：正在复核云端项目" : "已确认，云端删除任务执行中" : job.status === "completed" ? job.preview ? "云端复核通过，尚未删除" : "删除完成" : job.status === "partial" ? job.preview ? "部分云端项目复核通过，尚未删除" : "部分操作完成" : "删除未完成"}</strong>
     <p>{job.name}</p><p>{job.message}</p>
     <dl><div><dt>已耗时</dt><dd>{elapsedSeconds ?? job.elapsedSeconds ?? 0} 秒</dd></div><div><dt>云端已返回结果</dt><dd>{job.processed || 0} / {job.total || 1}</dd></div><div><dt>已确认移入最近删除</dt><dd>{job.deleted || 0} / {job.total || 1}</dd></div></dl>
     <DebugLogLink log={job.debugLog} />

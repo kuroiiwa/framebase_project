@@ -6,6 +6,23 @@ import { join } from "node:path";
 import test from "node:test";
 import { createIcloudManager } from "../server/framebase-icloud.mjs";
 
+test("timeline persists validated direct lookup hints without accepting invalid record names", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "framebase-direct-hints-"));
+  try {
+    const manager = createIcloudManager({ projectRoot });
+    const asset = { id: "one", library: "PrimarySync", name: "one.jpg", created: "2024-01-01", originalBytes: 100 };
+    await manager.recordTimeline("alice", { scannedAt: new Date().toISOString(), total: {}, years: [], quarters: [], months: [], assets: [
+      { ...asset, lookupAssetRecordName: "cloud-asset-record" },
+      { ...asset, id: "two", lookupAssetRecordName: "x".repeat(257) },
+      { ...asset, id: "three", lookupAssetRecordName: 123 },
+    ] });
+    const timeline = await manager.readTimeline("alice");
+    assert.equal(timeline.assets[0].lookupAssetRecordName, "cloud-asset-record");
+    assert.equal(timeline.assets[1].lookupAssetRecordName, undefined);
+    assert.equal(timeline.assets[2].lookupAssetRecordName, undefined);
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
 test("successful cloud recount clears persisted deletion warning", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "framebase-recount-"));
   try {

@@ -118,6 +118,7 @@ function publicAuthState(job) {
 export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive, hashFile = sha256File, verificationConcurrency = 2, progressInterval = 1000 }) {
   const authJobs = new Map();
   const sessionSecrets = new Map();
+  const assetLookupHints = new Map();
   const safeVerificationConcurrency = Math.min(4, Math.max(1, Math.floor(Number(verificationConcurrency) || 2)));
   const safeProgressInterval = Math.max(10, Math.floor(Number(progressInterval) || 1000));
 
@@ -816,7 +817,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", results: [], providerInfo };
     debugLog?.write("tool", { executablePath, providerInfo, commit });
-    const requested = Array.isArray(assets) ? assets.filter(asset => asset?.id && asset?.library && asset?.name && asset?.created && Number(asset?.originalBytes) > 0).slice(0, 100) : [];
+    const lookupKey = asset => JSON.stringify([sessionDirectory, appleAccount, domain, asset.library, asset.id]);
+    const requested = Array.isArray(assets) ? assets.filter(asset => asset?.id && asset?.library && asset?.name && asset?.created && Number(asset?.originalBytes) > 0).slice(0, 100).map(asset => ({ ...asset, ...(assetLookupHints.has(lookupKey(asset)) ? { lookupAssetRecordName: assetLookupHints.get(lookupKey(asset)) } : {}) })) : [];
     if (!requested.length) return { status: "invalid", message: "没有可安全匹配的 iCloud 项目。", results: [], providerInfo };
     const password = sessionSecrets.get(jobKey);
     const temporaryDirectory = await mkdtemp(join(sessionDirectory, "framebase-delete-"));
@@ -879,7 +881,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
               const progress = JSON.parse(line.slice(progressStart + "FRAMEBASE_DELETE_PROGRESS ".length));
               if (Number.isFinite(progress.scanned) && Number.isFinite(progress.remaining)) {
                 debugLog?.write("scan_progress", { library, scanned: progress.scanned, remaining: progress.remaining, direction: progress.direction });
-                scanMessage = `${progress.direction === "HINT" ? "正在已知索引附近快速查找" : progress.direction === "DESCENDING" ? "正在反向补扫未找到的目标" : "正在精确查找目标"}：已扫描 ${progress.scanned} 项，剩余 ${progress.remaining} 个目标…`;
+                scanMessage = progress.direction === "DIRECT" ? `正在按云端记录编号直接定位 ${progress.remaining} 个目标…` : `${progress.direction === "HINT" ? "正在已知索引附近快速查找" : progress.direction === "DESCENDING" ? "正在反向补扫未找到的目标" : "正在精确查找目标"}：已扫描 ${progress.scanned} 项，剩余 ${progress.remaining} 个目标…`;
                 publish();
               }
             } catch { /* Ignore malformed progress. */ }
@@ -890,6 +892,11 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           try {
             const parsed = JSON.parse(line.slice(resultStart + "FRAMEBASE_DELETE ".length));
             if (!libraryAssets.some(asset => asset.id === parsed.id && asset.library === parsed.library) || results.some(result => result.id === parsed.id && result.library === parsed.library)) return;
+            if (["matched", "deleted"].includes(parsed.status) && typeof parsed.lookupAssetRecordName === "string" && parsed.lookupAssetRecordName.length > 0 && parsed.lookupAssetRecordName.length <= 256) {
+              const key = lookupKey(parsed);
+              assetLookupHints.delete(key); assetLookupHints.set(key, parsed.lookupAssetRecordName);
+              while (assetLookupHints.size > 1000) assetLookupHints.delete(assetLookupHints.keys().next().value);
+            }
             results.push(parsed); debugLog?.write("asset_result", parsed); publish();
           } catch { /* Ignore malformed adapter output. */ }
         };

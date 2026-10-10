@@ -727,12 +727,14 @@ async function handleIcloud(request, response, url) {
     const lookupTimeline = await icloud.readTimeline(current.username);
     const libraryRanks = new Map();
     const rankByKey = new Map();
+    const recordByKey = new Map();
     for (const asset of lookupTimeline.assets || []) {
       const rank = libraryRanks.get(asset.library) || 0;
       rankByKey.set(`${asset.library}:${asset.id}`, rank);
+      if (asset.lookupAssetRecordName) recordByKey.set(`${asset.library}:${asset.id}`, asset.lookupAssetRecordName);
       libraryRanks.set(asset.library, rank + 1);
     }
-    assets = assets.map(asset => ({ ...asset, lookupRank: rankByKey.get(`${asset.library}:${asset.id}`) }));
+    assets = assets.map(asset => ({ ...asset, lookupRank: rankByKey.get(`${asset.library}:${asset.id}`), lookupAssetRecordName: recordByKey.get(`${asset.library}:${asset.id}`) || asset.lookupAssetRecordName }));
     const recycleLocal = body.recycleLocal === true;
     if (url.pathname.endsWith("/preview")) {
       if (body.background === true) return json(response, 202, { deleteJob: releaseDeleteJobs.start(current.username, { assets, recycleLocal, preview: true }) });

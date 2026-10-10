@@ -246,6 +246,22 @@ Python 模拟测试遇到 Windows 系统代理干扰 VCR 录制匹配时，可�
 
 ## 已验证基线
 
+### 按记录编号直接定位
+
+在上述补丁之后应用 [icloudpd-direct-lookup.patch](icloudpd-direct-lookup.patch)，并按前文步骤重新构建、替换兼容程序。只读清单新增 `lookupAssetRecordName`，FrameBase 会将它保存在时间统计和释放计划中；旧清单仍可使用分页查找。首次成功复核会在 Provider 中缓存目标记录编号，按 Apple 账户、区域、会话目录和图库隔离，最多缓存 1000 项，让后续正式删除优先直接定位。
+
+兼容工具对 `/records/lookup` 分批读取最新 CPLMaster 和 CPLAsset，每批最多 100 个记录，检查原片关联、最新变更标签与删除状态，再进入原有 ID、图库、名称、拍摄时间、类型和大小的精确校验。记录编号只是定位提示；不使用本地缓存的变更标签或缓存元数据提交删除。目标已经在“最近删除”时不重复提交云端删除；索引 RUNNING 仍阻止主动删除。旧提示、错误关联、接口失败或不完整返回会退回现有受限分页查询，不能据此判定目标不存在。
+
+重新读取云端时间统计后，新清单中的目标可在首次复核时使用直接定位。未更新的清单首次复核仍可能扫描，成功复核到正式删除之间可复用确认后的记录编号。真实 Apple 接口不支持直接定位时仍会回退，因此不能保证所有账户都跳过分页；当前验证为模拟接口回归，没有提交真实云端删除。
+
+回归命令（源码根目录）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_framebase_direct_lookup.py tests/test_framebase_deleted_targets.py tests/test_framebase_target_bounds.py tests/test_framebase_inventory.py -q
+```
+
+本次构建 SHA-256：`EAEA99BE680B52BB10E70E593CCB33D701B9310489019FAAA72D5250EA9FDAF8`。
+
 本兼容方案在 Windows、`icloud.com.cn` 区域完成过以下验证：
 
 - Apple ID 与双重认证成功。

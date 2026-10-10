@@ -262,6 +262,7 @@ export function createIcloudManager({ projectRoot }) {
       extension: String(item?.extension || "").toLowerCase(), originalBytes: Math.max(0, Number(item?.originalBytes) || 0),
       mainBytes: Math.max(0, Number(item?.mainBytes) || 0), livePhotoBytes: Math.max(0, Number(item?.livePhotoBytes) || 0),
       livePhoto: Boolean(item?.livePhoto), raw: Boolean(item?.raw),
+      ...(typeof item?.lookupAssetRecordName === "string" && item.lookupAssetRecordName.length > 0 && item.lookupAssetRecordName.length <= 256 ? { lookupAssetRecordName: item.lookupAssetRecordName } : {}),
     })).filter(item => item.id && item.name && !Number.isNaN(new Date(item.created).getTime()) && item.originalBytes > 0).slice(0, 50_000) : [];
   }
 

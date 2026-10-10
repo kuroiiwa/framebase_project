@@ -29,7 +29,9 @@ export function createReleaseDeleteJobs({ icloud, provider, recycleBin, debugLog
         log?.write("provider_result", releaseResult);
         if (preview) {
           job.result = { releaseResult, localRecyclePlan: { fileCount: localPlan.fileCount || 0, bytes: localPlan.bytes || 0 } };
-          job.status = releaseResult.status === "matched" ? "completed" : "failed";
+          const matchedKeys = new Set((releaseResult.results || []).filter(result => result.status === "matched").map(result => `${result.library}:${result.id}`));
+          const verifiedCount = assets.filter(asset => matchedKeys.has(`${asset.library}:${asset.id}`)).length;
+          job.status = verifiedCount === assets.length ? "completed" : verifiedCount > 0 ? "partial" : "failed";
           job.phase = job.status;
           job.message = releaseResult.message + " 尚未执行删除。";
           return;

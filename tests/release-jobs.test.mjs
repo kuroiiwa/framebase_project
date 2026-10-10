@@ -77,10 +77,10 @@ test("partial bulk cloud deletion recycles only the successful project's origina
 test("background preview exposes progress and never deletes, recycles, or records a release", async () => {
   const jobs = createReleaseDeleteJobs({
     icloud: { connectionContext: async () => ({}), prepareLocalRecycle: async () => ({files:[],fileCount:2,bytes:42}), recordReleasedAssets: () => assert.fail("preview cannot record a deletion") },
-    provider: { deleteAssets: async options => { assert.equal(options.commit,false); options.onProgress({processed:1,total:1}); return {status:"matched",message:"复核通过",results:[{status:"matched"}]}; } },
+    provider: { deleteAssets: async options => { assert.equal(options.commit,false); options.onProgress({processed:1,total:1}); return {status:"matched",message:"复核通过",results:[{id:"one",library:"default",status:"matched"}]}; } },
     recycleBin: { recycle: () => assert.fail("preview cannot recycle") },
   });
-  const started=jobs.start("alice",{assets:[{name:"one.jpg"}],recycleLocal:true,preview:true});
+  const started=jobs.start("alice",{assets:[{id:"one",library:"default",name:"one.jpg"}],recycleLocal:true,preview:true});
   const done=await jobs.wait("alice",started.id);
   assert.equal(done.preview,true);
   assert.equal(done.status,"completed");
@@ -88,3 +88,24 @@ test("background preview exposes progress and never deletes, recycles, or record
   assert.equal(done.result.localRecyclePlan.fileCount,2);
   assert.match(done.message,/尚未执行删除/);
 });
+
+for (const verified of [true, false]) {
+  test(`incomplete preview reports ${verified ? 'partial' : 'failed'} without side effects`, async () => {
+    const jobs = createReleaseDeleteJobs({
+      icloud: { connectionContext: async () => ({}), recordReleasedAssets: () => assert.fail('preview cannot record deletion') },
+      provider: { deleteAssets: async options => {
+        assert.equal(options.commit, false);
+        return { status: 'incomplete', message: 'Incomplete cloud results', results: [
+          { id: 'one', library: 'main', status: verified ? 'matched' : 'mismatch' },
+          { id: 'foreign', library: 'main', status: 'matched' },
+        ] };
+      } },
+      recycleBin: { recycle: () => assert.fail('preview cannot recycle') },
+    });
+    const started = jobs.start('alice', { assets: [{ id: 'one', library: 'main', name: 'one.mov' }, { id: 'two', library: 'main', name: 'two.mov' }], recycleLocal: false, preview: true });
+    const done = await jobs.wait('alice', started.id);
+    assert.equal(done.status, verified ? 'partial' : 'failed');
+    assert.equal(done.deleted, 0);
+    assert.equal(done.result.releaseResult.status, 'incomplete');
+  });
+}
