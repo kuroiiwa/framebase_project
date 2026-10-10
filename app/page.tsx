@@ -1423,6 +1423,7 @@ function Library({ username }: { username: string }) {
         <button className="secondary" disabled={visiblePage === 1} onClick={() => setCurrentPage(Math.max(1, visiblePage - 1))}>← 上一页</button>
         <span aria-live="polite">{visiblePage} / {totalPages}</span>
         <button className="secondary" disabled={visiblePage === totalPages} onClick={() => setCurrentPage(Math.min(totalPages, visiblePage + 1))}>下一页 →</button>
+        <button className="secondary floating-select" aria-pressed={selecting} onClick={() => { setSelecting(value => !value); setSelected(new Set()); selectionAnchor.current = null; }}>{selecting ? "退出多选" : "进入多选"}</button>
       </nav>}
 
       {drawCard && <div className="modal-backdrop">

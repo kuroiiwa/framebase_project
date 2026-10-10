@@ -163,6 +163,7 @@ h1 { margin:0; font-size:28px; letter-spacing:-1.2px; }
 .floating-video-pagination{position:fixed;z-index:35;bottom:calc(18px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:12px;max-width:calc(100vw - 24px);box-sizing:border-box;padding:8px;border:1px solid var(--line);border-radius:14px;background:var(--white);color:var(--ink);box-shadow:0 8px 32px #0004;font-size:15px}
 .floating-video-pagination button{min-height:42px;white-space:nowrap;color:var(--ink)}
 .floating-video-pagination>span{min-width:66px;text-align:center;white-space:nowrap;font-variant-numeric:tabular-nums}
+.floating-video-pagination{flex-wrap:wrap;justify-content:center;width:max-content}.floating-video-pagination .floating-select[aria-pressed=true]{background:var(--lime);color:var(--ink)}
 .floating-video-pagination.with-delete-task{left:16px;transform:none}
 @media(max-width:860px){.floating-video-pagination.with-delete-task{top:calc(12px + env(safe-area-inset-top));bottom:auto;left:12px}}
 @media(max-width:420px){.floating-video-pagination{gap:8px}.floating-video-pagination button{padding:8px 10px;font-size:14px}.floating-video-pagination>span{min-width:54px;font-size:14px}}
