@@ -913,3 +913,97 @@ test("Apple indexing errors preserve the plan and do not imply missing photos", 
   assert.equal(result.status,"indexing");assert.match(result.message,/无需因此重新生成/);assert.doesNotMatch(result.message,/未找到|失效/);
  }finally{await rm(root,{recursive:true,force:true});}
 });
+
+test("reverse timeline scan reports live records before the process completes", async t => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-live-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executablePath = join(root, "icloudpd.exe"); await writeFile(executablePath, "test");
+  const record = id => 'FRAMEBASE_INVENTORY ' + JSON.stringify({ id, created: "2025-03-02T10:00:00Z", mediaType: "photo", originalBytes: 100 });
+  const reports = [];
+  const provider = createIcloudPdProvider({ executablePath, runCommand: async (_path, args, options) => {
+    if (args.includes("--version")) return { stdout: "version:1.32.3" };
+    if (args.includes("--list-libraries")) return { stdout: "" };
+    if (options.env.FRAMEBASE_INVENTORY_DIRECTION !== "DESCENDING") return { stdout: 'FRAMEBASE_INVENTORY_TOTAL {"count":3}\n' + record("a") };
+    assert.equal(options.env.PYTHONUNBUFFERED, "1");
+    const output = record("a") + '\nFRAMEBASE_INVENTORY invalid\n' + record("b") + '\n' + record("c");
+    options.onStdout(output.slice(0, 35));
+    options.onStdout(output.slice(35));
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const live = reports.at(-1);
+    assert.equal(live.phase, "recovering");
+    assert.equal(live.recoveryScanned, 2);
+    assert.equal(live.recoveryLimit, 3);
+    assert.equal(live.recoveryAdded, 1);
+    assert.equal(live.itemCount, 2);
+    assert.ok(live.elapsedSeconds >= 1);
+    return { stdout: 'FRAMEBASE_INVENTORY_TOTAL {"count":3}\n' + output };
+  } });
+  const result = await provider.scanTimeline({ jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"), onProgress: update => reports.push(update) });
+  assert.equal(result.status, "ready");
+  assert.equal(result.total.itemCount, 3);
+  assert.ok(reports.some(update => update.recoveryScanned === 3 && update.recoveryAdded === 2));
+  assert.ok(reports.some(update => update.recoveryScanned === null));
+});
+
+test("abnormal recovery is bounded, persists cooldown, and deep recovery bypasses it", async t => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-recovery-budget-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executablePath = join(root, "icloudpd.exe"); await writeFile(executablePath, "test");
+  const sessionDirectory = join(root, "session");
+  const records = Array.from({ length: 1000 }, (_, id) => 'FRAMEBASE_INVENTORY ' + JSON.stringify({ id: String(id), created: "2025-01-01", mediaType: "photo", originalBytes: 10 }));
+  const prefix = 'FRAMEBASE_INDEXING {"indexingState":"FAILED"}\nFRAMEBASE_INVENTORY_TOTAL {"count":1000}\n';
+  let reverseCalls = 0;
+  const create = () => createIcloudPdProvider({ executablePath, runCommand: async (_path, args, options) => {
+    if (args.includes("--version")) return { stdout: "version:1.32.3" };
+    if (args.includes("--list-libraries")) return { stdout: "" };
+    if (options.env.FRAMEBASE_INVENTORY_DIRECTION !== "DESCENDING") return { stdout: prefix + records.slice(0, 990).join('\n') };
+    reverseCalls++;
+    const policy = JSON.parse(await readFile(options.env.FRAMEBASE_INVENTORY_RECOVERY_POLICY, 'utf8'));
+    assert.equal(policy.knownIds.length, 990);
+    if (reverseCalls === 1) {
+      assert.deepEqual(policy.limits, [64, 256]);
+      assert.equal(policy.stopOnNoGain, true);
+      assert.equal(options.timeout, 60000);
+      return { stdout: prefix + records.slice(926, 990).join('\n') };
+    }
+    assert.equal(policy.stopOnNoGain, false);
+    assert.equal(policy.limits.at(-1), 1000);
+    return { stdout: prefix + records.join('\n') };
+  } });
+  const context = { jobKey: 'alice', appleAccount: 'alice@example.com', domain: 'cn', sessionDirectory, backupDirectory: join(root, 'backup') };
+  const first = await create().scanTimeline(context);
+  assert.equal(first.status, 'incomplete'); assert.match(first.message, /冷却 15 分钟/);
+  const saved = await readFile(join(sessionDirectory, 'framebase-timeline-recovery-cooldown.json'), 'utf8');
+  const second = await create().scanTimeline(context);
+  assert.equal(second.status, 'incomplete'); assert.match(second.message, /冷却期/);
+  assert.equal(reverseCalls, 1);
+  assert.equal(await readFile(join(sessionDirectory, 'framebase-timeline-recovery-cooldown.json'), 'utf8'), saved);
+  const deep = await create().scanTimeline({ ...context, deepRecovery: true });
+  assert.equal(deep.status, 'ready'); assert.equal(reverseCalls, 2);
+  assert.equal(await readFile(join(sessionDirectory, 'framebase-timeline-recovery-cooldown.json'), 'utf8'), '{}');
+});
+
+test("recovery timeout remains incomplete and changed inventory invalidates cooldown", async t => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-recovery-timeout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executablePath = join(root, "icloudpd.exe"); await writeFile(executablePath, "test");
+  let id = 'a'; let reverseCalls = 0;
+  const provider = createIcloudPdProvider({ executablePath, runCommand: async (_path, args, options) => {
+    if (args.includes('--version')) return { stdout: 'version:1.32.3' };
+    if (args.includes('--list-libraries')) return { stdout: '' };
+    if (options.env.FRAMEBASE_INVENTORY_DIRECTION === 'DESCENDING') {
+      reverseCalls++;
+      throw Object.assign(new Error('timed out'), { killed: true, stdout: '' });
+    }
+    return { stdout: 'FRAMEBASE_INDEXING {"indexingState":"FAILED"}\nFRAMEBASE_INVENTORY_TOTAL {"count":3}\nFRAMEBASE_INVENTORY ' + JSON.stringify({ id, created: '2025-01-01', mediaType: 'photo', originalBytes: 1 }) };
+  } });
+  const context = { jobKey: 'alice', appleAccount: 'alice@example.com', domain: 'cn', sessionDirectory: join(root, 'session'), backupDirectory: join(root, 'backup') };
+  assert.equal((await provider.scanTimeline(context)).status, 'incomplete');
+  assert.equal((await provider.scanTimeline(context)).status, 'incomplete');
+  assert.equal(reverseCalls, 1);
+  id = 'b';
+  assert.equal((await provider.scanTimeline(context)).status, 'incomplete');
+  assert.equal(reverseCalls, 2);
+  assert.equal((await provider.scanTimeline({ ...context, appleAccount: 'bob@example.com', jobKey: 'bob' })).status, 'incomplete');
+  assert.equal(reverseCalls, 3);
+});

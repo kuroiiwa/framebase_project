@@ -69,10 +69,11 @@ const icloud = createIcloudManager({ projectRoot });
 const recycleBin = createRecycleBin();
 const bundledIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe");
 const compatibleIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-compatible.exe");
+const recoveryIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-inventory-recovery.exe");
 const icloudProvider = createIcloudPdProvider({
   executablePath: resolve(
     process.env.FRAMEBASE_ICLOUDPD_PATH
-      || (existsSync(compatibleIcloudPdPath) ? compatibleIcloudPdPath : bundledIcloudPdPath),
+      || (existsSync(recoveryIcloudPdPath) ? recoveryIcloudPdPath : existsSync(compatibleIcloudPdPath) ? compatibleIcloudPdPath : bundledIcloudPdPath),
   ),
 });
 const icloudBackupUsers = new Set();
@@ -567,13 +568,15 @@ async function handleIcloudOperation(request, response, url, current) {
     if (existing?.status === "running") return json(response, 202, { timelineJob: existing });
     const context = await icloud.connectionContext(current.username);
     const username = current.username;
+    const body = await readJsonBody(request);
+    const deepRecovery = body.deepRecovery === true;
     const timelineLog = debugLogs.start(username, "timeline_scan");
     const job = { status: "running", phase: "starting", message: "正在准备 iCloud 元数据扫描…", library: null, libraryIndex: 0, libraryCount: 0, itemCount: 0, elapsedSeconds: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     job.debugLog = timelineLog.info;
     icloudTimelineJobs.set(username, job);
     void (async () => {
       try {
-        const result = await icloudProvider.scanTimeline({ ...context, jobKey: username, debugLog: timelineLog, onProgress: progress => Object.assign(job, progress, { updatedAt: new Date().toISOString() }) });
+        const result = await icloudProvider.scanTimeline({ ...context, jobKey: username, deepRecovery, debugLog: timelineLog, onProgress: progress => Object.assign(job, progress, { updatedAt: new Date().toISOString() }) });
         timelineLog.write("finished", { status: result.status, message: result.message, total: result.total });
         if (result.status !== "ready") {
           if (result.status === "needs_auth") await icloud.recordConnectionCheck(username, result);

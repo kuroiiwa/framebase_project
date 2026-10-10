@@ -2,7 +2,7 @@ import { logToolDiagnostic, readIndexingDiagnostic } from "../framebase-debug-lo
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn as spawnPty } from "node-pty";
 
@@ -674,7 +674,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, debugLog, onProgress = () => undefined }) {
+  async function scanTimeline({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, deepRecovery = false, debugLog, onProgress = () => undefined }) {
     const startedAt = Date.now();
     const report = update => { try { onProgress({ elapsedSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)), ...update }); } catch { /* Progress reporting must not stop the scan. */ } };
     report({ phase: "starting", message: "正在准备 iCloud 元数据扫描…", libraryIndex: 0, libraryCount: 0, itemCount: 0 });
@@ -688,14 +688,15 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--size", "original", "--live-photo-size", "original", "--align-raw", "original", "--only-print-filenames",
     ];
     const inventoryEnv = { ...process.env, FRAMEBASE_INVENTORY_JSON: "1", FRAMEBASE_VERIFY_SESSION: "1" };
+    delete inventoryEnv.FRAMEBASE_INVENTORY_RECOVERY_POLICY;
     delete inventoryEnv.FRAMEBASE_DELETE_REQUEST;
     delete inventoryEnv.FRAMEBASE_DELETE_COMMIT;
-    const runInventory = async (args, direction = "ASCENDING") => {
-      const env = { ...inventoryEnv, FRAMEBASE_INVENTORY_DIRECTION: direction };
+    const runInventory = async (args, direction = "ASCENDING", onStdout, recovery = {}) => {
+      const env = { ...inventoryEnv, FRAMEBASE_INVENTORY_DIRECTION: direction, PYTHONUNBUFFERED: "1", ...(recovery.policyPath ? { FRAMEBASE_INVENTORY_RECOVERY_POLICY: recovery.policyPath } : {}) };
       debugLog?.write("timeline_inventory_start", { direction, library: args.includes("--library") ? args[args.indexOf("--library") + 1] : "default", executablePath, providerInfo });
       const result = password
-        ? await runWithRuntimePassword(args, password, 60 * 60_000, undefined, { env, maxOutput: 128 * 1024 * 1024 })
-        : await runCommand(executablePath, args, { timeout: 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env });
+        ? await runWithRuntimePassword(args, password, recovery.timeout || 60 * 60_000, undefined, { env, onStdout, maxOutput: 128 * 1024 * 1024 })
+        : await runCommand(executablePath, args, { timeout: recovery.timeout || 60 * 60_000, maxBuffer: 128 * 1024 * 1024, env, onStdout });
       logToolDiagnostic(debugLog, "timeline_inventory_exit", result);
       return result;
     };
@@ -768,12 +769,76 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           incompleteLibraries.push({ library: libraryLabel, expectedCount: null, completedCount: firstPassCount, missingTotal: true });
         } else if (expectedCount > firstPassCount) {
           let acceptedStableGap = false;
-          for (const recoveryLimit of inventoryRecoveryLimits(expectedCount, firstPassCount)) {
+          const cooldownPath = join(sessionDirectory, "framebase-timeline-recovery-cooldown.json");
+          let cooldowns = {};
+          try { const stored = JSON.parse(await readFile(cooldownPath, "utf8")); if (stored && typeof stored === "object" && !Array.isArray(stored)) cooldowns = stored; } catch { /* No previous recovery. */ }
+          const knownIds = [...itemsById.entries()].filter(([key]) => key.startsWith(libraryKeyPrefix)).map(([, item]) => String(item.id));
+          const signature = createHash("sha256").update(JSON.stringify([appleAccount, domain, library, expectedCount, inventorySummary.indexingUnfinished, [...knownIds].sort()])).digest("hex");
+          const cooling = !deepRecovery && cooldowns[libraryLabel]?.signature === signature && cooldowns[libraryLabel]?.until > Date.now();
+          let stopReason = cooling ? "cooldown" : "";
+          if (cooling) debugLog?.write("timeline_recovery_skipped", { library: libraryLabel, reason: "cooldown", retryAt: new Date(cooldowns[libraryLabel].until).toISOString() });
+          const abnormal = inventorySummary.indexingUnfinished;
+          const limits = inventoryRecoveryLimits(expectedCount, firstPassCount).filter(limit => deepRecovery || !abnormal || limit <= 256);
+          if (!limits.length) limits.push(Math.min(expectedCount, 256));
+          for (const recoveryLimit of cooling ? [] : [limits.at(-1)]) {
             const beforeRecovery = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
             const recoveryLabel = recoveryLimit < expectedCount ? `${recoveryLimit} 项` : "完整图库";
             report({ phase: "reading", message: `${libraryLabel} 首轮返回 ${beforeRecovery}/${expectedCount} 项，正在反向补扫 ${recoveryLabel}…`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
             const recoveryArgs = recoveryLimit < expectedCount ? [...inventoryArgs, "--recent", String(recoveryLimit)] : inventoryArgs;
-            const reverseResult = await runInventory(recoveryArgs, "DESCENDING");
+            let scanned = 0;
+            let visibleLimit = limits[0];
+            let pending = "";
+            const beforeTotal = itemsById.size;
+            const publishRecovery = () => report({ phase: "recovering", library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size,
+              recoveryScanned: scanned, recoveryLimit: visibleLimit, recoveryAdded: itemsById.size - beforeTotal,
+              message: `${libraryLabel} 正在反向补扫：本轮已读取 ${scanned}/${visibleLimit} 项，新增确认 ${itemsById.size - beforeTotal} 项…` });
+            const consumeLine = line => {
+              const clean = stripTerminalCodes(line).trim();
+              if (clean.startsWith("FRAMEBASE_RECOVERY_PROGRESS ")) {
+                try {
+                  const progress = JSON.parse(clean.slice("FRAMEBASE_RECOVERY_PROGRESS ".length));
+                  if (Number.isFinite(progress.limit) && progress.limit > 0) visibleLimit = progress.limit;
+                  if (typeof progress.reason === "string") stopReason = progress.reason;
+                  debugLog?.write("timeline_recovery_progress", { library: libraryLabel, ...progress });
+                } catch { /* Ignore invalid progress. */ }
+                return;
+              }
+              const marker = clean.indexOf("FRAMEBASE_INVENTORY ");
+              if (marker < 0) return;
+              try {
+                const item = JSON.parse(clean.slice(marker + "FRAMEBASE_INVENTORY ".length));
+                if (!item?.id || !item?.created) return;
+                scanned += 1;
+                parseInventory(clean.slice(marker), library);
+              } catch { /* Partial or malformed records are not progress. */ }
+            };
+            const onStdout = chunk => {
+              pending += String(chunk);
+              const lines = pending.split(/\r?\n/);
+              pending = lines.pop() || "";
+              for (const line of lines) consumeLine(line);
+              // Bound untrusted output while retaining an incomplete JSON record.
+              if (pending.length > 1024 * 1024) pending = "";
+            };
+            let reverseResult;
+            await mkdir(sessionDirectory, { recursive: true });
+            const recoveryDirectory = await mkdtemp(join(sessionDirectory, "timeline-recovery-"));
+            const policyPath = join(recoveryDirectory, "policy.json");
+            const maxSeconds = deepRecovery ? 900 : abnormal ? 60 : 3600;
+            publishRecovery();
+            const recoveryHeartbeat = setInterval(publishRecovery, 1000);
+            recoveryHeartbeat.unref?.();
+            try {
+              await writeFile(policyPath, JSON.stringify({ knownIds, expectedCount, limits, stopOnNoGain: !deepRecovery && (abnormal || isTolerableInventoryGap(expectedCount, firstPassCount)), maxSeconds }));
+              reverseResult = await runInventory(recoveryArgs, "DESCENDING", onStdout, { policyPath, timeout: maxSeconds * 1000 });
+            } catch (error) {
+              if (!/timed out|killed|ETIMEDOUT/i.test(String(error?.message || "")) && !error?.killed) throw error;
+              stopReason = "budget";
+              reverseResult = { stdout: error.stdout || "" };
+            } finally {
+              clearInterval(recoveryHeartbeat); if (pending) consumeLine(pending); publishRecovery();
+              await rm(recoveryDirectory, { recursive: true, force: true });
+            }
             const reverseSummary = parseInventory(reverseResult.stdout, library);
             inventorySummary.indexingUnfinished ||= reverseSummary.indexingUnfinished;
             const recoveredCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
@@ -785,18 +850,28 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
               break;
             }
           }
+          const afterRecovery = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
+          if (afterRecovery >= expectedCount) delete cooldowns[libraryLabel];
+          else if (!deepRecovery && !acceptedStableGap) {
+            if (!cooling) cooldowns[libraryLabel] = { signature, until: Date.now() + 15 * 60_000 };
+            const detail = cooling ? "相同缺口处于 15 分钟冷却期，跳过重复补扫" : "补扫达到预算或无新增，已停止扩大范围（冷却 15 分钟）";
+            incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount: afterRecovery, recoveryMessage: detail });
+            debugLog?.write("timeline_recovery_stopped", { library: libraryLabel, reason: stopReason, expectedCount, completedCount: afterRecovery });
+          }
+          await mkdir(sessionDirectory, { recursive: true });
+          await writeFile(cooldownPath, JSON.stringify(Object.fromEntries(Object.entries(cooldowns).filter(([, value]) => value?.until > Date.now()).slice(-32))));
           if (!acceptedStableGap) {
             const completedCount = [...itemsById.keys()].filter(key => key.startsWith(libraryKeyPrefix)).length;
-            if (expectedCount > completedCount) incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount });
+            if (expectedCount > completedCount && !incompleteLibraries.some(item => item.library === libraryLabel)) incompleteLibraries.push({ library: libraryLabel, expectedCount, completedCount });
           }
         }
-        report({ phase: "reading", message: `${libraryLabel} 已读取完成。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
+        report({ phase: "reading", recoveryScanned: null, recoveryLimit: null, recoveryAdded: null, message: `${libraryLabel} 已读取完成。`, library: libraryLabel, libraryIndex: libraryOffset + 1, libraryCount: targets.length, itemCount: itemsById.size });
       }
       if (incompleteLibraries.length) {
         const missing = incompleteLibraries[0];
         const message = missing.missingTotal
           ? `“${missing.library}”没有返回有效的图库总数，可能是 Apple 连接或兼容工具异常。已保留上次统计。`
-          : `Apple 本次只返回了“${missing.library}”的 ${missing.completedCount}/${missing.expectedCount} 项。已保留上次统计，请稍后重试。`;
+          : `Apple 本次只返回了“${missing.library}”的 ${missing.completedCount}/${missing.expectedCount} 项。已保留上次统计。${missing.recoveryMessage || "请稍后重试"}；如需完整检查，可选择“深度补扫”。`;
         return { status: "incomplete", message, years: [], quarters: [], months: [], assets: [], providerInfo };
       }
       report({ phase: "aggregating", message: `正在汇总 ${itemsById.size} 个项目的时间信息…`, libraryIndex: targets.length, libraryCount: targets.length, itemCount: itemsById.size });

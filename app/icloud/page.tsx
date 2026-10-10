@@ -380,10 +380,10 @@ function IcloudCenter({ username }: { username: string }) {
     finally { setBusy(null); }
   }
 
-  async function scanTimeline() {
+  async function scanTimeline(deepRecovery = false) {
     setBusy("scan"); setError(""); setMessage("");
     try {
-      const response = await fetch("/api/icloud/timeline", { method: "POST" });
+      const response = await fetch("/api/icloud/timeline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deepRecovery }) });
       const data = await response.json() as { timelineJob?: TimelineJob; error?: string };
       if (!response.ok) throw new Error(data.error || "无法读取 iCloud 时间统计");
       if (!data.timelineJob) throw new Error("时间统计任务未能启动");
@@ -585,7 +585,7 @@ function IcloudCenter({ username }: { username: string }) {
 
       <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
         <div className={styles.cardHead}><span>4</span><div><h2>按时间统计与选择</h2><p>只读获取拍摄时间、类型和原始资源大小，可按年、季度或月份选择增量备份范围。</p></div></div>
-        <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button></div>
+        <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button><button onClick={() => void scanTimeline(true)} disabled={busy !== null || config?.connectionStatus !== "connected"} title="跳过补扫冷却期，完整检查反向分页；可能耗时较长，只读取元数据">深度补扫</button></div>
         {timelineJob?.status === "running" && <div className={styles.timelineScanProgress}><div><strong>{timelineJob.message}</strong><span>{timelineJob.libraryCount ? `图库 ${timelineJob.libraryIndex}/${timelineJob.libraryCount}${timelineJob.library ? ` · ${timelineJob.library}` : ""}` : "正在发现图库"}</span></div><div className={styles.progressLine}><div className={`${styles.progress} ${timelineJob.libraryCount ? "" : styles.progressIndeterminate}`}><i style={timelineJob.libraryCount ? { width: `${Math.max(4, Math.round(timelineJob.libraryIndex / timelineJob.libraryCount * 100))}%` } : undefined} /></div><strong>{timelineJob.libraryCount ? `${Math.round(timelineJob.libraryIndex / timelineJob.libraryCount * 100)}%` : "连接中"}</strong></div><dl><div><dt>已读取项目</dt><dd>{timelineJob.itemCount.toLocaleString()}</dd></div><div><dt>已用时间</dt><dd>{Math.floor(timelineJob.elapsedSeconds / 60)}分 {timelineJob.elapsedSeconds % 60}秒</dd></div><div><dt>当前阶段</dt><dd>{timelineJob.phase === "discovering" ? "发现图库" : timelineJob.phase === "aggregating" ? "生成统计" : "读取元数据"}</dd></div></dl></div>}
         <DebugLogLink log={timelineJob?.debugLog} />
         {config?.timeline?.staleAt && <div className={styles.timelineWarning}><strong>云端内容已发生变化</strong><span>{config.timeline.staleReason || "当前数字已按本地删除结果更新，请重新统计以确认 iCloud 云端状态。"}</span></div>}
