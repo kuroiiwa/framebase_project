@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
 import ts from 'typescript';
 import { collectCloudSelection, MAX_PHOTO_SELECTION } from '../app/photos/bulk-selection.ts';
 import { viewerAfterRemoval } from '../app/photos/viewer-navigation.ts';
@@ -12,15 +13,18 @@ const ast = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true
 let workflow;
 let recyclingWorkflow;
 let previewWorkflow;
+let localWorkflow;
 function find(node) {
   if (ts.isFunctionDeclaration(node) && node.name?.text === 'deleteBatchPhotos') workflow = node.getText(ast);
   if (ts.isFunctionDeclaration(node) && node.name?.text === 'applyBatchRecycling') recyclingWorkflow = node.getText(ast);
+  if (ts.isFunctionDeclaration(node) && node.name?.text === 'recycleBatchLocalPhotos') localWorkflow = node.getText(ast);
   if (ts.isFunctionDeclaration(node) && node.name?.text === 'previewCloudDeletion') previewWorkflow = node.getText(ast);
   ts.forEachChild(node, find);
 }
 find(ast);
 assert.ok(workflow);
 const compiled = ts.transpileModule(workflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const compiledLocal = ts.transpileModule(localWorkflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 const compiledRecycling = ts.transpileModule(recyclingWorkflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
 function fixture(mode = 'icloud') {
@@ -30,6 +34,7 @@ function fixture(mode = 'icloud') {
   let ready;
   const waiting = new Promise(resolve => { ready = resolve; });
   const context = {
+    crypto: webcrypto, applyBatchRecycling: async () => {},
     MAX_PHOTO_SELECTION, collectCloudSelection, deleteMode: mode, releasingAsset: null, appleSessionBusy: false, autoReleaseAfterReview: false,
     releaseCatalog: { releasePlan: { id: 'fake-plan' } }, deletePollAbort: { current: null },
     cloudAssetFor: item => ({ id: item.id, library: 'test', localFiles: [] }),
@@ -43,7 +48,7 @@ function fixture(mode = 'icloud') {
     waitForCloudDelete: async () => ({ status: 'completed', elapsedSeconds: 3, message: 'done', result: { releaseResult: { status: 'deleted', results: [{ id: 'fake-photo', library: 'test', status: 'deleted' }] } } }),
     refreshReleaseCatalog() {},
   };
-  const run = vm.runInNewContext(`${compiled}\ndeleteBatchPhotos`, context);
+  const run = vm.runInNewContext(`${compiledLocal}\n${compiled}\ndeleteBatchPhotos`, context);
   return { run, waiting, calls, state, context, confirm: value => confirm(value) };
 }
 const photos = [{ id: 'fake-photo', name: 'test.jpg', sourceId: 'fake-source', sourceName: 'test' }];
@@ -203,4 +208,69 @@ test('a viewer opened on a task photo after submission advances only after succe
   assert.equal(currentViewer, 'b');
   await apply([item], [{ item, mainDeleted: true, companionDeleted: false }]);
   assert.equal(currentViewer, 'c');
+});
+
+function unmatchedPhoto(id = 'legacy') {
+  return { id, name: id + '.png', path: '2026/09/' + id + '.png', sourceId: 'legacy-source', sourceName: 'backup', handle: { getFile: async () => ({ size: 3, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }) } };
+}
+function localFallbackFixture(cloudStatus = 'completed', cancelled = false) {
+  const f = fixture('both');
+  const outcomes = [];
+  f.context.autoReleaseAfterReview = true;
+  f.context.cloudAssetFor = item => item.id === 'fake-photo' ? { id: item.id, library: 'test', localFiles: [] } : null;
+  f.context.previewCloudDeletion = async () => ({ releaseResult: { status: 'matched', results: [{ id: 'fake-photo', library: 'test', status: 'matched' }] } });
+  f.context.requestDeleteConfirmation = () => { throw new Error('unexpected confirmation'); };
+  f.context.applyBatchRecycling = async (items, results) => { outcomes.push(...results); };
+  f.context.waitForCloudDelete = async () => ({ status: cloudStatus, message: 'cloud result', result: { releaseResult: { results: [] } } });
+  f.context.fetch = async (url, options) => {
+    const body = JSON.parse(options.body); f.calls.push({ url, body });
+    return { ok: true, json: async () => url === '/api/photos/recycle'
+      ? cancelled ? { cancelled: true } : { recycleResult: { status: 'recycled', message: 'done', results: body.groups.flat().map(file => ({ relativePath: file.relativePath, status: 'recycled' })) } }
+      : { deleteJob: { id: 'cloud-job' } } };
+  };
+  return { ...f, outcomes };
+}
+
+test('both mode recycles unverified local photos after matched cloud photos, including live companions', async () => {
+  const f = localFallbackFixture();
+  const legacy = unmatchedPhoto(); legacy.liveVideo = { ...unmatchedPhoto('companion'), name: 'legacy.mov', path: '2026/09/legacy.mov' };
+  await f.run([...photos, legacy]);
+  assert.equal(f.state.error, ''); assert.equal(f.state.finished, true);
+  assert.deepEqual(f.calls.map(call => call.url), ['/api/icloud/release/delete', '/api/photos/recycle']);
+  assert.deepEqual(f.calls[0].body.assetKeys, ['test:fake-photo']);
+  const files = f.calls[1].body.groups[0];
+  assert.equal(files.length, 2); assert.equal(files[0].relativePath, legacy.path);
+  assert.match(files[0].sha256, /^[a-f0-9]{64}$/);
+  assert.equal(f.outcomes.find(result => result.item.id === 'legacy').mainDeleted, true);
+  assert.equal(f.outcomes.find(result => result.item.id === 'legacy').companionDeleted, true);
+});
+
+test('both mode with no matched photos uses local recycling without cloud requests', async () => {
+  const f = localFallbackFixture();
+  f.context.previewCloudDeletion = () => { throw new Error('must not query cloud'); };
+  await f.run([unmatchedPhoto()]);
+  assert.equal(f.state.error, ''); assert.equal(f.state.finished, true);
+  assert.deepEqual(f.calls.map(call => call.url), ['/api/photos/recycle']);
+});
+
+test('failed cloud operations leave unmatched local photos untouched', async () => {
+  const f = localFallbackFixture('partial');
+  await f.run([...photos, unmatchedPhoto()]);
+  assert.deepEqual(f.calls.map(call => call.url), ['/api/icloud/release/delete']);
+  assert.equal(f.outcomes.some(result => result.item.id === 'legacy'), false);
+  assert.ok(f.state.error);
+});
+
+test('cancelled source selection retains unmatched photos and reports the cancellation', async () => {
+  const f = localFallbackFixture('completed', true);
+  await f.run([...photos, unmatchedPhoto()]);
+  assert.match(f.state.error, /已取消/);
+  assert.equal(f.outcomes.some(result => result.item.id === 'legacy'), false);
+});
+
+test('manual both mode cancellation leaves an entirely unmatched batch untouched', async () => {
+  const f = fixture('both'); f.context.cloudAssetFor = () => null;
+  const pending = f.run([unmatchedPhoto()]);
+  await f.waiting; f.confirm(false); await pending;
+  assert.equal(f.calls.length, 0); assert.equal(f.state.finished, false);
 });

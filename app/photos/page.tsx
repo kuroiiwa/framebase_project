@@ -762,42 +762,48 @@ function PhotoLibrary({ username }: { username: string }) {
     return completed.result;
   }
 
+  async function recycleBatchLocalPhotos(items: PhotoItem[], confirm = true) {
+    const bySource = new Map<string, PhotoItem[]>();
+    for (const item of items) bySource.set(item.sourceId, [...(bySource.get(item.sourceId) || []), item]);
+    if (confirm && !await requestDeleteConfirmation('将选中的 ' + items.length + ' 张图片及其配对实况视频移入 Windows 回收站？iCloud 内容会保留。接下来需要为 ' + bySource.size + ' 个图片来源分别选择对应文件夹。')) return null;
+    const outcomes: Array<{ item: PhotoItem; mainDeleted: boolean; companionDeleted: boolean }> = [];
+    const issues: string[] = [];
+    let checked = 0;
+    for (const sourceItems of bySource.values()) {
+      try {
+        const groups = [];
+        for (const item of sourceItems) {
+          setBatchLocalProgress({ total: items.length, checked, recycled: outcomes.filter(result => result.mainDeleted).length, message: '正在读取并校验：' + item.name });
+          const entries = [{ relativePath: item.path, handle: item.handle }, ...(item.liveVideo ? [{ relativePath: item.liveVideo.path, handle: item.liveVideo.handle }] : [])];
+          const files = [];
+          for (const entry of entries) { const file = await entry.handle.getFile(); const hash = await crypto.subtle.digest("SHA-256", await file.arrayBuffer()); files.push({ relativePath: entry.relativePath, size: file.size, sha256: Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("") }); }
+          groups.push(files); checked += 1;
+        }
+        setBatchLocalProgress({ total: items.length, checked, recycled: outcomes.filter(result => result.mainDeleted).length, message: '请选择来源“' + sourceItems[0].sourceName + '”，随后将回收 ' + sourceItems.length + ' 张图片…' });
+        const response = await fetch("/api/photos/recycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceName: sourceItems[0].sourceName, groups, confirmation: "移入本地回收站" }) });
+        const data = await response.json() as { cancelled?: boolean; error?: string; recycleResult?: { message: string; status: string; results: Array<{ relativePath: string; status: string }> } };
+        if (data.cancelled) { issues.push(sourceItems[0].sourceName + "：已取消，该来源未删除。"); continue; }
+        if (!response.ok || !data.recycleResult) throw new Error(data.error || "该来源回收失败。");
+        const recycled = new Set(data.recycleResult.results.filter(result => result.status === "recycled").map(result => result.relativePath));
+        for (const item of sourceItems) outcomes.push({ item, mainDeleted: recycled.has(item.path), companionDeleted: Boolean(item.liveVideo && recycled.has(item.liveVideo.path)) });
+        if (data.recycleResult.status !== "recycled") issues.push(data.recycleResult.message);
+      } catch (reason) { issues.push(sourceItems[0].sourceName + "：" + (reason instanceof Error ? reason.message : "回收失败")); }
+    }
+    await applyBatchRecycling(items, outcomes);
+    const done = outcomes.filter(result => result.mainDeleted).length;
+    setBatchLocalProgress({ total: items.length, checked, recycled: done, message: '批量本地删除结束：已回收 ' + done + '/' + items.length + ' 张图片；iCloud 内容保留。' });
+    return { done, issues };
+  }
+
   async function deleteBatchPhotos(items: PhotoItem[]) {
     if (!items.length || items.length > MAX_PHOTO_SELECTION || releasingAsset !== null || appleSessionBusy) return;
     setReleasingAsset("batch"); setError(""); setNotice(""); setDeleteJob(null); setBatchLocalProgress(null);
     try {
-      if (deleteMode === "local") {
-        const bySource = new Map<string, PhotoItem[]>();
-        for (const item of items) bySource.set(item.sourceId, [...(bySource.get(item.sourceId) || []), item]);
-        if (!await requestDeleteConfirmation('将选中的 ' + items.length + ' 张图片及其配对实况视频移入 Windows 回收站？iCloud 内容会保留。接下来需要为 ' + bySource.size + ' 个图片来源分别选择对应文件夹。')) return;
-        const outcomes: Array<{ item: PhotoItem; mainDeleted: boolean; companionDeleted: boolean }> = [];
-        const issues: string[] = [];
-        let checked = 0;
-        for (const sourceItems of bySource.values()) {
-          try {
-            const groups = [];
-            for (const item of sourceItems) {
-              setBatchLocalProgress({ total: items.length, checked, recycled: outcomes.filter(result => result.mainDeleted).length, message: '正在读取并校验：' + item.name });
-              const entries = [{ relativePath: item.path, handle: item.handle }, ...(item.liveVideo ? [{ relativePath: item.liveVideo.path, handle: item.liveVideo.handle }] : [])];
-              const files = [];
-              for (const entry of entries) { const file = await entry.handle.getFile(); const hash = await crypto.subtle.digest("SHA-256", await file.arrayBuffer()); files.push({ relativePath: entry.relativePath, size: file.size, sha256: Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("") }); }
-              groups.push(files); checked += 1;
-            }
-            setBatchLocalProgress({ total: items.length, checked, recycled: outcomes.filter(result => result.mainDeleted).length, message: '请选择来源“' + sourceItems[0].sourceName + '”，随后将回收 ' + sourceItems.length + ' 张图片…' });
-            const response = await fetch("/api/photos/recycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceName: sourceItems[0].sourceName, groups, confirmation: "移入本地回收站" }) });
-            const data = await response.json() as { cancelled?: boolean; error?: string; recycleResult?: { message: string; status: string; results: Array<{ relativePath: string; status: string }> } };
-            if (data.cancelled) { issues.push(sourceItems[0].sourceName + "：已取消，该来源未删除。"); continue; }
-            if (!response.ok || !data.recycleResult) throw new Error(data.error || "该来源回收失败。");
-            const recycled = new Set(data.recycleResult.results.filter(result => result.status === "recycled").map(result => result.relativePath));
-            for (const item of sourceItems) outcomes.push({ item, mainDeleted: recycled.has(item.path), companionDeleted: Boolean(item.liveVideo && recycled.has(item.liveVideo.path)) });
-            if (data.recycleResult.status !== "recycled") issues.push(data.recycleResult.message);
-          } catch (reason) { issues.push(sourceItems[0].sourceName + "：" + (reason instanceof Error ? reason.message : "回收失败")); }
-        }
-        await applyBatchRecycling(items, outcomes);
-        const done = outcomes.filter(result => result.mainDeleted).length;
-        setBatchLocalProgress({ total: items.length, checked, recycled: done, message: '批量本地删除结束：已回收 ' + done + '/' + items.length + ' 张图片；iCloud 内容保留。' });
-        setNotice('本地已回收 ' + done + '/' + items.length + ' 张图片。');
-        if (issues.length) setError(issues.join(" "));
+      if (deleteMode === "local" || (deleteMode === "both" && !collectCloudSelection(items, cloudAssetFor).assets.length)) {
+        const result = await recycleBatchLocalPhotos(items, deleteMode === "local" || !autoReleaseAfterReview);
+        if (!result) return;
+        setNotice('本地已回收 ' + result.done + '/' + items.length + ' 张图片。');
+        if (result.issues.length) setError(result.issues.join(" "));
       } else {
         const selection = collectCloudSelection(items, cloudAssetFor);
         if (!selection.assets.length) throw new Error("选中图片没有可精确匹配的云端项目。");
@@ -808,11 +814,11 @@ function PhotoLibrary({ username }: { username: string }) {
         if (autoReleaseAfterReview) {
           const results = preview.releaseResult?.results || [];
           const verifiedKeys = new Set(results.filter(result => result.status === "matched").map(result => result.library + ":" + result.id));
-          if (selection.skipped.length || preview.releaseResult?.status !== "matched" || results.length !== keys.length || verifiedKeys.size !== keys.length || keys.some(key => !verifiedKeys.has(key))) {
+          if ((!recycleLocal && selection.skipped.length) || preview.releaseResult?.status !== "matched" || results.length !== keys.length || verifiedKeys.size !== keys.length || keys.some(key => !verifiedKeys.has(key))) {
             throw new Error("本批存在未匹配图片或复核结果不完整，已停止自动删除。请查看结果，处理问题或取消自动删除后重新复核。");
           }
         }
-        const confirmation = autoReleaseAfterReview || await requestDeleteConfirmation('将 ' + selection.assets.length + ' 个精确匹配云端项目移入“最近删除”。' + (recycleLocal ? '仅在云端删除成功或确认已在最近删除中后回收本地原片（最多 ' + (preview.localRecyclePlan?.fileCount || 0) + ' 个文件）。' : '本地原片保留。') + '跳过 ' + selection.skipped.length + ' 张未匹配图片。已在云端最近删除中的项目不会重复删除。确认继续？');
+        const confirmation = autoReleaseAfterReview || await requestDeleteConfirmation('将 ' + selection.assets.length + ' 个精确匹配云端项目移入“最近删除”。' + (recycleLocal ? '仅在云端删除成功或确认已在最近删除中后回收本地原片（最多 ' + (preview.localRecyclePlan?.fileCount || 0) + ' 个文件）。' : '本地原片保留。') + (recycleLocal ? '另有 ' + selection.skipped.length + ' 张未匹配图片，仅回收本地文件，保留 iCloud 内容；需要选择对应来源文件夹。' : '跳过 ' + selection.skipped.length + ' 张未匹配图片。') + '已在云端最近删除中的项目不会重复删除。确认继续？');
         if (!confirmation) { setDeleteJob(null); return; }
         const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: keys, recycleLocal, confirmation, background: true }) });
         const started = await response.json() as { deleteJob?: DeleteJob; error?: string };
@@ -826,7 +832,15 @@ function PhotoLibrary({ username }: { username: string }) {
         const outcomes = selection.matched.map(({ item, asset }) => ({ item, mainDeleted: asset.localFiles.some(path => path.split(/[\\/]/).pop()?.toLowerCase() === item.name.toLowerCase() && recycledPaths.has(path.replaceAll("\\", "/").toLowerCase())), companionDeleted: Boolean(item.liveVideo && asset.localFiles.some(path => path.split(/[\\/]/).pop()?.toLowerCase() === item.liveVideo?.name.toLowerCase() && recycledPaths.has(path.replaceAll("\\", "/").toLowerCase()))) }));
         if (recycleLocal) await applyBatchRecycling(items, outcomes);
         else setSelectedIds(current => current.filter(id => !selection.matched.some(({ item, asset }) => item.id === id && deletedKeys.has(asset.library + ":" + asset.id))));
-        setNotice(completed.message || "批量删除结束。");
+        let localSummary = "";
+        if (recycleLocal && selection.skipped.length && completed.status === "completed") {
+          const local = await recycleBatchLocalPhotos(selection.skipped, false);
+          if (local) {
+            localSummary = ' 未匹配图片仅回收本地：' + local.done + '/' + selection.skipped.length + ' 张，iCloud 内容保留。';
+            if (local.issues.length) setError(local.issues.join(" "));
+          }
+        }
+        setNotice((completed.message || "批量删除结束。") + localSummary);
         if (completed.status !== "completed") setError(completed.message || "部分项目未完成，失败项已保留。");
       }
       void refreshReleaseCatalog();
@@ -841,7 +855,7 @@ function PhotoLibrary({ username }: { username: string }) {
     if (!deleteItem || releasingAsset !== null || appleSessionBusy) return;
     const item = deleteItem;
     let completed: boolean | undefined;
-    if (deleteMode === "local") completed = await recycleLocalPhoto(item);
+    if (deleteMode === "local" || (deleteMode === "both" && !cloudAssetFor(item))) completed = await recycleLocalPhoto(item);
     else {
       const asset = cloudAssetFor(item);
       if (!asset) { setError("请先在 iCloud 备份中心完成释放计划复核和确认。"); return; }
@@ -1121,16 +1135,16 @@ function PhotoLibrary({ username }: { username: string }) {
       <header className={styles.deleteHeader}><div><h2 id="delete-photo-title">{bulkDeleteItems.length ? `批量删除 ${dialogItems.length} 张图片` : "删除这张图片"}</h2><p>{deleteConfirmation ? "等待确认 · 尚未执行此次删除" : deleteFinished ? "操作已结束，可查看结果后关闭" : releasingAsset !== null ? "任务继续进行，可缩小后浏览图片库" : "确认图片与删除范围，再继续复核"}</p></div><button className={actionStyles.button} onClick={() => { if (deleteMinimized) setDeleteMinimized(false); else minimizeDeleteWindow(); }} aria-label={deleteMinimized ? "恢复删除大窗" : "缩小删除窗口"}>{deleteMinimized ? "恢复" : "缩小"}</button></header>
       <div className={styles.deleteBody}>
       {deleteConfirmation && <section className={styles.confirmationPanel} role="alert" aria-labelledby="delete-confirm-title"><span>!</span><h3 id="delete-confirm-title">确认删除</h3><p>{deleteConfirmation}</p><small>只有点击下方“确认删除”才会继续执行。</small></section>}
-      {!deleteFinished && <div className={styles.deleteSetup}><ul className={styles.deleteItemList}>{dialogItems.map(item => <li key={item.id}>{item.name}{item.liveVideo ? " · 包含配对实况视频" : ""}</li>)}</ul>{bulkDeleteItems.length > 0 && <p>精确匹配 {dialogCloudSelection.matched.length} 张图片，对应 {dialogCloudSelection.assets.length} 个云端项目；云端操作跳过 {dialogCloudSelection.skipped.length} 张未匹配图片。失败及跳过的图片保留选择。</p>}
+      {!deleteFinished && <div className={styles.deleteSetup}><ul className={styles.deleteItemList}>{dialogItems.map(item => <li key={item.id}>{item.name}{item.liveVideo ? " · 包含配对实况视频" : ""}{deleteMode === "both" && dialogCloudSelection.skipped.some(photo => photo.id === item.id) ? " · 仅回收本地" : ""}</li>)}</ul>{bulkDeleteItems.length > 0 && <p>精确匹配 {dialogCloudSelection.matched.length} 张图片，对应 {dialogCloudSelection.assets.length} 个云端项目；{deleteMode === "both" ? `未匹配的 ${dialogCloudSelection.skipped.length} 张图片仅回收本地，保留 iCloud 内容。` : `云端操作跳过 ${dialogCloudSelection.skipped.length} 张未匹配图片。`}失败及未回收的图片保留选择。</p>}
       <fieldset disabled={releasingAsset !== null}>
         <legend>选择删除范围</legend>
         <label htmlFor="photo-delete-local" aria-label="仅删除本地"><input id="photo-delete-local" type="radio" name="photo-delete-mode" checked={deleteMode === "local"} onChange={() => setDeleteMode("local")} /><span><strong>仅删除本地</strong><small>移入 Windows 回收站，保留 iCloud 内容。</small></span></label>
         <label htmlFor="photo-delete-icloud" aria-label="仅删除 iCloud"><input id="photo-delete-icloud" type="radio" name="photo-delete-mode" checked={deleteMode === "icloud"} disabled={!cloudDeleteAvailable} onChange={() => setDeleteMode("icloud")} /><span><strong>仅删除 iCloud</strong><small>移入 iCloud“最近删除”，保留本地原片。</small></span></label>
-        <label htmlFor="photo-delete-both" aria-label="两边都删除"><input id="photo-delete-both" type="radio" name="photo-delete-mode" checked={deleteMode === "both"} disabled={!cloudDeleteAvailable} onChange={() => setDeleteMode("both")} /><span><strong>两边都删除</strong><small>云端成功移入“最近删除”后，再将本地原片移入回收站。</small></span></label>
+        <label htmlFor="photo-delete-both" aria-label="两边都删除"><input id="photo-delete-both" type="radio" name="photo-delete-mode" checked={deleteMode === "both"} disabled={releaseCatalogLoading || Boolean(releaseCatalogError)} onChange={() => setDeleteMode("both")} /><span><strong>两边都删除</strong><small>已匹配图片在云端删除成功后回收本地；未匹配图片仅回收本地，保留 iCloud 内容。</small></span></label>
       </fieldset>
       {bulkDeleteItems.length > 0 && deleteMode !== "local" && <fieldset disabled={releasingAsset !== null || appleSessionBusy}>
         <legend>复核后的操作</legend>
-        <label htmlFor="photo-auto-release"><input id="photo-auto-release" type="checkbox" checked={autoReleaseAfterReview} onChange={event => changeAutoReleasePreference(event.target.checked)} /><span><strong>复核通过后自动删除</strong><small>勾选后，点击开始即可在全部复核通过后按所选范围执行，无需再次人工确认；报错或存在未匹配图片时停止。此选项仅为当前账户保存。</small></span></label>
+        <label htmlFor="photo-auto-release" aria-label="复核通过后自动删除"><input id="photo-auto-release" type="checkbox" checked={autoReleaseAfterReview} onChange={event => changeAutoReleasePreference(event.target.checked)} /><span><strong>复核通过后自动删除</strong><small>勾选后，点击开始即可在全部复核通过后按所选范围执行，无需再次人工确认；云端复核报错时停止；两边都删除时，未匹配图片仅回收本地。此选项仅为当前账户保存。</small></span></label>
         {!autoReleaseAfterReview && <p>未勾选：复核完成后，仍需点击“确认删除”。</p>}
       </fieldset>}
       {releaseCatalogLoading ? <p>正在刷新云端释放计划…</p> : releaseCatalogError ? <p>{releaseCatalogError}</p> : !dialogCloudSelection.assets.length && <p>{releaseCatalog?.releasePlan?.status === "confirmed" ? "释放计划已确认，但此图片未能唯一匹配计划中的云端项目。请确认图片来源和本地文件大小，或重新生成释放计划。" : "请到 iCloud 备份中心复核并确认释放计划后，再操作 iCloud。"}</p>}
@@ -1141,7 +1155,7 @@ function PhotoLibrary({ username }: { username: string }) {
       {deleteJob && deleteJob.status !== "idle" && <section className={styles.deleteProgress}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} /></section>}
       {error && <p className={styles.taskError} role="alert">{error}</p>}
       {deleteFinished && notice && <p className={styles.taskResult} role="status">{notice}</p>}
-      </div><div className={styles.deleteActions}>{deleteConfirmation ? <><button ref={confirmationCancelRef} className={actionStyles.button} onClick={() => resolveDeleteConfirmation(false)}>暂不删除</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} onClick={() => resolveDeleteConfirmation(true)}>确认删除</button></> : deleteFinished ? <button className={actionStyles.button} onClick={closeDeleteDialog}>关闭</button> : <><button className={actionStyles.button} disabled={releasingAsset !== null || appleSessionBusy} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode !== "local" && (!cloudDeleteAvailable))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : bulkDeleteItems.length > 0 && deleteMode !== "local" ? autoReleaseAfterReview ? "开始复核并自动删除" : "开始复核" : "继续"}</button></>}</div>
+      </div><div className={styles.deleteActions}>{deleteConfirmation ? <><button ref={confirmationCancelRef} className={actionStyles.button} onClick={() => resolveDeleteConfirmation(false)}>暂不删除</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} onClick={() => resolveDeleteConfirmation(true)}>确认删除</button></> : deleteFinished ? <button className={actionStyles.button} onClick={closeDeleteDialog}>关闭</button> : <><button className={actionStyles.button} disabled={releasingAsset !== null || appleSessionBusy} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode === "icloud" && !cloudDeleteAvailable) || (deleteMode === "both" && (releaseCatalogLoading || Boolean(releaseCatalogError)))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : bulkDeleteItems.length > 0 && deleteMode !== "local" ? autoReleaseAfterReview ? "开始复核并自动删除" : "开始复核" : "继续"}</button></>}</div>
     </dialog>}
     {viewer && <PhotoViewer key={`${viewer.id}:${viewer.liveVideo?.path || ""}`} item={viewer} taskNotice={releasingAsset !== null && dialogItems.some(item => item.id === viewer.id) ? deleteMode === "icloud" ? "当前照片在云端删除任务中，本地图片仍可继续浏览。" : "当前照片在删除任务范围内；本地回收成功后将自动切换到其他照片。" : ""} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onFavorite={() => toggleMark(viewer.id, "liked")} onCleanup={() => toggleMark(viewer.id, "cleanup")} onDelete={mode => openDeleteDialog([viewer], mode)} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
   </main>;
