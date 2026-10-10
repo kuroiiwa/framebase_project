@@ -16,6 +16,10 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Framebase · 本地视频管理",
   description: "快速浏览、标记、筛选并整理你的本地视频素材。",
+  icons: {
+    icon: { url: "/framebase-icon.svg", type: "image/svg+xml", sizes: "any" },
+    shortcut: "/framebase-icon.svg",
+  },
 };
 
 export default function RootLayout({

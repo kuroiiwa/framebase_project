@@ -34,7 +34,7 @@ type IcloudConfig = {
   releaseHistory?: { movedCount: number; movedBytes: number; recycledFileCount: number; recycledBytes: number; lastReleasedAt: string | null; events: Array<{ id: string; recycleStatus: string; recycleResults: Array<{ relativePath: string; status: string }> }> };
 };
 
-type ReleaseProgress = { status: "idle" | "running" | "completed" | "failed"; phase?: string; message?: string; total?: number; checked?: number; failed?: number; totalBytes?: number; readBytes?: number; currentFile?: string | null };
+type ReleaseProgress = { status: "idle" | "running" | "completed" | "failed"; phase?: string; message?: string; total?: number; checked?: number; failed?: number; reused?: number; rehashed?: number; totalBytes?: number; readBytes?: number; currentFile?: string | null };
 
 type ReleasePlan = { matchedAssetCount: number; matchedLocalFileCount: number; unmatchedLocalFileCount: number; livePhotoAssetCount: number; unmatchedFiles: Array<{ name: string; relativePath: string; size: number }>; id: string | null; status: "ready" | "blocked" | "confirmed"; message: string; createdAt: string | null; confirmedAt: string | null; eligibleCount: number; eligibleBytes: number; failedCount: number; files: Array<{ name: string; relativePath: string; mediaType: "photo" | "video"; size: number }>; assets: Array<{ id: string; library: string; name: string; originalBytes: number }> };
 
@@ -621,13 +621,13 @@ function IcloudCenter({ username }: { username: string }) {
       </article>
 
       <article className={`${styles.card} ${verifiedManifestCount === 0 ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>6</span><div><h2>iCloud 容量释放</h2><p>先重新复核本地清单，再进入独立确认；任何云端删除都不与备份按钮绑定。</p></div></div>
+        <div className={styles.cardHead}><span>6</span><div><h2>iCloud 容量释放</h2><p>增量复核本地清单：未变化文件复用已通过的校验结果，新增或变化文件重新计算 SHA-256；每次重新匹配云端项目，实际删除前仍需精确复核。</p></div></div>
         <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>仅允许删除已通过本地 SHA-256、云端资产 ID、文件名、拍摄时间、原始大小和图库六重核对的项目；删除入口位于图片库，每次都先 dry-run 并要求手动确认。</span></div>
         {config?.releaseHistory?.movedCount ? <><div className={styles.releaseSummary}><div><span>云端“最近删除”</span><strong>{config.releaseHistory.movedCount} 个 · {formatBytes(config.releaseHistory.movedBytes)}</strong></div><div><span>Windows 回收站</span><strong>{config.releaseHistory.recycledFileCount || 0} 个 · {formatBytes(config.releaseHistory.recycledBytes || 0)}</strong></div><p>两侧都保留恢复窗口；分别清空 iCloud“最近删除”和 Windows 回收站后，空间才会彻底释放。</p></div>{config.releaseHistory.events?.filter(event => event.recycleStatus === "failed" || event.recycleStatus === "partial").map(event => <div className={styles.recycleRetry} key={event.id}><span>有 {event.recycleResults.filter(result => result.status === "failed").length} 个本地文件未移入回收站。</span><button onClick={() => void retryLocalRecycle(event.id)} disabled={busy !== null}>重试本地回收</button></div>)}</> : null}
         {releaseProgress && releaseProgress.status !== "idle" && <div className={styles.fullStatus} role="status" aria-live="polite">
           <div><strong>{releaseProgress.status === "running" ? "正在复核本地备份" : releaseProgress.status === "failed" ? "复核失败" : "复核完成"}</strong><span>{releaseProgress.message}</span></div>
           <div className={styles.progressLine}><div className={styles.progress} role="progressbar" aria-label="本地文件复核进度" aria-valuemin={0} aria-valuemax={releaseProgress.total || 1} aria-valuenow={releaseProgress.checked || 0}><i style={{ width: (releaseProgress.total ? Math.round((releaseProgress.checked || 0) / releaseProgress.total * 100) : 0) + "%" }} /></div><strong>{releaseProgress.checked || 0} / {releaseProgress.total || 0} 个 · {releaseProgress.total ? Math.round((releaseProgress.checked || 0) / releaseProgress.total * 100) : 0}%</strong></div>
-          <div className={styles.liveMetrics}><div><span>已读取 / 总容量</span><strong>{formatBytes(releaseProgress.readBytes || 0)} / {formatBytes(releaseProgress.totalBytes || 0)}</strong></div><div><span>复核通过</span><strong>{(releaseProgress.checked || 0) - (releaseProgress.failed || 0)} 个</strong></div><div><span>校验失败</span><strong>{releaseProgress.failed || 0} 个</strong></div></div>
+          <div className={styles.liveMetrics}><div><span>本轮读取（复用文件无需读取）</span><strong>{formatBytes(releaseProgress.readBytes || 0)}</strong></div><div><span>复用 / 重新计算</span><strong>{releaseProgress.reused || 0} / {releaseProgress.rehashed || 0} 个</strong></div><div><span>复核通过</span><strong>{(releaseProgress.checked || 0) - (releaseProgress.failed || 0)} 个</strong></div><div><span>校验失败</span><strong>{releaseProgress.failed || 0} 个</strong></div></div>
           {releaseProgress.currentFile && <small>当前文件：{releaseProgress.currentFile}</small>}
         </div>}
         {config?.releasePlan ? <div className={styles.fullStatus}>

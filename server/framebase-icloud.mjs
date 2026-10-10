@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { livePhotoVideoNames } from "../shared/live-photo.mjs";
 
 const usernamePattern = /^[a-zA-Z0-9_]{3,32}$/;
 const manifestExtensions = new Set(["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "mov", "mp4", "m4v", "avi", "mkv", "mpeg", "mpg", "webm"]);
@@ -27,10 +28,11 @@ function validateUsername(username) {
   if (!usernamePattern.test(username)) throw Object.assign(new Error("FrameBase 用户名无效。"), { status: 400 });
 }
 
-export function createIcloudManager({ projectRoot }) {
+export function createIcloudManager({ projectRoot, hashFile }) {
   const configRoot = join(projectRoot, ".framebase-icloud");
   let writes = Promise.resolve();
   const releaseProgress = new Map();
+  const hashReleaseFile = hashFile || sha256File;
   function readReleaseProgress(username) {
     validateUsername(username);
     return { ...(releaseProgress.get(username) || { status: "idle" }) };
@@ -384,7 +386,7 @@ export function createIcloudManager({ projectRoot }) {
   async function createReleasePlan(username) {
     validateUsername(username);
     if (releaseProgress.get(username)?.status === "running") throw Object.assign(new Error("释放计划正在复核，请等待当前任务完成。"), { status: 409 });
-    const progress = { status: "running", phase: "preparing", message: "正在读取本地清单…", total: 0, checked: 0, failed: 0, totalBytes: 0, readBytes: 0, currentFile: null, startedAt: new Date().toISOString() };
+    const progress = { status: "running", phase: "preparing", message: "正在读取本地清单…", total: 0, checked: 0, failed: 0, reused: 0, rehashed: 0, totalBytes: 0, readBytes: 0, currentFile: null, startedAt: new Date().toISOString() };
     releaseProgress.set(username, progress);
     try {
       await persistReleaseProgress(username, progress);
@@ -408,10 +410,22 @@ export function createIcloudManager({ projectRoot }) {
       throw Object.assign(new Error("现有时间统计是旧格式，缺少云端资产 ID。请先在“按时间统计与选择”中点击“刷新统计”，完成后再生成释放计划；不需要重新备份。"), { status: 409 });
     }
     const backupRoot = await realpath(config.backupDirectory);
+    const cachePath = join(userDirectory(username), "release-verification-cache.json");
+    let cachedFiles = new Map();
+    try {
+      const cache = JSON.parse(await readFile(cachePath, "utf8"));
+      if (cache.version === 1 && cache.backupRoot === backupRoot && cache.files && typeof cache.files === "object") cachedFiles = new Map(Object.entries(cache.files));
+    } catch (error) { if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
+    const manifestPaths = new Set(manifest.files.map(item => item.relativePath));
+    const nextCache = new Map([...cachedFiles].filter(([path]) => manifestPaths.has(path)));
+    const fileStamp = info => ({ size: info.size, modifiedMs: info.mtimeMs, changedMs: info.ctimeMs, device: info.dev, inode: info.ino });
+    const sameStamp = (left, right) => Object.keys(right).every(key => left?.[key] === right[key]);
+    const saveCache = () => atomicJson(username, cachePath, { version: 1, backupRoot, files: Object.fromEntries(nextCache) });
+    let lastCacheSaved = Date.now();
     const eligible = [];
     const failures = [];
     let lastSaved = 0;
-    Object.assign(progress, { phase: "verifying", total: manifest.files.length, totalBytes: manifest.files.reduce((sum, item) => sum + item.size, 0), message: "正在重新计算本地文件 SHA-256…" });
+    Object.assign(progress, { phase: "verifying", total: manifest.files.length, totalBytes: manifest.files.reduce((sum, item) => sum + item.size, 0), message: "正在增量复核本地文件；未变化的文件复用上次校验结果…" });
     for (const item of manifest.files) {
       progress.currentFile = item.relativePath;
       try {
@@ -423,21 +437,41 @@ export function createIcloudManager({ projectRoot }) {
         if (actualRelative.startsWith("..") || isAbsolute(actualRelative)) throw new Error("文件链接超出备份目录");
         const info = await stat(actual);
         if (!info.isFile() || info.size !== item.size || info.size <= 0) throw new Error("文件大小不一致");
-        const sha256 = await sha256File(actual, bytes => {
-          progress.readBytes += bytes;
-          if (Date.now() - lastSaved >= 1000) {
-            lastSaved = Date.now();
-            void persistReleaseProgress(username, progress).catch(() => undefined);
-          }
-        });
-        if (sha256 !== item.sha256) throw new Error("SHA-256 不一致");
-        eligible.push({ ...item, verifiedAt: new Date().toISOString() });
+        const stamp = fileStamp(info);
+        const cached = cachedFiles.get(item.relativePath);
+        const reusable = Number.isFinite(info.mtimeMs) && Number.isFinite(info.ctimeMs) && info.mtimeMs > 0 && info.ctimeMs > 0
+          && cached?.actualPath === actual && /^[a-f0-9]{64}$/.test(item.sha256) && cached.sha256 === item.sha256 && sameStamp(cached, stamp);
+        let verifiedAt = cached?.verifiedAt;
+        if (reusable) progress.reused += 1;
+        else {
+          progress.rehashed += 1;
+          const sha256 = await hashReleaseFile(actual, bytes => {
+            progress.readBytes += bytes;
+            if (Date.now() - lastSaved >= 1000) {
+              lastSaved = Date.now();
+              void persistReleaseProgress(username, progress).catch(() => undefined);
+            }
+          });
+          if (sha256 !== item.sha256) throw new Error("SHA-256 不一致");
+          if (!sameStamp(fileStamp(await stat(actual)), stamp)) throw new Error("文件在校验过程中发生变化");
+          verifiedAt = new Date().toISOString();
+        }
+        nextCache.set(item.relativePath, { ...stamp, sha256: item.sha256, actualPath: actual, verifiedAt });
+        eligible.push({ ...item, verifiedAt });
       } catch (error) {
+        nextCache.delete(item.relativePath);
         failures.push({ relativePath: item.relativePath, reason: error instanceof Error ? error.message : "校验失败" });
       }
       progress.checked += 1;
       progress.failed = failures.length;
+      progress.message = `已复核 ${progress.checked}/${progress.total} 个文件，复用 ${progress.reused} 个，重新计算 ${progress.rehashed} 个，失败 ${progress.failed} 个。`;
+      if (Date.now() - lastSaved >= 1000 || progress.checked === progress.total) {
+        lastSaved = Date.now();
+        await persistReleaseProgress(username, progress);
+      }
+      if (Date.now() - lastCacheSaved >= 5000) { await saveCache(); lastCacheSaved = Date.now(); }
     }
+    await saveCache();
     Object.assign(progress, { phase: "matching", currentFile: null, message: "本地复核完成，正在匹配云端项目并保存释放计划…" });
     const createdAt = new Date().toISOString();
     const eligibleByName = new Map();
@@ -453,14 +487,15 @@ export function createIcloudManager({ projectRoot }) {
       const mainMatches = (eligibleByName.get(asset.name.toLocaleLowerCase()) || []).filter(file => file.size === asset.mainBytes && file.relativePath.replaceAll("\\", "/").includes(yearMonth));
       if (mainMatches.length !== 1) return [];
       if (!asset.livePhoto || asset.livePhotoBytes === 0) return [{ ...asset, localFiles: [mainMatches[0].relativePath] }];
-      const stem = asset.name.replace(/\.[^.]+$/, "").toLocaleLowerCase();
-      const liveMatches = eligible.filter(file => file.extension === "mov" && file.size === asset.livePhotoBytes && file.name.replace(/\.[^.]+$/, "").toLocaleLowerCase() === stem && file.relativePath.replaceAll("\\", "/").includes(yearMonth));
+      const videoNames = new Set(livePhotoVideoNames(asset.name));
+      const imageDirectory = mainMatches[0].relativePath.replaceAll("\\", "/").replace(/\/[^/]+$/, "");
+      const liveMatches = eligible.filter(file => file.extension === "mov" && file.size === asset.livePhotoBytes && videoNames.has(file.name.toLowerCase()) && file.relativePath.replaceAll("\\", "/").replace(/\/[^/]+$/, "") === imageDirectory);
       return liveMatches.length === 1 ? [{ ...asset, localFiles: [mainMatches[0].relativePath, liveMatches[0].relativePath] }] : [];
     });
     const ready = failures.length === 0 && eligible.length === manifest.files.length;
     const plan = {
       version: 1, id: randomUUID(), status: ready ? "ready" : "blocked",
-      message: ready ? `已重新校验本地清单中的 ${eligible.length} 个文件；${matchedAssets.length} 个云端项目完成精确匹配，可以进入人工释放确认。` : `${failures.length} 个本地文件未通过复核，禁止释放 iCloud 内容。`,
+      message: ready ? `已增量复核 ${eligible.length} 个本地文件（复用 ${progress.reused} 个，重新计算 ${progress.rehashed} 个）；${matchedAssets.length} 个云端项目完成精确匹配，可以进入人工释放确认。` : `${failures.length} 个本地文件未通过复核，禁止释放 iCloud 内容；已复用 ${progress.reused} 个校验结果。`,
       createdAt, confirmedAt: null, manifestUpdatedAt: manifest.updatedAt,
       eligibleCount: eligible.length, eligibleBytes: eligible.reduce((sum, item) => sum + item.size, 0),
       failedCount: failures.length, files: eligible, assets: matchedAssets, failures,

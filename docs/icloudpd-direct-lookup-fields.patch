@@ -1,0 +1,136 @@
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -944,36 +944,69 @@
+     if not hints:
+         return
+     print("FRAMEBASE_DELETE_PROGRESS " + json.dumps({"scanned": 0, "remaining": len(requested), "direction": "DIRECT"}), flush=True)
++    matched = 0
++    reasons: dict[str, int] = {}
++    def skip(reason: str) -> None:
++        reasons[reason] = reasons.get(reason, 0) + 1
+     try:
+-        names = list(dict.fromkeys([*hints, *hints.values()]))
++        names = list({**{key: "CPLMaster" for key in hints}, **{name: "CPLAsset" for name in hints.values()}}.items())
++        # Request deletion flags and media fields explicitly, as with album queries.
++        # Lookup responses may omit optional fields unless desiredKeys is supplied.
++        desired_keys = library.all._list_query_gen(0, "CPLAssetAndMasterByAssetDate", None)["desiredKeys"]
+         records = []
+         for start in range(0, len(names), 100):
+             response = library.session.post(
+                 f"{library.service_endpoint}/records/lookup?{urllib.parse.urlencode(library.params)}",
+-                data=json.dumps({"records": [{"recordName": name} for name in names[start:start + 100]], "zoneID": library.zone_id}),
++                data=json.dumps({"records": [{"recordName": name, "recordType": record_type, "zoneID": library.zone_id} for name, record_type in names[start:start + 100]], "zoneID": library.zone_id, "desiredKeys": desired_keys}),
+                 headers={"Content-type": "application/json"},
+             ).json()
++            if response.get("serverErrorCode"):
++                skip("lookup_server_error")
+             records.extend(response.get("records", []))
++            for batch in response.get("batch", []):
++                records.extend(batch.get("records", []))
++        for record in records:
++            if record.get("serverErrorCode"):
++                skip("record_server_error")
+         masters = {record.get("recordName"): record for record in records if record.get("recordType") == "CPLMaster" and not record.get("serverErrorCode")}
+         assets = {record.get("recordName"): record for record in records if record.get("recordType") == "CPLAsset" and not record.get("serverErrorCode")}
+         for key, record_name in hints.items():
+             master = masters.get(key)
+             asset = assets.get(record_name)
+-            if not master or not asset or not asset.get("recordChangeTag"):
++            if not master:
++                skip("master_missing")
++                continue
++            if not asset:
++                skip("asset_missing")
++                continue
++            if not asset.get("recordChangeTag"):
++                skip("change_tag_missing")
+                 continue
+             fields = asset.get("fields", {})
+             if fields.get("masterRef", {}).get("value", {}).get("recordName") != key:
++                skip("master_reference_mismatch")
+                 continue
+             deleted = fields.get("isDeleted", {}).get("value")
+-            if deleted not in (0, 1) or (deleted == 0 and getattr(library, "framebase_indexing_state", None) == "RUNNING"):
++            if deleted not in (0, 1):
++                skip("deletion_state_missing_or_invalid")
++                continue
++            if fields.get("isExpunged", {}).get("value") not in (None, 0):
++                skip("expunged_or_unknown")
++                continue
++            if deleted == 0 and getattr(library, "framebase_indexing_state", None) == "RUNNING":
++                skip("index_running")
+                 continue
+             photo = PhotoAsset(master, asset)
+             photo.framebase_direct_lookup = True
+             photo.framebase_already_deleted = deleted == 1
++            matched += 1
+             yield photo
+-    except Exception:
++    except Exception as error:
+         # Unsupported endpoints, stale hints and malformed responses use guarded pagination.
++        skip("exception_" + type(error).__name__)
+         print("FRAMEBASE_DELETE_LOOKUP_FALLBACK", flush=True)
++    finally:
++        print("FRAMEBASE_DELETE_LOOKUP " + json.dumps({"requested": len(hints), "matched": matched, "reasons": reasons}), flush=True)
+
+ 
+ def framebase_targets_with_deleted(library: PhotoLibrary, photo_album: PhotoAlbum, requested: Mapping[str, Mapping[str, Any]]) -> Iterable[PhotoAsset]:
+--- a/tests/test_framebase_direct_lookup.py
++++ b/tests/test_framebase_direct_lookup.py
+@@ -18,6 +18,7 @@
+     result.session.post.return_value.json.return_value = {"records": records}
+     result.recently_deleted = []
+     result.framebase_read_probe_count = None
++    result.all._list_query_gen.return_value = {"desiredKeys": ["isDeleted", "isExpunged", "masterRef", "filenameEnc", "resOriginalRes"]}
+     return result
+
+ 
+@@ -33,6 +34,10 @@
+     call = cloud.session.post.call_args
+     assert "/records/lookup?" in call.args[0]
+     assert json.loads(call.kwargs["data"])["zoneID"] == {"zoneName": "PrimarySync"}
++    payload = json.loads(call.kwargs["data"])
++    assert "isDeleted" in payload["desiredKeys"]
++    assert payload["records"][0]["recordType"] == "CPLMaster"
++    assert all(record["zoneID"] == {"zoneName": "PrimarySync"} for record in payload["records"])
+     assert not any("/records/modify" in entry.args[0] for entry in cloud.session.post.call_args_list)
+
+ 
+@@ -83,3 +88,37 @@
+     requested = {str(i): {"lookupAssetRecordName": f"asset-{i}"} for i in range(100)}
+     assert len(list(framebase_direct_targets(cloud, requested))) == 100
+     assert cloud.session.post.call_count == 2
++
++
++def test_explicit_fields_and_batch_response_avoid_pagination(capsys):
++    cloud = library([])
++    def respond(_url, **kwargs):
++        payload = json.loads(kwargs["data"])
++        assert "isDeleted" in payload["desiredKeys"]
++        return Mock(json=lambda: {"batch": [{"records": pair()}]})
++    cloud.session.post.side_effect = respond
++    with patch("icloudpd.base.framebase_target_photos") as scan:
++        assert len(list(framebase_targets_with_deleted(cloud, object(), {"target": {"lookupAssetRecordName": "asset-record"}}))) == 1
++    scan.assert_not_called()
++    assert '"matched": 1' in capsys.readouterr().out
++
++
++@pytest.mark.parametrize("reason,modify", [
++    ("deletion_state_missing_or_invalid", lambda records: records[1]["fields"].pop("isDeleted")),
++    ("expunged_or_unknown", lambda records: records[1]["fields"].update({"isExpunged": {"value": 1}})),
++    ("change_tag_missing", lambda records: records[1].pop("recordChangeTag")),
++])
++def test_incomplete_or_expunged_records_report_reason_without_authorizing_delete(reason, modify, capsys):
++    records = pair()
++    modify(records)
++    assert list(framebase_direct_targets(library(records), {"target": {"lookupAssetRecordName": "asset-record"}})) == []
++    assert reason in capsys.readouterr().out
++
++
++def test_partial_lookup_scans_only_remaining_targets(capsys):
++    cloud = library(pair())
++    requested = {"target": {"lookupAssetRecordName": "asset-record"}, "other": {"lookupAssetRecordName": "other-record"}}
++    with patch("icloudpd.base.framebase_target_photos", return_value=iter([Mock(id="other")])) as scan:
++        assert len(list(framebase_targets_with_deleted(cloud, object(), requested))) == 2
++    assert set(scan.call_args.args[1]) == {"other"}
++    assert "master_missing" in capsys.readouterr().out

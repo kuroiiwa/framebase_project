@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public/framebase-icon.svg" width="96" height="96" alt="FrameBase 图标" />
+</p>
+
 # Framebase
 
 Framebase 是一个在自己电脑上运行的视频整理工具。它把多个本地文件夹汇总成视频库，方便查找、预览、标记、筛选和播放；同一局域网中的手机可以浏览与播放电脑共享的视频。电脑端和手机端的日常使用都通过浏览器完成。

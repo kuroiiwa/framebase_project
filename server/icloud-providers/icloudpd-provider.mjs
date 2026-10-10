@@ -119,6 +119,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
   const authJobs = new Map();
   const sessionSecrets = new Map();
   const assetLookupHints = new Map();
+  let versionCache;
   const safeVerificationConcurrency = Math.min(4, Math.max(1, Math.floor(Number(verificationConcurrency) || 2)));
   const safeProgressInterval = Math.max(10, Math.floor(Number(progressInterval) || 1000));
 
@@ -191,14 +192,23 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
   }
   async function info() {
     try {
-      if (!(await stat(executablePath)).isFile()) throw new Error("not-file");
-      const { stdout, stderr } = await runCommand(executablePath, ["--version"], { timeout: 15_000 });
-      const versionOutput = `${stdout || ""}\n${stderr || ""}`.trim().split(/\r?\n/).find(Boolean) || "icloudpd";
-      const parsedVersion = /version[:\s]+([^,\s]+)/i.exec(versionOutput)?.[1] || versionOutput;
-      const version = basename(executablePath).includes("framebase-compatible")
-        ? "1.32.3 · FrameBase 兼容版"
-        : parsedVersion;
-      return { id: "icloudpd", available: true, version, executablePath };
+      const file = await stat(executablePath);
+      if (!file.isFile()) throw new Error("not-file");
+      const fingerprint = JSON.stringify([file.size, file.mtimeMs, file.ctimeMs, file.dev, file.ino]);
+      if (versionCache?.fingerprint === fingerprint) return await versionCache.promise;
+      const entry = { fingerprint, promise: null };
+      entry.promise = (async () => {
+        const { stdout, stderr } = await runCommand(executablePath, ["--version"], { timeout: 15_000 });
+        const versionOutput = `${stdout || ""}\n${stderr || ""}`.trim().split(/\r?\n/).find(Boolean) || "icloudpd";
+        const parsedVersion = /version[:\s]+([^,\s]+)/i.exec(versionOutput)?.[1] || versionOutput;
+        const version = basename(executablePath).includes("framebase-compatible")
+          ? "1.32.3 · FrameBase 兼容版"
+          : parsedVersion;
+        return { id: "icloudpd", available: true, version, executablePath };
+      })();
+      versionCache = entry;
+      try { return await entry.promise; }
+      catch (error) { if (versionCache === entry) versionCache = undefined; throw error; }
     } catch {
       return { id: "icloudpd", available: false, version: null, executablePath };
     }
@@ -870,6 +880,20 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           if (line.includes("FRAMEBASE_DELETE_LIMIT ")) {
             scanMessage = "只读复核已达到查找时间上限，正在汇总已精确匹配的结果；未匹配项目不会删除。";
             publish(); return;
+          }
+          const lookupStart = line.indexOf("FRAMEBASE_DELETE_LOOKUP ");
+          if (lookupStart >= 0) {
+            try {
+              const diagnostic = JSON.parse(line.slice(lookupStart + "FRAMEBASE_DELETE_LOOKUP ".length));
+              debugLog?.write("direct_lookup", { library, ...diagnostic });
+              if (Number.isInteger(diagnostic.matched) && Number.isInteger(diagnostic.requested)) {
+                scanMessage = diagnostic.matched === diagnostic.requested
+                  ? `已直接定位 ${diagnostic.matched} 个目标，无需分页扫描。`
+                  : `已直接定位 ${diagnostic.matched}/${diagnostic.requested} 个目标，仅为剩余项目执行分页复核。`;
+                publish();
+              }
+            } catch { /* Ignore malformed lookup diagnostics. */ }
+            return;
           }
           const doneStart = line.indexOf("FRAMEBASE_DELETE_DONE ");
           if (doneStart >= 0) {

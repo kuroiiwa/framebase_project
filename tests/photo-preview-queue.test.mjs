@@ -72,3 +72,28 @@ test('failed decoding releases its slot and permits subsequent previews', async 
   await f.idle(); await rejection; await f.idle();
   assert.equal(await next, 'next'); assert.equal(f.queue.active, 0);
 });
+
+test('visible thumbnails overtake next-page prefetch queued during scrolling', async () => {
+  const f = fixture(); const order = [];
+  f.setPreviewScrolling(true);
+  const background = f.schedulePreview(f.queue, async () => { order.push('next-page'); }, () => false, false, true);
+  const visible = f.schedulePreview(f.queue, async () => { order.push('visible'); }, () => false);
+  f.setPreviewScrolling(false); await f.idle(); await visible;
+  await f.idle(); await background;
+  assert.deepEqual(order, ['visible', 'next-page']);
+});
+
+test('prefetch yields to foreground work in another codec queue and resumes on completion', async () => {
+  const f = fixture(); const other = { pending: [], active: 0, limit: 1 }; let complete; let prefetched = false;
+  const foreground = f.schedulePreview(other, () => new Promise(resolve => { complete = resolve; }), () => false, true);
+  const background = f.schedulePreview(f.queue, async () => { prefetched = true; }, () => false, false, true);
+  await f.idle(); assert.equal(prefetched, false);
+  complete(); await foreground; await f.idle(); await background;
+  assert.equal(prefetched, true);
+});
+
+test('stale next-page prefetch never decodes after page changes', async () => {
+  const f = fixture(); let cancelled = false; let started = false;
+  const background = f.schedulePreview(f.queue, async () => { started = true; }, () => cancelled, false, true);
+  cancelled = true; await f.idle(); assert.equal(await background, null); assert.equal(started, false);
+});

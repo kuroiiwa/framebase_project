@@ -103,3 +103,4 @@
 .timePeriods input{width:18px;height:18px;accent-color:var(--ink);flex-shrink:0}
 .timePeriods small{margin-left:auto;color:var(--muted);white-space:nowrap;font-size:12px}
 .timePeriods .selectedTimePeriod{border-color:var(--ink);background:color-mix(in srgb,var(--lime) 20%,var(--white))}
+.viewerMedia>img{width:auto;height:auto;max-width:100%;max-height:100%}

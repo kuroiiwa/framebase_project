@@ -7,12 +7,14 @@ import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
 import ThemeSelector from "../theme-selector";
 import PhotoActionsMenu from "./photo-actions-menu";
+import { findLivePhotoVideo } from "../../shared/live-photo.mjs";
 import AppleSessionControls from "../apple-session-controls";
 import styles from "./photos.module.css";
 import actionStyles from "../media-actions.module.css";
 import { collectCloudSelection, MAX_PHOTO_SELECTION } from "./bulk-selection";
 import { viewerAfterRemoval } from "./viewer-navigation";
 import { decodeHeicPreview } from "./heic-preview";
+import { createBrowserThumbnail } from "./thumbnail-preview";
 import type { HeicPreviewOptions } from "./heic-codec";
 import { schedulePreview, setPreviewScrolling, type PreviewQueue } from "./preview-queue";
 import { findPhotoCloudAsset } from "./cloud-match";
@@ -45,6 +47,7 @@ type PhotoItem = {
   liked: boolean;
   cleanup: boolean;
 };
+type PreviewItem = Pick<PhotoItem, "id" | "modified" | "size" | "extension" | "handle">;
 type SourceFolder = { id: string; name: string; handle: DirectoryHandle; lastScan: number; photoCount: number; totalSize: number };
 type PhotoMarks = Record<string, { liked?: boolean; cleanup?: boolean }>;
 type Tab = "all" | "live" | "liked" | "cleanup";
@@ -74,19 +77,20 @@ type ThumbnailManifest = { entries: Array<{ key: string; size: number }>; totalS
 const regularPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 2 };
 const heicPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 1 };
 const thumbnailBlobCache = new Map<string, Blob>();
+const thumbnailDecodes = new Map<string, Promise<Blob | null>>();
 const fullHeicPreviewCache = new Map<string, Blob>();
 const FULL_HEIC_PREVIEW_CACHE_BYTES = 32 * 1024 * 1024;
 let thumbnailPersistence = Promise.resolve();
 
-function thumbnailCacheKey(item: PhotoItem) { return `${item.id}:${item.modified}:${item.size}`; }
-function persistentThumbnailKey(item: PhotoItem) { return `${PERSISTENT_THUMBNAIL_PREFIX}${thumbnailCacheKey(item)}`; }
-function readThumbnailCache(item: PhotoItem) {
+function thumbnailCacheKey(item: PreviewItem) { return `${item.id}:${item.modified}:${item.size}`; }
+function persistentThumbnailKey(item: PreviewItem) { return `${PERSISTENT_THUMBNAIL_PREFIX}${thumbnailCacheKey(item)}`; }
+function readThumbnailCache(item: PreviewItem) {
   const key = thumbnailCacheKey(item);
   const cached = thumbnailBlobCache.get(key) || null;
   if (cached) { thumbnailBlobCache.delete(key); thumbnailBlobCache.set(key, cached); }
   return cached;
 }
-function rememberThumbnail(item: PhotoItem, blob: Blob) {
+function rememberThumbnail(item: PreviewItem, blob: Blob) {
   const key = thumbnailCacheKey(item);
   thumbnailBlobCache.delete(key);
   thumbnailBlobCache.set(key, blob);
@@ -131,14 +135,14 @@ async function dbDelete(key: string) {
   });
 }
 
-async function readPersistentThumbnail(item: PhotoItem) {
+async function readPersistentThumbnail(item: PreviewItem) {
   const blob = await dbGet<Blob>(persistentThumbnailKey(item)).catch(() => undefined);
   if (!(blob instanceof Blob)) return null;
   rememberThumbnail(item, blob);
   return blob;
 }
 
-function persistThumbnail(item: PhotoItem, blob: Blob) {
+function persistThumbnail(item: PreviewItem, blob: Blob) {
   const key = persistentThumbnailKey(item);
   thumbnailPersistence = thumbnailPersistence.catch(() => undefined).then(async () => {
     const saved = await dbGet<ThumbnailManifest>(PERSISTENT_THUMBNAIL_MANIFEST_KEY).catch(() => undefined);
@@ -157,7 +161,7 @@ function persistThumbnail(item: PhotoItem, blob: Blob) {
   }).catch(() => undefined);
 }
 
-function writeThumbnailCache(item: PhotoItem, blob: Blob) {
+function writeThumbnailCache(item: PreviewItem, blob: Blob) {
   rememberThumbnail(item, blob);
   if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) persistThumbnail(item, blob);
 }
@@ -186,14 +190,13 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
     const entries: Array<FileHandle | DirectoryHandle> = [];
     for await (const entry of directory.values()) entries.push(entry);
     const files = entries.filter((entry): entry is FileHandle => entry.kind === "file");
-    const liveVideos = new Map(files.filter(entry => entry.name.split(".").pop()?.toLowerCase() === "mov").map(entry => [entry.name.replace(/\.[^.]+$/, "").toLocaleLowerCase(), entry]));
+    const liveVideos = files.filter(entry => entry.name.split(".").pop()?.toLowerCase() === "mov");
     for (const entry of files) {
       const extension = entry.name.split(".").pop()?.toLowerCase() || "";
       if (!PHOTO_EXTENSIONS.has(extension)) continue;
       const file = await entry.getFile();
       const path = [...parts, entry.name].join("/");
-      const stem = entry.name.replace(/\.[^.]+$/, "").toLocaleLowerCase();
-      const companion = LIVE_PHOTO_IMAGE_EXTENSIONS.has(extension) ? liveVideos.get(stem) : undefined;
+      const companion = LIVE_PHOTO_IMAGE_EXTENSIONS.has(extension) ? findLivePhotoVideo(entry.name, liveVideos) : null;
       found.push({
         id: `${source.id}:${path}`,
         sourceId: source.id,
@@ -217,7 +220,7 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
   return found;
 }
 
-async function createPreviewBlob(item: PhotoItem) {
+async function createPreviewBlob(item: PreviewItem) {
   const file = await item.handle.getFile();
   if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
     try {
@@ -263,7 +266,7 @@ async function createPreviewObjectUrl(item: PhotoItem, cancelled: () => boolean)
   return blob ? URL.createObjectURL(blob) : null;
 }
 
-async function createThumbnailBlob(item: PhotoItem) {
+async function createThumbnailBlob(item: PreviewItem) {
     let blob: Blob | null;
     if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
       const file = await item.handle.getFile();
@@ -271,35 +274,35 @@ async function createThumbnailBlob(item: PhotoItem) {
       catch { blob = await convertLegacyHeic(file); }
     } else blob = await createPreviewBlob(item);
     if (!blob) return null;
-    const bitmap = await createImageBitmap(blob, { resizeWidth: THUMBNAIL_WIDTH, resizeQuality: "medium" });
-    try {
-      if (typeof OffscreenCanvas !== "undefined") {
-        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-        canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
-        return await canvas.convertToBlob({ type: "image/webp", quality: THUMBNAIL_WEBP_QUALITY });
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
-      return await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("thumbnail_failed")), "image/webp", THUMBNAIL_WEBP_QUALITY));
-    } finally {
-      bitmap.close();
-    }
+    return createBrowserThumbnail(blob, THUMBNAIL_WIDTH, THUMBNAIL_WEBP_QUALITY);
 }
 
-async function createThumbnailObjectUrl(item: PhotoItem, cancelled: () => boolean) {
-  const cached = readThumbnailCache(item)
-    || (HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? await readPersistentThumbnail(item) : null);
-  if (cached) return URL.createObjectURL(cached);
+async function loadThumbnail(item: PreviewItem, cancelled: () => boolean, background = false) {
+  const cached = readThumbnailCache(item);
+  if (cached) return cancelled() ? null : cached;
   const queue = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? heicPreviewQueue : regularPreviewQueue;
-  const thumbnail = await schedulePreview(queue, async () => {
+  return schedulePreview(queue, async () => {
     const cached = readThumbnailCache(item);
     if (cached) return cached;
-    const created = await createThumbnailBlob(item);
-    if (created) writeThumbnailCache(item, created);
-    return created;
-  }, cancelled);
+    const key = `${accountDbName()}:${thumbnailCacheKey(item)}`;
+    const running = thumbnailDecodes.get(key);
+    if (running) return running;
+    const decoding = (async () => {
+      const persisted = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? await readPersistentThumbnail(item) : null;
+      if (persisted) return persisted;
+      if (cancelled()) return null;
+      const created = await createThumbnailBlob(item);
+      if (created) writeThumbnailCache(item, created);
+      return created;
+    })();
+    thumbnailDecodes.set(key, decoding);
+    try { return await decoding; }
+    finally { thumbnailDecodes.delete(key); }
+  }, cancelled, false, background);
+}
+
+async function createThumbnailObjectUrl(item: PreviewItem, cancelled: () => boolean) {
+  const thumbnail = await loadThumbnail(item, cancelled);
   return thumbnail ? URL.createObjectURL(thumbnail) : null;
 }
 
@@ -311,6 +314,9 @@ function previewStatus(extension: string, failed: boolean) {
 }
 
 function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
+  // Marks change the item object but do not change its preview content.
+  const { id, modified, size, extension, handle } = item;
+  const previewItem = useMemo(() => ({ id, modified, size, extension, handle }), [id, modified, size, extension, handle]);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
@@ -334,19 +340,21 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
     if (!nearViewport) return;
     let cancelled = false;
     let objectUrl = "";
-    void createThumbnailObjectUrl(item, () => cancelled).then(createdUrl => {
+    void createThumbnailObjectUrl(previewItem, () => cancelled).then(createdUrl => {
       if (!createdUrl) return;
       if (cancelled) URL.revokeObjectURL(createdUrl);
       else { objectUrl = createdUrl; setUrl(createdUrl); }
     }).catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [item, nearViewport]);
+  }, [previewItem, nearViewport]);
   return <button ref={buttonRef} className={styles.thumb} onClick={onOpen} aria-label={`查看 ${item.name}`}>
     {url && !failed ? <img src={url} alt="" loading="lazy" decoding="async" onError={() => setFailed(true)} /> : <span><b>{item.extension.toUpperCase()}</b><small>{nearViewport ? previewStatus(item.extension, failed) : "接近时加载预览"}</small></span>}
   </button>;
 }
 
 function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCleanup, cloudAvailable, cloudLoading, cloudMessage, releaseBusy, taskNotice = "" }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void; onDelete: (mode: "local" | "icloud" | "both") => void; onFavorite: () => void; onCleanup: () => void; cloudAvailable: boolean; cloudLoading: boolean; cloudMessage: string; releaseBusy: boolean; taskNotice?: string }) {
+  const backdropPointer = useRef<{ x: number; y: number; blank: boolean; moved: boolean } | null>(null);
+  const isViewerBlank = (target: EventTarget | null, viewer: HTMLElement) => target === viewer || target === mediaRef.current || target instanceof HTMLElement && target.tagName === "FIGURE";
   const [previewItem] = useState(item);
   const [initialUrl] = useState<string | null>(() => {
     const thumbnail = readThumbnailCache(item);
@@ -427,7 +435,16 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCl
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
   }, [next, onClose, previous]);
-  return <div className={styles.viewer} role="dialog" aria-modal="true" aria-label={item.name}>
+  return <div className={styles.viewer} role="dialog" aria-modal="true" aria-label={item.name} onPointerDownCapture={event => {
+    backdropPointer.current = event.isPrimary && event.button === 0 ? { x: event.clientX, y: event.clientY, blank: isViewerBlank(event.target, event.currentTarget), moved: false } : null;
+  }} onPointerMoveCapture={event => {
+    const pointer = backdropPointer.current;
+    if (pointer && Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) > 5) pointer.moved = true;
+  }} onPointerUp={event => {
+    const pointer = backdropPointer.current;
+    backdropPointer.current = null;
+    if (pointer?.blank && !pointer.moved && isViewerBlank(event.target, event.currentTarget)) onClose();
+  }} onPointerCancel={() => { backdropPointer.current = null; }}>
     <button className={styles.viewerClose} onClick={onClose} aria-label="关闭">×</button>
     <button className={styles.viewerPrevious} onClick={previous} aria-label="上一张">‹</button>
     <figure><div ref={mediaRef} className={styles.viewerMedia} style={{ cursor: zoom > 1 && !playingLive ? "grab" : "default" }} onPointerDown={event => {
@@ -927,6 +944,22 @@ function PhotoLibrary({ username }: { username: string }) {
     setPage(Math.max(1, Math.min(pageCount, nextPage)));
   }
   const visible = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+  useEffect(() => {
+    if (viewerId || loading) return;
+    let cancelled = false;
+    // Warm only the next page's small thumbnails, without creating image elements or URLs.
+    const timer = setTimeout(() => {
+      void (async () => {
+        const nextPage = filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+        for (const item of nextPage) {
+          if (cancelled) break;
+          try { await loadThumbnail(item, () => cancelled, true); }
+          catch { /* Speculative failures must not interrupt browsing. */ }
+        }
+      })();
+    }, 1200);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [currentPage, filtered, viewerId, loading]);
   const viewerIndex = viewerId ? filtered.findIndex(item => item.id === viewerId) : -1;
   const viewer = viewerId ? photos.find(item => item.id === viewerId) : null;
   const moveViewer = useCallback((direction: -1 | 1) => {

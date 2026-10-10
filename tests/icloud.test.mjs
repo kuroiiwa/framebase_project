@@ -268,7 +268,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /setConfig\(await fetchIcloudConfig\(\)\)/);
   assert.doesNotMatch(styles, /timelineLocalOnly\{background:#/);
   assert.match(page, /实时同步速率/);
-  assert.match(page, /等待 iCloud/);
+  assert.match(page, /读取云端清单/);
   assert.match(page, /图片进度/);
   assert.match(page, /syncedPhotoCount/);
   assert.match(page, /transferRateBps/);

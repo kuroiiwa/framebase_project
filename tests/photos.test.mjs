@@ -18,13 +18,16 @@ test("confirmed cloud photos match backup paths independently of local download 
 });
 
 test("photo library remains isolated from the existing video library", async () => {
-  const [photos, photoStyles, icloud, videos, accountGate, globalStyles] = await Promise.all([
+  const [photos, photoStyles, icloud, videos, accountGate, globalStyles, heicCodec, thumbnailCodec, previewQueue] = await Promise.all([
     readFile(new URL("../app/photos/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/photos/photos.module.css", import.meta.url), "utf8"),
     readFile(new URL("../app/icloud/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/account-gate.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../app/photos/heic-codec.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/photos/thumbnail-codec.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/photos/preview-queue.ts", import.meta.url), "utf8"),
   ]);
   assert.match(photos, /photo-source-folders-v1/);
   assert.match(photos, /photo-library:/);
@@ -38,12 +41,12 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(photos, /<a className="media-header-button" href="\/icloud">iCloud 备份<\/a>/);
   assert.match(photos, /<a className="media-header-button" href="\/lan">局域网<\/a>/);
   assert.match(photos, /手机比例 9:16/);
-  assert.match(photos, /styles\.cardActions/);
+  assert.match(photos, /<PhotoActionsMenu/);
   assert.match(photoStyles, /\.phoneRatio \.thumb\{aspect-ratio:9\/16\}/);
   assert.match(icloud, /media-header-button.*href="\/\?library=video">← 返回视频库<\/a>/);
   assert.match(icloud, /media-header-button.*href="\/photos">返回图片库<\/a>/);
   assert.match(photos, /import\("heic2any"\)/);
-  assert.match(photos, /import\("libheif-js\/wasm-bundle\.js"\)/);
+  assert.match(heicCodec, /import\("libheif-js\/wasm-bundle\.js"\)/);
   assert.match(photos, /decodeModernHeic/);
   assert.match(photos, /HEIC 预览生成失败/);
   assert.match(photos, /framebase-photo-view/);
@@ -58,10 +61,10 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(globalStyles, /\.media-header-actions \.media-header-button/);
   assert.match(globalStyles, /height:34px;min-height:34px/);
   assert.match(photos, /IntersectionObserver/);
-  assert.match(photos, /createImageBitmap/);
-  assert.match(photos, /regularPreviewQueue: PreviewQueue = \{ pending: \[\], active: 0, limit: 3 \}/);
+  assert.match(thumbnailCodec, /createImageBitmap/);
+  assert.match(photos, /regularPreviewQueue: PreviewQueue = \{ pending: \[\], active: 0, limit: 2 \}/);
   assert.match(photos, /heicPreviewQueue: PreviewQueue = \{ pending: \[\], active: 0, limit: 1 \}/);
-  assert.match(photos, /if \(job\.cancelled\(\)\) \{ job\.skip\(\); continue; \}/);
+  assert.match(previewQueue, /if \(job\.cancelled\(\)\) \{ queue\.pending\.shift\(\); job\.skip\(\); continue; \}/);
   assert.match(photos, /thumbnailBlobCache/);
   assert.match(photos, /PERSISTENT_THUMBNAIL_CACHE_BYTES = 48 \* 1024 \* 1024/);
   assert.match(photos, /PERSISTENT_THUMBNAIL_PREFIX = "photo-thumbnail-v1:"/);
@@ -70,7 +73,7 @@ test("photo library remains isolated from the existing video library", async () 
   assert.match(photos, /if \(HEIC_PREVIEW_EXTENSIONS\.has\(item\.extension\)\) persistThumbnail\(item, blob\)/);
   assert.match(photoStyles, /content-visibility:auto/);
   assert.match(photos, /LIVE_PHOTO_IMAGE_EXTENSIONS/);
-  assert.match(photos, /const liveVideos = new Map/);
+  assert.match(photos, /findLivePhotoVideo\(entry.name, liveVideos\)/);
   assert.match(photos, /liveVideo: companion/);
   assert.match(photos, />实况<\/button>/);
   assert.match(photos, /<video src=\{liveUrl\} controls autoPlay playsInline/);

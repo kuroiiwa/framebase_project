@@ -6,6 +6,31 @@ import { join } from "node:path";
 import test from "node:test";
 import { createIcloudPdProvider, inventoryRecoveryLimits, isTolerableInventoryGap } from "../server/icloud-providers/icloudpd-provider.mjs";
 
+test("version queries share one process and refresh when executable changes", async t => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-version-cache-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executablePath = join(root, "icloudpd.exe"); await writeFile(executablePath, "test");
+  let calls = 0;
+  const provider = createIcloudPdProvider({ executablePath, runCommand: async () => { calls++; await new Promise(resolve => setImmediate(resolve)); return { stdout: `version:1.32.${calls}` }; } });
+  const results = await Promise.all([provider.info(), provider.info(), provider.info()]);
+  assert.equal(calls, 1); assert.ok(results.every(result => result.available && result.version === "1.32.1"));
+  await provider.info(); assert.equal(calls, 1);
+  await writeFile(executablePath, "changed-binary");
+  assert.equal((await provider.info()).version, "1.32.2"); assert.equal(calls, 2);
+  await rm(executablePath); assert.equal((await provider.info()).available, false);
+});
+
+test("failed version queries can retry instead of caching tool_missing", async t => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-version-retry-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executablePath = join(root, "icloudpd.exe"); await writeFile(executablePath, "test");
+  let calls = 0;
+  const provider = createIcloudPdProvider({ executablePath, runCommand: async () => { if (++calls === 1) throw new Error("temporarily unavailable"); return { stdout: "version:1.32.3" }; } });
+  assert.equal((await provider.info()).available, false);
+  assert.equal((await provider.info()).available, true); assert.equal(calls, 2);
+  await provider.info(); assert.equal(calls, 2);
+});
+
 test("timeline recovery starts with a small reverse window and expands only when needed", () => {
   assert.deepEqual(inventoryRecoveryLimits(4680, 4670), [64, 256, 1024, 4680]);
   assert.deepEqual(inventoryRecoveryLimits(4680, 3000), [1712, 4680]);
@@ -668,20 +693,22 @@ test("provider deletes only exact asset ids through the protected FrameBase adap
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-delete-"));
   const executablePath = join(root, "icloudpd.exe");
   const calls = [];
+  const diagnostics = [];
+  let versionCalls = 0;
   try {
     await writeFile(executablePath, "test");
     const provider = createIcloudPdProvider({
       executablePath,
       runCommand: async (_executable, args, options) => {
-        if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
+        if (args.includes("--version")) { versionCalls++; return { stdout: "version:1.32.3\n", stderr: "" }; }
         const request = JSON.parse(await readFile(options.env.FRAMEBASE_DELETE_REQUEST, "utf8"));
         calls.push({ args, options, request });
         const asset = request.assets[0];
-        return { stdout: `FRAMEBASE_DELETE ${JSON.stringify({ id: asset.id, library: asset.library, status: options.env.FRAMEBASE_DELETE_COMMIT === "1" ? "deleted" : "matched", bytes: asset.originalBytes, lookupAssetRecordName: "fresh-asset-record" })}\n`, stderr: "" };
+        return { stdout: `FRAMEBASE_DELETE_LOOKUP {"requested":1,"matched":1,"reasons":{}}\nFRAMEBASE_DELETE ${JSON.stringify({ id: asset.id, library: asset.library, status: options.env.FRAMEBASE_DELETE_COMMIT === "1" ? "deleted" : "matched", bytes: asset.originalBytes, lookupAssetRecordName: "fresh-asset-record" })}\n`, stderr: "" };
       },
     });
     const asset = { id: "asset-1", library: "SharedSync", name: "IMG_0001.HEIC", created: "2024-03-02T10:00:00+08:00", mediaType: "photo", originalBytes: 4096 };
-    const context = { jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"), assets: [asset] };
+    const context = { jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory: join(root, "backup"), assets: [asset], debugLog: { write: (event, data) => diagnostics.push({ event, data }) } };
     await mkdir(context.sessionDirectory, { recursive: true });
     const preview = await provider.deleteAssets({ ...context, commit: false });
     const deleted = await provider.deleteAssets({ ...context, commit: true });
@@ -694,6 +721,9 @@ test("provider deletes only exact asset ids through the protected FrameBase adap
     assert.equal(calls[1].options.env.FRAMEBASE_DELETE_COMMIT, "1");
     assert.equal(calls[0].request.assets[0].lookupAssetRecordName, undefined);
     assert.equal(calls[1].request.assets[0].lookupAssetRecordName, "fresh-asset-record", "commit reuses the confirmed preview's record name and still refetches cloud metadata");
+    assert.equal(versionCalls, 1, "preview and commit share the version query");
+    assert.equal(diagnostics.filter(entry => entry.event === "direct_lookup").length, 2);
+    assert.equal(diagnostics.find(entry => entry.event === "direct_lookup").data.matched, 1);
     await provider.deleteAssets({ ...context, appleAccount: "another@example.com", commit: false });
     assert.equal(calls[2].request.assets[0].lookupAssetRecordName, undefined, "lookup hints must stay isolated between Apple accounts");
   } finally {
