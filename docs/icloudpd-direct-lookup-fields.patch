@@ -72,7 +72,7 @@
          print("FRAMEBASE_DELETE_LOOKUP_FALLBACK", flush=True)
 +    finally:
 +        print("FRAMEBASE_DELETE_LOOKUP " + json.dumps({"requested": len(hints), "matched": matched, "reasons": reasons}), flush=True)
-
+ 
  
  def framebase_targets_with_deleted(library: PhotoLibrary, photo_album: PhotoAlbum, requested: Mapping[str, Mapping[str, Any]]) -> Iterable[PhotoAsset]:
 --- a/tests/test_framebase_direct_lookup.py
@@ -83,7 +83,7 @@
      result.framebase_read_probe_count = None
 +    result.all._list_query_gen.return_value = {"desiredKeys": ["isDeleted", "isExpunged", "masterRef", "filenameEnc", "resOriginalRes"]}
      return result
-
+ 
  
 @@ -33,6 +34,10 @@
      call = cloud.session.post.call_args
@@ -94,7 +94,7 @@
 +    assert payload["records"][0]["recordType"] == "CPLMaster"
 +    assert all(record["zoneID"] == {"zoneName": "PrimarySync"} for record in payload["records"])
      assert not any("/records/modify" in entry.args[0] for entry in cloud.session.post.call_args_list)
-
+ 
  
 @@ -83,3 +88,37 @@
      requested = {str(i): {"lookupAssetRecordName": f"asset-{i}"} for i in range(100)}
