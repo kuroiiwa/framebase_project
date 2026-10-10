@@ -7,7 +7,7 @@ declare module "libheif-js/wasm-bundle.js" {
     free?(): void;
   };
 
-  type HeifDecoder = {
+  export type HeifDecoder = {
     decode(data: ArrayBuffer | Uint8Array): HeifImage[];
   };
 

@@ -160,6 +160,13 @@ h1 { margin:0; font-size:28px; letter-spacing:-1.2px; }
 .toast button { margin-left:auto; border:0; background:transparent; color:inherit; font-size:18px; cursor:pointer; }
 .modal-backdrop { position:fixed; z-index:40; inset:0; display:grid; place-items:center; padding:28px; background:#10120fca; backdrop-filter:blur(8px); }
 .confirmation-backdrop { z-index:1250; }
+dialog.app-confirm-dialog{position:fixed;inset:0;margin:auto;box-sizing:border-box;width:min(580px,calc(100vw - 32px));max-height:calc(100dvh - 32px);border:1px solid var(--line);background:var(--white);color:var(--ink);font-family:inherit}
+.app-confirm-dialog::backdrop{background:#10170eb3;backdrop-filter:blur(5px)}
+dialog.app-confirm-dialog p{font-size:14px;white-space:pre-line;overflow-wrap:anywhere}
+.app-confirm-dialog>div{margin-top:24px;flex-wrap:wrap}
+.app-confirm-dialog .confirmation-text{display:grid;gap:10px;background:var(--paper);color:var(--ink);font-size:14px}
+.confirmation-text input{min-width:0;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--white);color:var(--ink);font:inherit}
+.app-confirm-dialog button:disabled{opacity:.45;cursor:not-allowed}
 .player-backdrop { padding:0; background:#0d0f0c; backdrop-filter:none; }
 .player-modal { width:100vw; height:100vh; display:grid; grid-template-columns:300px minmax(0,1fr); overflow:hidden; background:#11130f; color:white; }
 .player-sidebar { min-width:0; display:flex; flex-direction:column; overflow-y:auto; padding:18px; border-right:1px solid #30342d; background:#191c17; }

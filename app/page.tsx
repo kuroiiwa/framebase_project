@@ -9,6 +9,9 @@ import { usePlayerShortcuts } from "./player-shortcuts";
 import AccountGate, { signOut } from "./account-gate";
 import { accountDbName, accountKey } from "./account-storage";
 import AdminDashboard from "./admin-dashboard";
+import ConfirmationDialog, { type ConfirmationRequest } from "./confirmation-dialog";
+import CloudDeleteWindow from "./cloud-delete-window";
+import { waitForCloudDelete, type CloudDeleteJob } from "./icloud-delete-progress";
 
 type FsPermission = "granted" | "denied" | "prompt";
 type FileHandle = {
@@ -76,6 +79,7 @@ type StoryboardCacheRecord = { key: string; size: number; lastAccess: number };
 type HealthIssue = { video: VideoItem; kind: "unavailable" | "changed" | "empty" | "preview"; detail: string };
 type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number; localFiles: string[] };
 type ReleaseCatalog = { releasePlan: { id: string | null; status: string; assets: IcloudAsset[] } | null; releaseHistory: { movedCount: number; movedBytes: number; recycledFileCount: number; recycledBytes: number; lastReleasedAt: string | null }; timeline: { staleAt: string | null; staleReason: string | null } };
+type VideoCloudDeleteJob = CloudDeleteJob & { result?: { releaseResult?: { status: string; message: string }; localRecyclePlan?: { fileCount: number; bytes: number }; recycleResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"] } };
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg"]);
 const DB_STORE = "cache";
@@ -395,6 +399,8 @@ function Library({ username }: { username: string }) {
   const [libraryReady, setLibraryReady] = useState(false);
   const [sourceFilter, setSourceFilter] = useState("all");
   const [videos, setVideos] = useState<VideoItem[]>([]);
+  const videoLibraryRef = useRef({ videos, sources });
+  videoLibraryRef.current = { videos, sources };
   const [loading, setLoading] = useState(false);
   const scanControlRef = useRef<ScanControl | null>(null);
   const [scanTask, setScanTask] = useState<{ name: string; phase: string; count: number; total: number; failed: number; paused: boolean; active: boolean } | null>(null);
@@ -468,6 +474,18 @@ function Library({ username }: { username: string }) {
   const playerOpenRef = useRef(false);
   const playerUrlRef = useRef<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [cloudConfirmation, setCloudConfirmation] = useState<ConfirmationRequest | null>(null);
+  const cloudConfirmationResolver = useRef<((value: string | null) => void) | null>(null);
+  useEffect(() => () => { cloudConfirmationResolver.current?.(null); }, []);
+  function requestCloudConfirmation(request: ConfirmationRequest) {
+    return new Promise<string | null>(resolve => { cloudConfirmationResolver.current = resolve; setCloudConfirmation(request); });
+  }
+  function resolveCloudConfirmation(value: string | null) {
+    const resolve = cloudConfirmationResolver.current;
+    cloudConfirmationResolver.current = null;
+    setCloudConfirmation(null);
+    resolve?.(value);
+  }
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -482,6 +500,9 @@ function Library({ username }: { username: string }) {
   }, [notice, error]);
   const [releaseCatalog, setReleaseCatalog] = useState<ReleaseCatalog | null>(null);
   const [releasingAsset, setReleasingAsset] = useState<string | null>(null);
+  const [videoDeleteJob, setVideoDeleteJob] = useState<VideoCloudDeleteJob | null>(null);
+  const videoDeleteAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => { videoDeleteAbort.current?.abort(); }, []);
 
   useEffect(() => { localStorage.setItem(accountKey("framebase-last-library"), "video"); }, []);
 
@@ -501,29 +522,49 @@ function Library({ username }: { username: string }) {
   }, [releaseCatalog]);
 
   async function releaseVideoFromIcloud(video: VideoItem, asset: IcloudAsset) {
+    if (releasingAsset !== null) return;
     const key = `${asset.library}:${asset.id}`;
     setReleasingAsset(key); setError(null); setNotice(null);
     try {
-      const recycleLocal = window.confirm("是否同时把本地备份移入 Windows 回收站？\n\n确定：云端和本地同时清理\n取消：只清理 iCloud，保留本地视频");
-      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], recycleLocal }) });
-      const preview = await previewResponse.json() as { releaseResult?: { status: string }; localRecyclePlan?: { fileCount: number; bytes: number }; error?: string };
-      if (!previewResponse.ok || preview.releaseResult?.status !== "matched") throw new Error(preview.error || "云端视频复核失败，没有执行删除。");
+      const scope = await requestCloudConfirmation({ title: "选择视频清理范围", message: `“${video.name}”将从 iCloud 移入“最近删除”。是否同时将本地备份移入 Windows 回收站？`, choices: [{ label: "仅清理 iCloud", value: "cloud" }, { label: "云端和本地同时清理", value: "both", danger: true }] });
+      if (scope === null) return;
+      const recycleLocal = scope === "both";
+      videoDeleteAbort.current = new AbortController();
+      setVideoDeleteJob({ status: "running", preview: true, phase: "preview", name: video.name, startedAt: Date.now(), message: "正在启动后台复核，尚未执行删除…" });
+      const previewResponse = await fetch("/api/icloud/release/delete/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], recycleLocal, background: true }) });
+      const previewStarted = await previewResponse.json() as { deleteJob?: VideoCloudDeleteJob; error?: string };
+      if (!previewResponse.ok || !previewStarted.deleteJob?.id) throw new Error(previewStarted.error || "云端视频复核未能启动。");
+      setVideoDeleteJob(previewStarted.deleteJob);
+      const reviewed = await waitForCloudDelete<VideoCloudDeleteJob>(previewStarted.deleteJob.id, setVideoDeleteJob, videoDeleteAbort.current.signal);
+      const preview = reviewed.result;
+      if (reviewed.status !== "completed" || preview?.releaseResult?.status !== "matched") throw new Error(reviewed.message || "云端视频复核失败，没有执行删除。");
       const localSummary = recycleLocal ? `同时将 ${preview.localRecyclePlan?.fileCount || 0} 个本地原文件（${formatBytes(preview.localRecyclePlan?.bytes || 0)}）移入 Windows 回收站。` : "本地视频会保留。";
-      const confirmation = window.prompt(`已精确匹配“${video.name}”。云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。${localSummary}\n\n请输入“移入最近删除”继续：`, "");
-      if (confirmation === null) return;
-      if (confirmation !== "移入最近删除") throw new Error("确认文字不正确，没有执行删除。");
-      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation, recycleLocal }) });
-      const data = await response.json() as { releaseResult?: { status: string; message: string }; recycleResult?: { status: string; message: string }; releaseHistory?: ReleaseCatalog["releaseHistory"]; timeline?: ReleaseCatalog["timeline"]; error?: string };
-      if (!response.ok || data.releaseResult?.status !== "deleted") throw new Error(data.error || data.releaseResult?.message || "iCloud 删除失败。");
+      const confirmation = await requestCloudConfirmation({ title: "确认清理视频", message: `已精确匹配“${video.name}”。云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。${localSummary}`, choices: [{ label: "确认删除", value: "confirm", danger: true }] });
+      if (confirmation !== "confirm") { setVideoDeleteJob(null); return; }
+      setVideoDeleteJob({ status: "running", phase: "preparing", name: video.name, startedAt: Date.now(), message: "已确认，正在启动后台删除…" });
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation: true, recycleLocal, background: true }) });
+      const started = await response.json() as { deleteJob?: VideoCloudDeleteJob; error?: string };
+      if (!response.ok || !started.deleteJob?.id) throw new Error(started.error || "删除任务未能启动。");
+      setVideoDeleteJob(started.deleteJob);
+      const completed = await waitForCloudDelete<VideoCloudDeleteJob>(started.deleteJob.id, setVideoDeleteJob, videoDeleteAbort.current.signal);
+      const data = completed.result;
+      if (data?.releaseResult?.status !== "deleted") throw new Error(completed.message || "iCloud 删除未完成。");
       setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
       if (data.recycleResult?.status === "recycled") {
-        const nextVideos = videos.filter(item => item.id !== video.id);
-        const nextSources = sources.map(source => source.id === video.sourceId ? { ...source, videoCount: Math.max(0, source.videoCount - 1), totalSize: Math.max(0, source.totalSize - video.size) } : source);
+        const nextVideos = videoLibraryRef.current.videos.filter(item => item.id !== video.id);
+        const nextSources = videoLibraryRef.current.sources.map(source => source.id === video.sourceId ? { ...source, videoCount: nextVideos.filter(item => item.sourceId === source.id).length, totalSize: nextVideos.filter(item => item.sourceId === source.id).reduce((sum, item) => sum + item.size, 0) } : source);
         setVideos(nextVideos); setSources(nextSources);
+        setSelected(current => new Set([...current].filter(id => id !== video.id)));
+        setPlayer(current => current?.id === video.id ? null : current);
         await Promise.all([dbSet(`library:${video.sourceId}`, nextVideos.filter(item => item.sourceId === video.sourceId).map(storedVideo)), dbSet("source-folders", nextSources)]);
       }
       setNotice(data.recycleResult ? `“${video.name}”已移入 iCloud“最近删除”。${data.recycleResult.message}` : `“${video.name}”已移入 iCloud“最近删除”，本地视频未删除。预计可释放 ${formatBytes(asset.originalBytes)}。`);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "iCloud 删除失败。"); }
+    } catch (reason) {
+      if (videoDeleteAbort.current?.signal.aborted) return;
+      const message = reason instanceof Error ? reason.message : "iCloud 删除失败。";
+      setError(message);
+      setVideoDeleteJob(current => current ? { ...current, status: (current.deleted || 0) > 0 ? "partial" : "failed", message } : null);
+    }
     finally { setReleasingAsset(null); }
   }
 
@@ -1405,6 +1446,8 @@ function Library({ username }: { username: string }) {
         </section>
       </div>}
 
+      {cloudConfirmation && <ConfirmationDialog key={cloudConfirmation.title} request={cloudConfirmation} onResolve={resolveCloudConfirmation} />}
+      {videoDeleteJob && !cloudConfirmation && <CloudDeleteWindow key={videoDeleteJob.id || "starting"} job={videoDeleteJob} onClose={() => setVideoDeleteJob(null)} />}
       {confirmDelete && <div className="modal-backdrop confirmation-backdrop">
         <section className="confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
           <span className="warning">!</span><h2 id="delete-title">永久删除 {selected.size} 个视频？</h2>

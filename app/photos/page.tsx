@@ -12,6 +12,9 @@ import styles from "./photos.module.css";
 import actionStyles from "../media-actions.module.css";
 import { collectCloudSelection, MAX_PHOTO_SELECTION } from "./bulk-selection";
 import { viewerAfterRemoval } from "./viewer-navigation";
+import { decodeHeicPreview } from "./heic-preview";
+import type { HeicPreviewOptions } from "./heic-codec";
+import { schedulePreview, setPreviewScrolling, type PreviewQueue } from "./preview-queue";
 import { findPhotoCloudAsset } from "./cloud-match";
 import { CloudDeleteProgress, waitForCloudDelete, type CloudDeleteJob } from "../icloud-delete-progress";
 
@@ -66,39 +69,13 @@ const PERSISTENT_THUMBNAIL_CACHE_BYTES = 48 * 1024 * 1024;
 const PERSISTENT_THUMBNAIL_CACHE_ENTRIES = 800;
 const PERSISTENT_THUMBNAIL_MANIFEST_KEY = "photo-thumbnail-manifest-v1";
 const PERSISTENT_THUMBNAIL_PREFIX = "photo-thumbnail-v1:";
-type PreviewJob = { cancelled: () => boolean; start: () => Promise<void>; skip: () => void };
-type PreviewQueue = { pending: PreviewJob[]; active: number; limit: number };
 type ThumbnailManifest = { entries: Array<{ key: string; size: number }>; totalSize: number };
-const regularPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 3 };
+const regularPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 2 };
 const heicPreviewQueue: PreviewQueue = { pending: [], active: 0, limit: 1 };
 const thumbnailBlobCache = new Map<string, Blob>();
+const fullHeicPreviewCache = new Map<string, Blob>();
+const FULL_HEIC_PREVIEW_CACHE_BYTES = 32 * 1024 * 1024;
 let thumbnailPersistence = Promise.resolve();
-
-function drainPreviewQueue(queue: PreviewQueue) {
-  while (queue.pending.length && queue.active < queue.limit) {
-    const job = queue.pending.shift()!;
-    if (job.cancelled()) { job.skip(); continue; }
-    queue.active += 1;
-    void job.start().finally(() => { queue.active -= 1; drainPreviewQueue(queue); });
-  }
-}
-
-function schedulePreview<T>(queue: PreviewQueue, task: () => Promise<T>, cancelled: () => boolean, priority = false) {
-  return new Promise<T | null>((resolve, reject) => {
-    const job: PreviewJob = {
-      cancelled,
-      skip: () => resolve(null),
-      start: async () => {
-        try {
-          const result = await task();
-          resolve(cancelled() ? null : result);
-        } catch (error) { if (cancelled()) resolve(null); else reject(error); }
-      },
-    };
-    if (priority) queue.pending.unshift(job); else queue.pending.push(job);
-    drainPreviewQueue(queue);
-  });
-}
 
 function thumbnailCacheKey(item: PhotoItem) { return `${item.id}:${item.modified}:${item.size}`; }
 function persistentThumbnailKey(item: PhotoItem) { return `${PERSISTENT_THUMBNAIL_PREFIX}${thumbnailCacheKey(item)}`; }
@@ -243,56 +220,55 @@ async function createPreviewBlob(item: PhotoItem) {
   const file = await item.handle.getFile();
   if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
     try {
-      const { default: heic2any } = await import("heic2any");
-      const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.86 });
-      return Array.isArray(converted) ? converted[0] : converted;
+      return await decodeModernHeic(file);
     } catch {
-      return decodeModernHeic(file);
+      return convertLegacyHeic(file);
     }
   }
   if (BROWSER_PREVIEW_EXTENSIONS.has(item.extension)) return file;
   return null;
 }
 
-async function decodeModernHeic(file: Blob) {
-  const { default: libheif } = await import("libheif-js/wasm-bundle.js");
-  const images = new libheif.HeifDecoder().decode(await file.arrayBuffer());
-  const image = images.find(candidate => candidate.is_primary?.()) || images[0];
-  if (!image) throw new Error("heic_no_image");
-  const width = image.get_width();
-  const height = image.get_height();
-  if (!width || !height || width * height > 100_000_000) throw new Error("heic_invalid_dimensions");
-  const imageData = new ImageData(width, height);
-  try {
-    await new Promise<void>((resolve, reject) => image.display(imageData, result => result ? resolve() : reject(new Error("heic_decode_failed"))));
-    if (typeof OffscreenCanvas !== "undefined") {
-      const canvas = new OffscreenCanvas(width, height);
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("heic_canvas_unavailable");
-      context.putImageData(imageData, 0, 0);
-      return canvas.convertToBlob({ type: "image/jpeg", quality: 0.86 });
-    }
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error("heic_canvas_unavailable");
-    context.putImageData(imageData, 0, 0);
-    return await new Promise<Blob>((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error("heic_canvas_failed")), "image/jpeg", 0.86));
-  } finally {
-    image.free?.();
-  }
+async function convertLegacyHeic(file: Blob) {
+  const { default: heic2any } = await import("heic2any");
+  const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.86 });
+  return Array.isArray(converted) ? converted[0] : converted;
+}
+
+async function decodeModernHeic(file: Blob, options: HeicPreviewOptions = {}) {
+  return decodeHeicPreview(file, options);
 }
 
 async function createPreviewObjectUrl(item: PhotoItem, cancelled: () => boolean) {
+  const key = `${accountDbName()}:${thumbnailCacheKey(item)}`;
+  const ready = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? fullHeicPreviewCache.get(key) : null;
+  if (ready) { fullHeicPreviewCache.delete(key); fullHeicPreviewCache.set(key, ready); return URL.createObjectURL(ready); }
   const blob = HEIC_PREVIEW_EXTENSIONS.has(item.extension)
-    ? await schedulePreview(heicPreviewQueue, () => createPreviewBlob(item), cancelled, true)
+    ? await schedulePreview(heicPreviewQueue, async () => {
+      const cached = fullHeicPreviewCache.get(key);
+      if (cached) { fullHeicPreviewCache.delete(key); fullHeicPreviewCache.set(key, cached); return cached; }
+      const created = await createPreviewBlob(item);
+      if (created && created.size <= FULL_HEIC_PREVIEW_CACHE_BYTES) {
+        fullHeicPreviewCache.set(key, created);
+        let bytes = [...fullHeicPreviewCache.values()].reduce((total, entry) => total + entry.size, 0);
+        while (fullHeicPreviewCache.size > 4 || bytes > FULL_HEIC_PREVIEW_CACHE_BYTES) {
+          const oldest = fullHeicPreviewCache.keys().next().value!;
+          bytes -= fullHeicPreviewCache.get(oldest)!.size; fullHeicPreviewCache.delete(oldest);
+        }
+      }
+      return created;
+    }, cancelled, true)
     : await createPreviewBlob(item);
   return blob ? URL.createObjectURL(blob) : null;
 }
 
 async function createThumbnailBlob(item: PhotoItem) {
-    const blob = await createPreviewBlob(item);
+    let blob: Blob | null;
+    if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
+      const file = await item.handle.getFile();
+      try { return await decodeModernHeic(file, { width: THUMBNAIL_WIDTH, type: "image/webp", quality: THUMBNAIL_WEBP_QUALITY }); }
+      catch { blob = await convertLegacyHeic(file); }
+    } else blob = await createPreviewBlob(item);
     if (!blob) return null;
     const bitmap = await createImageBitmap(blob, { resizeWidth: THUMBNAIL_WIDTH, resizeQuality: "medium" });
     try {
@@ -317,6 +293,8 @@ async function createThumbnailObjectUrl(item: PhotoItem, cancelled: () => boolea
   if (cached) return URL.createObjectURL(cached);
   const queue = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? heicPreviewQueue : regularPreviewQueue;
   const thumbnail = await schedulePreview(queue, async () => {
+    const cached = readThumbnailCache(item);
+    if (cached) return cached;
     const created = await createThumbnailBlob(item);
     if (created) writeThumbnailCache(item, created);
     return created;
@@ -347,7 +325,7 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
       if (!entries.some(entry => entry.isIntersecting)) return;
       setNearViewport(true);
       observer.disconnect();
-    }, { rootMargin: "600px 0px" });
+    }, { rootMargin: "250px 0px" });
     observer.observe(button);
     return () => observer.disconnect();
   }, []);
@@ -475,7 +453,37 @@ export default function PhotosPage() {
   return <AccountGate>{username => <PhotoLibrary key={username} username={username} />}</AccountGate>;
 }
 
+function PhotoPageJump({ page, pageCount, onChange }: { page: number; pageCount: number; onChange: (page: number) => void }) {
+  return <form className={styles.pageJump} onSubmit={event => {
+    event.preventDefault();
+    const input = event.currentTarget.elements.namedItem("page") as HTMLInputElement;
+    const nextPage = input.valueAsNumber;
+    if (Number.isInteger(nextPage) && nextPage >= 1 && nextPage <= pageCount) onChange(nextPage);
+  }}>
+    <label>跳至 <input key={`${page}:${pageCount}`} name="page" type="number" min={1} max={pageCount} step={1} required defaultValue={page} aria-label="跳转到指定页码" /> 页</label>
+    <button className={actionStyles.button} type="submit">跳转</button>
+  </form>;
+}
+
 function PhotoLibrary({ username }: { username: string }) {
+  useEffect(() => {
+    let resumeTimer: ReturnType<typeof setTimeout>;
+    const pausePreviews = () => {
+      setPreviewScrolling(true);
+      clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(() => setPreviewScrolling(false), 180);
+    };
+    window.addEventListener("scroll", pausePreviews, { passive: true, capture: true });
+    window.addEventListener("wheel", pausePreviews, { passive: true });
+    window.addEventListener("touchmove", pausePreviews, { passive: true });
+    return () => {
+      clearTimeout(resumeTimer);
+      window.removeEventListener("scroll", pausePreviews, true);
+      window.removeEventListener("wheel", pausePreviews);
+      window.removeEventListener("touchmove", pausePreviews);
+      setPreviewScrolling(false);
+    };
+  }, []);
   const [sources, setSources] = useState<SourceFolder[]>([]);
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const libraryStateRef = useRef({ photos, sources, filtered: [] as PhotoItem[] });
@@ -492,7 +500,6 @@ function PhotoLibrary({ username }: { username: string }) {
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [page, setPage] = useState(1);
   const paginationRef = useRef<HTMLDivElement>(null);
-  const libraryHeadRef = useRef<HTMLElement>(null);
   const [paginationVisible, setPaginationVisible] = useState(true);
   const [viewerId, setViewerId] = useState<string | null>(null);
   const [icloudBackupDirectory, setIcloudBackupDirectory] = useState<string | null>(null);
@@ -905,7 +912,6 @@ function PhotoLibrary({ username }: { username: string }) {
   }, [pageCount]);
   function changePhotoPage(nextPage: number) {
     setPage(Math.max(1, Math.min(pageCount, nextPage)));
-    libraryHeadRef.current?.scrollIntoView({ block: "start", behavior: "instant" });
   }
   const visible = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
   const viewerIndex = viewerId ? filtered.findIndex(item => item.id === viewerId) : -1;
@@ -971,9 +977,9 @@ function PhotoLibrary({ username }: { username: string }) {
       <button className={`${actionStyles.button} ${styles.quickSelectAll}`} disabled={loading || !filtered.length} title={`选择当前筛选结果，包含其他分页，每批最多 ${MAX_PHOTO_SELECTION} 张`} onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? `全选前 ${MAX_PHOTO_SELECTION} 张` : "快捷全选"}</button>
       {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择</span></div><div className={styles.selectionActions}><button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={`${actionStyles.button} ${styles.bulkCleanup}`} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>批量加入待整理{selectedPhotos.length ? ` · ${selectedPhotos.length} 张` : ""}</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除选中的 {selectedPhotos.length} 张</button></div></>}
     </section>
-    <section ref={libraryHeadRef} className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div ref={paginationRef}><button disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页</button></div>}</section>
-    {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button></nav>}
-    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div ref={paginationRef}><button disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></div>}</section>
+    {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></nav>}
+    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}{item.cleanup && <span className={styles.cleanupBadge} title="已加入待整理">✓ 待整理</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
     <footer><span>图片来源来自你授权的本地文件夹；删除前需单独确认</span><a href="/?library=video">返回视频库 →</a></footer>
     {!dialogItems.length && deleteJob?.status === "failed" && <aside className={styles.deleteProgress}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></aside>}
     {dialogItems.length === 0 && deleteJob && deleteJob.status !== "idle" && <aside className={styles.deleteToast}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} />{deleteJob.status !== "running" && <button onClick={() => setDeleteJob(null)} aria-label="关闭删除结果">关闭</button>}</aside>}

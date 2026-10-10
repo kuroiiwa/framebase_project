@@ -75,10 +75,19 @@
 .deleteMini .deleteActions button{min-width:0;flex:1;padding:9px 10px;font-size:14px}
 @media(max-width:700px){.deleteDialog.deleteMini{inset:auto 12px 12px auto;width:calc(100vw - 24px);max-height:calc(100dvh - 48px)}}
 .viewerTaskNotice{margin:6px 0 0;padding:9px 12px;border:1px solid #cba6f755;border-radius:8px;background:#cba6f718;color:#e2d1f8;font-size:14px;line-height:1.6;overflow-wrap:anywhere}
-.libraryHead{scroll-margin-top:16px}
 .floatingPagination{position:fixed;z-index:1400;bottom:calc(18px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:12px;max-width:calc(100vw - 32px);padding:8px;border:1px solid var(--line);border-radius:14px;background:var(--white);color:var(--ink);box-shadow:0 8px 32px #0004;font-size:15px}
 .floatingPagination button{min-height:44px;white-space:nowrap}
 .floatingPagination>span{min-width:66px;text-align:center;white-space:nowrap;font-variant-numeric:tabular-nums}
 .floatingPaginationWithTask{left:16px;transform:none}
+.cleanupBadge{position:absolute;z-index:2;bottom:8px;left:8px;padding:3px 7px;border:1px solid #cce89a80;border-radius:6px;background:#23351ee6;color:#e6f6cc;font-size:11px;font-weight:650;line-height:1.4;pointer-events:none;box-shadow:0 1px 5px #0003}
+.pageJump{display:flex;align-items:center;gap:6px;margin:0;padding-left:10px;border-left:1px solid var(--line);font-size:13px;white-space:nowrap}
+.pageJump label{display:flex;align-items:center;gap:5px}
+.pageJump input{box-sizing:border-box;width:64px;min-height:34px;padding:5px 6px;border:1px solid var(--line);border-radius:7px;background:var(--paper);color:var(--ink);font:inherit;text-align:center;font-variant-numeric:tabular-nums}
+.pageJump input:focus-visible{outline:2px solid var(--lime);outline-offset:2px}
+.libraryHead{gap:12px;flex-wrap:wrap;padding:10px 0}
+.libraryHead>div{flex-wrap:wrap;gap:9px;font-size:13px}
+.libraryHead button{min-height:34px;color:var(--ink);font:inherit}
+.floatingPagination{flex-wrap:wrap;justify-content:center;width:max-content;box-sizing:border-box}
+@media(max-width:600px){.floatingPagination .pageJump{flex-basis:100%;justify-content:center;padding:6px 0 0;border-left:0;border-top:1px solid var(--line)}.libraryHead .pageJump{padding-left:0;border-left:0}.floatingPagination .pageJump button{min-height:34px;padding:5px 10px}}
 @media(max-width:860px){.floatingPaginationWithTask{top:calc(12px + env(safe-area-inset-top));bottom:auto;left:12px}.page:has(.floatingPaginationWithTask) .deleteMini{max-height:calc(100dvh - 100px)}}
 @media(max-width:420px){.floatingPagination{gap:8px}.floatingPagination button{padding:10px;font-size:14px}.floatingPagination>span{min-width:54px;font-size:14px}}
