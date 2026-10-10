@@ -2,12 +2,14 @@
 
 /* eslint-disable @next/next/no-html-link-for-pages -- hard navigation is required by the Vinext compatibility router. */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
 import ThemeSelector from "../theme-selector";
 import ConfirmationDialog, { type ConfirmationRequest } from "../confirmation-dialog";
 import { RecentDebugLogs, DebugLogLink, type DebugLog } from "../icloud-debug-log";
 import styles from "./icloud.module.css";
+import IcloudTutorial from "./tutorial";
+import { timelineProgress } from "./timeline-progress";
 import { createBackupNotifier } from "./backup-notifier";
 
 type IcloudConfig = {
@@ -52,7 +54,7 @@ type CoverageBucket = { key: string; verifiedCount: number; verifiedBytes: numbe
 type TimelineState = { scannedAt: string | null; staleAt: string | null; staleReason: string | null; assetCount: number; total: TimelineBucket | null; years: TimelineBucket[]; quarters: TimelineBucket[]; months: TimelineBucket[] };
 type BackupRange = { key: string; label: string; start: string; end: string };
 type TimelineGranularity = "years" | "quarters" | "months";
-type TimelineJob = { status: "idle" | "running" | "completed" | "failed"; phase: string; message: string; library: string | null; libraryIndex: number; libraryCount: number; itemCount: number; elapsedSeconds: number; timeline?: TimelineState; debugLog?: DebugLog };
+type TimelineJob = { status: "idle" | "running" | "completed" | "failed"; phase: string; message: string; library: string | null; libraryIndex: number; libraryCount: number; itemCount: number; elapsedSeconds: number; recoveryScanned?: number | null; recoveryLimit?: number | null; recoveryAdded?: number | null; timeline?: TimelineState; debugLog?: DebugLog };
 
 type AuthState = { status: "idle" | "starting" | "waiting_password" | "verifying" | "waiting_mfa" | "connected" | "failed" | "cancelled" | "tool_missing"; message: string; startedAt?: string };
 type RuntimeVersion = { app: "FrameBase"; version: string; commit: string; startedAt: string; pid: number; node: string };
@@ -74,6 +76,8 @@ export default function IcloudPage() {
 }
 
 function IcloudCenter({ username }: { username: string }) {
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+  const closeTutorial = useCallback(() => setTutorialOpen(false), []);
   const [config, setConfig] = useState<IcloudConfig | null>(null);
   const [manualPath, setManualPath] = useState("");
   const [appleAccount, setAppleAccount] = useState("");
@@ -86,6 +90,7 @@ function IcloudCenter({ username }: { username: string }) {
   const [releaseAcknowledged, setReleaseAcknowledged] = useState(false);
   const [timelineGranularity, setTimelineGranularity] = useState<TimelineGranularity>("years");
   const [timelineJob, setTimelineJob] = useState<TimelineJob | null>(null);
+  const timelineDisplay = timelineJob ? timelineProgress(timelineJob) : null;
   const [selectedPeriods, setSelectedPeriods] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -529,82 +534,29 @@ function IcloudCenter({ username }: { username: string }) {
     </header>
 
     <section className={styles.hero}>
-      <p>独立备份中心</p>
-      <h1>把 iCloud 原片安全保存到这台电脑</h1>
-      <span>每个 FrameBase 用户拥有独立的目录、认证会话、任务和清单。FrameBase 通过可替换 Provider 调用 icloudpd，不保存 Apple 密码。</span>
+      <div><h1>iCloud 备份中心</h1><span>备份原片、查看进度与管理释放计划</span></div><div className={styles.heroTools}><button className={styles.tutorialButton} onClick={() => setTutorialOpen(value => !value)} aria-haspopup="dialog" aria-expanded={tutorialOpen}>? 使用教程</button><strong className={`${styles.connectionBadge} ${config?.connectionStatus === "connected" ? styles.available : styles.missing}`}>{config?.connectionStatus === "connected" ? "● 已连接" : config?.connectionStatus === "expired" ? "需要登录" : "尚未连接"}</strong></div>
     </section>
 
-    <aside className={`${styles.runtimeVersion} ${runtimeVersionUnavailable ? styles.runtimeVersionOld : ""}`} aria-live="polite">{runtimeVersion ? <><strong>后端运行版本 <code>{runtimeVersion.commit !== "unknown" ? runtimeVersion.commit : `v${runtimeVersion.version}`}</code></strong><span>启动于 {new Date(runtimeVersion.startedAt).toLocaleString("zh-CN")} · PID {runtimeVersion.pid} · Node {runtimeVersion.node}</span></> : runtimeVersionUnavailable ? <><strong>未检测到运行版本</strong><span>当前后端可能仍是旧进程；新版后端启动后会在这里显示提交号和启动时间。</span></> : <><strong>正在读取后端运行版本…</strong><span>用于确认 iCloud 任务是否由最新进程执行。</span></>}</aside>
+    <section className={styles.overview} aria-label="备份概览">
+      <div><span>云端项目</span><strong>{config?.timeline?.total ? config.timeline.total.itemCount.toLocaleString() : "—"}</strong></div>
+      <div><span>云端原始大小</span><strong>{config?.timeline?.total ? formatBytes(config.timeline.total.originalBytes) : "—"}</strong></div>
+      <div><span>本地已验证文件</span><strong>{config ? verifiedManifestCount.toLocaleString() : "—"}</strong></div>
+      <div title="移入云端最近删除的累计容量；清空后才会彻底释放空间"><span>累计移入云端最近删除</span><strong>{config ? formatBytes(config.releaseHistory?.movedBytes || 0) : "—"}</strong></div>
+    </section>
 
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {message && <div className={styles.notice} role="status">{message}<button onClick={() => setMessage("")}>×</button></div>}
 
-    <section className={styles.content}>
-      <details className={`${styles.card} ${styles.diagnostics}`}><summary>运行诊断日志 · 查看地址与下载</summary><RecentDebugLogs /></details>
-      <article className={styles.card}>
-        <div className={styles.cardHead}><span>1</span><div><h2>选择备份位置</h2><p>选择一个上级文件夹，FrameBase 会自动创建 <code>FrameBase-iCloud\{username}</code>。</p></div></div>
-        <div className={styles.currentPath}><small>当前用户的备份目录</small><strong>{config?.backupDirectory || "尚未设置"}</strong></div>
-        <div className={styles.actions}><button className={styles.primary} onClick={() => void chooseFolder()} disabled={busy !== null}>{busy === "folder" ? "请稍候…" : "选择文件夹"}</button></div>
-        <form className={styles.manual} onSubmit={saveManualPath}><label>也可以输入上级文件夹的绝对路径<input value={manualPath} onChange={event => setManualPath(event.target.value)} placeholder="例如 D:\\照片备份" disabled={busy !== null} /></label><button disabled={busy !== null || !manualPath.trim()}>{busy === "path" ? "保存中…" : "保存路径"}</button></form>
-      </article>
-
-      <article className={`${styles.card} ${!readyForConnection ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>2</span><div><h2>配置 iCloud 连接</h2><p>账户和区域按 FrameBase 用户隔离。此阶段只验证现有会话，不下载或删除照片。</p></div></div>
-        <div className={styles.provider}><div><small>连接适配器</small><strong>icloudpd</strong></div><span className={config?.providerInfo?.available ? styles.available : styles.missing}>{config?.providerInfo?.available ? config.providerInfo.version || "可用" : "未找到工具"}</span></div>
-        <form className={styles.connectionForm} onSubmit={saveConnection}>
-          <label>Apple ID<input type="email" value={appleAccount} onChange={event => setAppleAccount(event.target.value)} placeholder="name@example.com" autoComplete="username" disabled={busy !== null || !readyForConnection} /></label>
-          <label>iCloud 服务区域<select value={icloudDomain} onChange={event => setIcloudDomain(event.target.value as "cn" | "com")} disabled={busy !== null || !readyForConnection}><option value="cn">中国大陆（icloud.com.cn）</option><option value="com">全球（icloud.com）</option></select></label>
-          <button className={styles.primary} disabled={busy !== null || !readyForConnection || !appleAccount.trim()}>{busy === "connection" ? "保存中…" : "保存连接配置"}</button>
-        </form>
-        <div className={styles.status}><i className={config?.connectionStatus === "connected" ? styles.statusOk : ""} /><strong>{config?.connectionStatus === "connected" ? "已连接" : config?.connectionStatus === "expired" ? "需要登录" : "尚未验证"}</strong><small>{config?.lastConnectionMessage || (readyForConnection ? "本地目录已经就绪" : "请先设置备份目录")}</small></div>
-        <DebugLogLink log={verificationLog} />
-        <div className={styles.actions}><button onClick={() => void verifyConnection()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available}>{busy === "verify" ? "正在检查…" : "验证已有会话与照片图库"}</button>{config?.connectionStatus !== "connected" && <button className={styles.primary} onClick={() => void startAuthentication()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available || Boolean(auth && activeAuthStates.has(auth.status))}>{busy === "auth" ? "正在启动…" : "开始 Apple 登录"}</button>}</div>
-        {auth && auth.status !== "idle" && <div className={styles.authBox}>
-          <div><strong>{auth.status === "connected" ? "登录成功" : auth.status === "failed" ? "登录失败" : "Apple 登录"}</strong><span>{auth.message}</span></div>
-          {auth.status === "waiting_password" && <form onSubmit={event => void submitAuthInput(event, "password")}><input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" placeholder="Apple ID 密码" aria-label="Apple ID 密码" /><button className={styles.primary} disabled={!password}>提交密码</button></form>}
-          {auth.status === "waiting_mfa" && <form onSubmit={event => void submitAuthInput(event, "mfa")}><input inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={mfaCode} onChange={event => setMfaCode(event.target.value.replace(/\D/g, "").slice(0, 6))} autoComplete="one-time-code" placeholder="六位验证码" aria-label="Apple 六位验证码" /><button className={styles.primary} disabled={mfaCode.length !== 6}>提交验证码</button></form>}
-          {activeAuthStates.has(auth.status) && <button className={styles.cancel} onClick={() => void cancelAuthentication()}>取消登录</button>}
-        </div>}
-      </article>
-
-      <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>3</span><div><h2>扫描、备份与验证</h2><p>连接后先只读统计，再由当前用户选择测试备份或完整增量备份。</p></div></div>
-        <div className={styles.capabilities}><div><strong>iCloud 照片与视频</strong><span>支持只读扫描和安全备份</span></div><div><strong>FrameBase 媒体库</strong><span>视频库与独立图片库按格式隔离管理</span></div></div>
-        <p className={styles.libraryHint}>同一备份目录可以分别加入 <a href="/photos">独立图片库</a> 和 <a href="/?library=video">视频库</a>；图片与视频索引会按格式自动分流。</p>
-        <ul><li>测试备份硬性限制为最近 3 个项目</li><li>保存原始尺寸，完成后验证本地文件存在且非空</li><li>不会传入云端删除、移动或自动清理参数</li></ul>
-        <div className={styles.actions}><button onClick={() => void scanRecent()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在只读扫描…" : "扫描最近 10 个项目"}</button><button className={styles.primary} onClick={() => void backupRecent()} disabled={busy !== null || config?.connectionStatus !== "connected" || !config?.scan?.sampleCount || Boolean(config?.backup?.completedAt)}>{busy === "backup" ? "正在安全备份与验证…" : config?.backup?.completedAt ? "测试备份已完成" : "安全备份最近 3 个"}</button></div>
-        {config?.scan?.scannedAt && <div className={styles.scanResult}>
-          <div><strong>最近一次只读扫描</strong><span>{config.scan.sampleCount} 个媒体项目 · {new Date(config.scan.scannedAt).toLocaleString("zh-CN")}</span></div>
-          {config.scan.samples.length > 0 && <ul>{config.scan.samples.map((item, index) => <li key={`${item.name}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong>{item.name}</strong></li>)}</ul>}
-        </div>}
-        {config?.backup?.completedAt && <div className={styles.scanResult}>
-          <div><strong>已验证的安全备份清单</strong><span>{config.backup.fileCount} 个项目 · {new Date(config.backup.completedAt).toLocaleString("zh-CN")}</span></div>
-          {config.backup.files.length > 0 && <ul>{config.backup.files.map((item, index) => <li key={`${item.relativePath}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong title={`${item.relativePath}${item.sha256 ? ` · SHA-256 ${item.sha256}` : ""}`}>{item.name} · {formatBytes(item.size)} · {item.sha256 ? "SHA-256 已记录" : "基础校验"}</strong></li>)}</ul>}
-        </div>}
-      </article>
-
-      <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>4</span><div><h2>按时间统计与选择</h2><p>只读获取拍摄时间、类型和原始资源大小，可按年、季度或月份选择增量备份范围。</p></div></div>
-        <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button><button onClick={() => void scanTimeline(true)} disabled={busy !== null || config?.connectionStatus !== "connected"} title="跳过补扫冷却期，完整检查反向分页；可能耗时较长，只读取元数据">深度补扫</button></div>
-        {timelineJob?.status === "running" && <div className={styles.timelineScanProgress}><div><strong>{timelineJob.message}</strong><span>{timelineJob.libraryCount ? `图库 ${timelineJob.libraryIndex}/${timelineJob.libraryCount}${timelineJob.library ? ` · ${timelineJob.library}` : ""}` : "正在发现图库"}</span></div><div className={styles.progressLine}><div className={`${styles.progress} ${timelineJob.libraryCount ? "" : styles.progressIndeterminate}`}><i style={timelineJob.libraryCount ? { width: `${Math.max(4, Math.round(timelineJob.libraryIndex / timelineJob.libraryCount * 100))}%` } : undefined} /></div><strong>{timelineJob.libraryCount ? `${Math.round(timelineJob.libraryIndex / timelineJob.libraryCount * 100)}%` : "连接中"}</strong></div><dl><div><dt>已读取项目</dt><dd>{timelineJob.itemCount.toLocaleString()}</dd></div><div><dt>已用时间</dt><dd>{Math.floor(timelineJob.elapsedSeconds / 60)}分 {timelineJob.elapsedSeconds % 60}秒</dd></div><div><dt>当前阶段</dt><dd>{timelineJob.phase === "discovering" ? "发现图库" : timelineJob.phase === "aggregating" ? "生成统计" : "读取元数据"}</dd></div></dl></div>}
-        <DebugLogLink log={timelineJob?.debugLog} />
-        {config?.timeline?.staleAt && <div className={styles.timelineWarning}><strong>云端内容已发生变化</strong><span>{config.timeline.staleReason || "当前数字已按本地删除结果更新，请重新统计以确认 iCloud 云端状态。"}</span></div>}
-        {config?.timeline?.scannedAt && <>
-          <div className={styles.timelineTabs}><button className={timelineGranularity === "years" ? styles.active : ""} onClick={() => { setTimelineGranularity("years"); setSelectedPeriods([]); }}>按年份</button><button className={timelineGranularity === "quarters" ? styles.active : ""} onClick={() => { setTimelineGranularity("quarters"); setSelectedPeriods([]); }}>每 3 个月</button><button className={timelineGranularity === "months" ? styles.active : ""} onClick={() => { setTimelineGranularity("months"); setSelectedPeriods([]); }}>按月份</button></div>
-          <div className={styles.timelineTable}><div className={styles.timelineRow}><span>选择</span><strong>时间</strong><span>备份状态</span><span>图片</span><span>视频</span><span>Live Photo</span><span>RAW</span><span>原始大小</span></div>{timelineBuckets.map(bucket => { const backupState = backupStateForBucket(bucket); return <label className={`${styles.timelineRow} ${bucket.localOnly ? styles.timelineLocalOnly : ""}`} key={bucket.key}><input type="checkbox" disabled={bucket.localOnly} checked={!bucket.localOnly && selectedPeriods.includes(bucket.key)} onChange={() => setSelectedPeriods(current => current.includes(bucket.key) ? current.filter(key => key !== bucket.key) : [...current, bucket.key])} /><div className={styles.timelinePeriod}><strong>{periodRange(bucket.key).label}</strong>{bucket.localOnly && <small>云端待补扫 · 本地已记录</small>}</div><span className={`${styles.backupBadge} ${styles[backupState.key]}`} title={backupState.detail}>{backupState.label}</span><span>{bucket.photoCount}</span><span>{bucket.videoCount}</span><span>{bucket.livePhotoCount}</span><span>{bucket.rawCount}</span><span>{formatBytes(bucket.originalBytes)}</span></label>; })}</div>
-          <div className={styles.timelineActions}><span>已选择 {selectedPeriods.length} 个时间范围</span><button className={styles.primary} onClick={() => void controlFullBackup("start", selectedPeriods.map(periodRange))} disabled={busy !== null || selectedPeriods.length === 0 || fullBackupActive}>备份所选范围</button></div>
-        </>}
-      </article>
-
-      <article className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>5</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；未变文件复用本地校验清单，仅对新增或变化文件重算 SHA-256。</p></div></div>
-        <div className={styles.safetyBanner}><strong>安全边界</strong><span>此任务不带任何云端删除参数。暂停或取消只会停止本机任务，已下载文件会保留。</span></div>
+    <section className={`${styles.content} ${!readyForConnection || !connectionConfigured ? styles.setup : ""}`}>
+      <div className={styles.workspace}>
+      <article data-icloud-step="4" className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
+        <div className={styles.cardHead}><div><h2><span className={styles.stepNumber}>4</span>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；未变文件复用本地校验清单，仅对新增或变化文件重算 SHA-256。</p></div></div>
+        <div className={styles.safetyBanner}><span>备份任务不会删除云端内容；暂停或取消后，已下载文件会保留。</span></div>
         <div className={styles.fullStatus}>
           <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? `正在${backupPhaseLabel}` : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>
-          {fullBackupActive && <small>每个时间范围依次进行：读取清单 → 下载 → 校验 → 保存记录。文件本地进度达到 100% 后仍需完成校验和保存。</small>}
           {config?.fullBackup?.rangeCount ? <div className={styles.rangeStatus}><strong>时间范围 {config.fullBackup.rangeIndex || 1}/{config.fullBackup.rangeCount}</strong><span>{config.fullBackup.currentRange || "正在准备"} · 已完成 {config.fullBackup.completedRanges.length} 个范围</span></div> : null}
           {config?.fullBackup && <div className={styles.liveMetrics}><div><span>实时同步速率</span><strong>{config.fullBackup.phase === "downloading" ? `${formatBytes(config.fullBackup.transferRateBps || 0)}/秒` : "—"}</strong></div><div><span>图片进度</span><strong>{syncedPhotoCount} / {plannedPhotoCount || "—"}</strong></div><div><span>视频进度</span><strong>{syncedVideoCount} / {plannedVideoCount || "—"}</strong></div><div><span>总同步进度</span><strong>{config.fullBackup.downloaded} / {config.fullBackup.planned || "—"}</strong></div></div>}
-          {config?.fullBackup && <dl><div><dt>计划</dt><dd>{config.fullBackup.planned}</dd></div><div><dt>已验证</dt><dd>{config.fullBackup.verified}</dd></div><div><dt>增量跳过</dt><dd>{config.fullBackup.skipped}</dd></div><div><dt>失败</dt><dd>{config.fullBackup.failed}</dd></div><div><dt>图片</dt><dd>{config.fullBackup.photoCount}</dd></div><div><dt>视频</dt><dd>{config.fullBackup.videoCount}</dd></div></dl>}
+          {config?.fullBackup && <details className={styles.taskDetails}><summary>详细统计与任务说明</summary><dl><div><dt>计划</dt><dd>{config.fullBackup.planned}</dd></div><div><dt>已验证</dt><dd>{config.fullBackup.verified}</dd></div><div><dt>增量跳过</dt><dd>{config.fullBackup.skipped}</dd></div><div><dt>失败</dt><dd>{config.fullBackup.failed}</dd></div><div><dt>图片</dt><dd>{config.fullBackup.photoCount}</dd></div><div><dt>视频</dt><dd>{config.fullBackup.videoCount}</dd></div></dl><p>每个时间范围依次进行：读取清单 → 下载 → 校验 → 保存记录。文件本地进度达到 100% 后仍需完成校验和保存。</p></details>}
           {stageIndeterminate ? <div className={styles.progressLine}><div className={`${styles.progress} ${styles.progressIndeterminate}`} aria-label={backupPhaseLabel}><i /></div><strong>{backupPhaseLabel}</strong></div> : progressTotal ? <div className={styles.progressLine}><div className={styles.progress} aria-label={`${progressLabel} ${progressPercent}%`}><i style={{ width: `${progressPercent}%` }} /></div><strong>{progressLabel} {progressPercent}%</strong></div> : null}
           {config?.fullBackup?.downloadedBytes ? <small>本地已存在或写入：{formatBytes(config.fullBackup.downloadedBytes)}</small> : null}
           {config?.fullBackup?.verifiedBytes ? <small>已通过完整性校验：{formatBytes(config.fullBackup.verifiedBytes)} · 清单共 {config.fullManifest?.fileCount || config.fullBackup.verified} 个文件</small> : null}
@@ -619,9 +571,25 @@ function IcloudCenter({ username }: { username: string }) {
         </div>
         <p>任务完成或最终失败时会弹窗并播放提示音；桌面提醒需允许浏览器通知。请保持此备份页签打开，浏览器静音或限制后台活动可能影响提醒。</p>
       </article>
-
-      <article className={`${styles.card} ${verifiedManifestCount === 0 ? styles.disabled : ""}`}>
-        <div className={styles.cardHead}><span>6</span><div><h2>iCloud 容量释放</h2><p>增量复核本地清单：未变化文件复用已通过的校验结果，新增或变化文件重新计算 SHA-256；每次重新匹配云端项目，实际删除前仍需精确复核。</p></div></div>
+      <article data-icloud-step="3" className={`${styles.card} ${config?.connectionStatus !== "connected" ? styles.disabled : ""}`}>
+        <div className={styles.cardHead}><div><h2><span className={styles.stepNumber}>3</span>按时间选择备份</h2><p>只读获取拍摄时间、类型和原始资源大小，可按年、季度或月份选择增量备份范围。</p></div></div>
+        <div className={styles.timelineHead}><div><strong>{config?.timeline?.total ? `${config.timeline.total.itemCount} 个云端项目 · ${formatBytes(config.timeline.total.originalBytes)}` : "尚未生成时间统计"}</strong><span>{config?.timeline?.scannedAt ? `更新于 ${new Date(config.timeline.scannedAt).toLocaleString("zh-CN")}` : "扫描不会下载或删除媒体文件"}</span></div><button onClick={() => void scanTimeline()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在读取云端元数据…" : config?.timeline?.scannedAt ? "刷新统计" : "开始只读统计"}</button><button onClick={() => void scanTimeline(true)} disabled={busy !== null || config?.connectionStatus !== "connected"} title="跳过补扫冷却期，完整检查反向分页；可能耗时较长，只读取元数据">深度补扫</button></div>
+        {timelineJob && timelineJob.status !== "idle" && timelineDisplay && <div className={styles.timelineScanProgress} role="status" aria-live="polite">
+          <div><strong>{timelineJob.message}</strong><span>{timelineJob.libraryCount ? `${timelineJob.status === "running" ? "正在处理图库" : "图库"} ${timelineJob.libraryIndex}/${timelineJob.libraryCount}${timelineJob.library ? ` · ${timelineJob.library}` : ""}` : "正在发现图库"}</span></div>
+          <div className={styles.progressLine}><div className={`${styles.progress} ${timelineDisplay.indeterminate ? styles.progressIndeterminate : ""}`} role="progressbar" aria-label="云端统计进度" aria-valuenow={timelineDisplay.value} aria-valuetext={timelineDisplay.label}><i style={timelineDisplay.indeterminate ? undefined : { width: `${timelineDisplay.value || 0}%` }} /></div><strong>{timelineDisplay.label}</strong></div>
+          {timelineJob.status === "running" && <small>{timelineJob.phase === "recovering" ? "反向补扫每秒更新本轮读取与新增确认数量；本轮读取包含已有项目，不代表总体完成比例。" : "云端未提供实时总进度；项目数在每轮读取结束后更新。"}</small>}
+          <dl><div><dt>已确认项目</dt><dd>{timelineJob.itemCount.toLocaleString()}</dd></div><div><dt>已用时间</dt><dd>{Math.floor(timelineJob.elapsedSeconds / 60)}分 {timelineJob.elapsedSeconds % 60}秒</dd></div><div><dt>当前阶段</dt><dd>{timelineDisplay.stage}</dd></div>{timelineJob.phase === "recovering" && <><div><dt>本轮补扫读取</dt><dd>{(timelineJob.recoveryScanned || 0).toLocaleString()} / {timelineJob.recoveryLimit?.toLocaleString() || "—"} 项</dd></div><div><dt>本轮新增确认</dt><dd>{(timelineJob.recoveryAdded || 0).toLocaleString()} 项</dd></div></>}</dl>
+        </div>}
+        <DebugLogLink log={timelineJob?.debugLog} />
+        {config?.timeline?.staleAt && <div className={styles.timelineWarning}><strong>云端内容已发生变化</strong><span>{config.timeline.staleReason || "当前数字已按本地删除结果更新，请重新统计以确认 iCloud 云端状态。"}</span></div>}
+        {config?.timeline?.scannedAt && <>
+          <div className={styles.timelineTabs}><button className={timelineGranularity === "years" ? styles.active : ""} onClick={() => { setTimelineGranularity("years"); setSelectedPeriods([]); }}>按年份</button><button className={timelineGranularity === "quarters" ? styles.active : ""} onClick={() => { setTimelineGranularity("quarters"); setSelectedPeriods([]); }}>每 3 个月</button><button className={timelineGranularity === "months" ? styles.active : ""} onClick={() => { setTimelineGranularity("months"); setSelectedPeriods([]); }}>按月份</button></div>
+          <div className={styles.timelineTable}><div className={styles.timelineRow}><span>选择</span><strong>时间</strong><span>备份状态</span><span>图片</span><span>视频</span><span>Live Photo</span><span>RAW</span><span>原始大小</span></div>{timelineBuckets.map(bucket => { const backupState = backupStateForBucket(bucket); return <label className={`${styles.timelineRow} ${bucket.localOnly ? styles.timelineLocalOnly : ""}`} key={bucket.key}><input type="checkbox" disabled={bucket.localOnly} checked={!bucket.localOnly && selectedPeriods.includes(bucket.key)} onChange={() => setSelectedPeriods(current => current.includes(bucket.key) ? current.filter(key => key !== bucket.key) : [...current, bucket.key])} /><div className={styles.timelinePeriod}><strong>{periodRange(bucket.key).label}</strong>{bucket.localOnly && <small>云端待补扫 · 本地已记录</small>}</div><span className={`${styles.backupBadge} ${styles[backupState.key]}`} title={backupState.detail}>{backupState.label}</span><span>{bucket.photoCount}</span><span>{bucket.videoCount}</span><span>{bucket.livePhotoCount}</span><span>{bucket.rawCount}</span><span>{formatBytes(bucket.originalBytes)}</span></label>; })}</div>
+          <div className={styles.timelineActions}><span>已选择 {selectedPeriods.length} 个时间范围</span><button className={styles.primary} onClick={() => void controlFullBackup("start", selectedPeriods.map(periodRange))} disabled={busy !== null || selectedPeriods.length === 0 || fullBackupActive}>备份所选范围</button></div>
+        </>}
+      </article>
+      <article data-icloud-step="5" className={`${styles.card} ${verifiedManifestCount === 0 ? styles.disabled : ""}`}>
+        <div className={styles.cardHead}><div><h2><span className={styles.stepNumber}>5</span>iCloud 容量释放</h2><p>增量复核本地清单：未变化文件复用已通过的校验结果，新增或变化文件重新计算 SHA-256；每次重新匹配云端项目，实际删除前仍需精确复核。</p></div></div>
         <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>仅允许删除已通过本地 SHA-256、云端资产 ID、文件名、拍摄时间、原始大小和图库六重核对的项目；删除入口位于图片库，每次都先 dry-run 并要求手动确认。</span></div>
         {config?.releaseHistory?.movedCount ? <><div className={styles.releaseSummary}><div><span>云端“最近删除”</span><strong>{config.releaseHistory.movedCount} 个 · {formatBytes(config.releaseHistory.movedBytes)}</strong></div><div><span>Windows 回收站</span><strong>{config.releaseHistory.recycledFileCount || 0} 个 · {formatBytes(config.releaseHistory.recycledBytes || 0)}</strong></div><p>两侧都保留恢复窗口；分别清空 iCloud“最近删除”和 Windows 回收站后，空间才会彻底释放。</p></div>{config.releaseHistory.events?.filter(event => event.recycleStatus === "failed" || event.recycleStatus === "partial").map(event => <div className={styles.recycleRetry} key={event.id}><span>有 {event.recycleResults.filter(result => result.status === "failed").length} 个本地文件未移入回收站。</span><button onClick={() => void retryLocalRecycle(event.id)} disabled={busy !== null}>重试本地回收</button></div>)}</> : null}
         {releaseProgress && releaseProgress.status !== "idle" && <div className={styles.fullStatus} role="status" aria-live="polite">
@@ -636,14 +604,64 @@ function IcloudCenter({ username }: { username: string }) {
           <p className={styles.releaseExplanation}>本地文件与云端项目按不同单位计数：{config.releasePlan.matchedAssetCount ?? config.releasePlan.assets.length} 个云端项目对应 {config.releasePlan.matchedLocalFileCount ?? 0} 个本地文件，其中 {config.releasePlan.livePhotoAssetCount ?? 0} 个实况照片包含配对视频；另有 {config.releasePlan.unmatchedLocalFileCount ?? 0} 个通过校验的本地文件未完成精确匹配，不开放云端删除。容量是本地已校验文件大小，不代表可释放的 iCloud 容量。</p>
           {Boolean(config.releasePlan.unmatchedLocalFileCount) && <details className={styles.unmatchedFiles}><summary>查看未匹配文件（{config.releasePlan.unmatchedLocalFileCount} 个）</summary><p>这些文件未满足云端项目的唯一匹配条件。可重新统计云端内容后生成计划；本地文件仍保留。</p><ul>{config.releasePlan.unmatchedFiles?.map(file => <li key={file.relativePath}>{file.relativePath} · {formatBytes(file.size)}</li>)}</ul>{config.releasePlan.unmatchedLocalFileCount > 100 && <small>显示前 100 个未匹配文件。</small>}</details>}
           {config.releasePlan.files.length > 0 && <ul className={styles.releaseFiles}>{config.releasePlan.files.slice(0, 5).map(item => <li key={item.relativePath}><span>{item.mediaType === "video" ? "视频" : "图片"}</span><strong>{item.name}</strong><small>{formatBytes(item.size)}</small></li>)}</ul>}
-        </div> : <p className={styles.releaseIntro}>{verifiedManifestCount === 0 ? "先在“完整增量备份”中选择至少一个时间范围并完成备份，系统才会建立可用于安全释放的 SHA-256 清单。" : !hasPreciseCloudCatalog ? `本地已有 ${verifiedManifestCount} 个 SHA-256 验证文件，不需要重新备份；但当前时间统计是旧格式，请先到上方第 4 区点击“刷新统计”，保存云端资产 ID。` : `本地持久化清单已有 ${verifiedManifestCount} 个 SHA-256 验证文件，可以直接生成释放计划；即使上方任务因服务重启显示“已暂停”，也不需要重新下载。`}</p>}
+        </div> : <p className={styles.releaseIntro}>{verifiedManifestCount === 0 ? "先在“完整增量备份”中选择至少一个时间范围并完成备份，系统才会建立可用于安全释放的 SHA-256 清单。" : !hasPreciseCloudCatalog ? `本地已有 ${verifiedManifestCount} 个 SHA-256 验证文件，不需要重新备份；但当前时间统计是旧格式，请先到“按时间选择备份”点击“刷新统计”，保存云端资产 ID。` : `本地持久化清单已有 ${verifiedManifestCount} 个 SHA-256 验证文件，可以直接生成释放计划；即使上方任务因服务重启显示“已暂停”，也不需要重新下载。`}</p>}
         <div className={styles.actions}><button onClick={() => void createReleasePlan()} disabled={busy !== null || verifiedManifestCount === 0 || !hasPreciseCloudCatalog}>{releaseStatus === "running" ? "正在复核 " + (releaseProgress?.checked || 0) + " / " + (releaseProgress?.total || verifiedManifestCount) + " 个本地文件…" : busy === "release" ? "正在处理…" : !hasPreciseCloudCatalog && verifiedManifestCount > 0 ? "请先刷新上方时间统计" : config?.releasePlan ? "重新生成释放计划" : "生成只读释放计划"}</button></div>
         {config?.releasePlan?.status === "ready" && <form className={styles.confirmRelease} onSubmit={confirmReleasePlan}><label className={styles.releaseAcknowledgement}><input type="checkbox" checked={releaseAcknowledged} onChange={event => setReleaseAcknowledged(event.target.checked)} /><span>我了解仅对上方精确匹配的项目开放删除；实际删除时仍需逐项选择并确认。此操作只启用删除入口，不会立即删除文件。</span></label><button className={styles.primary} disabled={busy !== null || !releaseAcknowledged || (config.releasePlan.matchedAssetCount ?? config.releasePlan.assets.length) === 0}>启用逐项删除</button></form>}
         {config?.releasePlan?.status === "confirmed" && <div className={styles.manualRelease}><strong>已开放逐项安全释放</strong><span>打开图片库，点击图片卡片的删除按钮，可选择仅本地、仅 iCloud 或两边都删除。云端选项只对通过精确匹配的图片开放。</span><a href="/photos">打开图片库</a></div>}
       </article>
+      </div>
+      <aside className={styles.sidebar} aria-label="备份设置与诊断">
+        <article className={`${styles.card} ${styles.settingsCard}`}>
+        <div className={styles.cardHead}><div><h2>连接与目录</h2><p>账户配置与备份目录按用户隔离。</p></div></div>
+        <div className={styles.connectionSection} data-icloud-step="2"><h3><span className={styles.stepNumber}>2</span>连接 iCloud</h3>
+        <dl className={styles.connectionSummary}><div><dt>Apple ID</dt><dd>{config?.appleAccount || "尚未配置"}</dd></div><div><dt>服务区域</dt><dd>{config?.icloudDomain === "com" ? "全球" : "中国大陆"}</dd></div></dl><details className={styles.inlineSettings} open={!connectionConfigured}><summary>编辑连接配置</summary><form className={styles.connectionForm} onSubmit={saveConnection}>
+          <label>Apple ID<input type="email" value={appleAccount} onChange={event => setAppleAccount(event.target.value)} placeholder="name@example.com" autoComplete="username" disabled={busy !== null || !readyForConnection} /></label>
+          <label>iCloud 服务区域<select value={icloudDomain} onChange={event => setIcloudDomain(event.target.value as "cn" | "com")} disabled={busy !== null || !readyForConnection}><option value="cn">中国大陆（icloud.com.cn）</option><option value="com">全球（icloud.com）</option></select></label>
+          <button className={styles.primary} disabled={busy !== null || !readyForConnection || !appleAccount.trim()}>{busy === "connection" ? "保存中…" : "保存连接配置"}</button>
+        </form></details>
+        <div className={styles.status}><i className={config?.connectionStatus === "connected" ? styles.statusOk : ""} /><strong>{config?.connectionStatus === "connected" ? "已连接" : config?.connectionStatus === "expired" ? "需要登录" : "尚未验证"}</strong><small>{config?.lastConnectionMessage || (readyForConnection ? "本地目录已经就绪" : "请先设置备份目录")}</small></div>
+        <DebugLogLink log={verificationLog} />
+        <div className={styles.actions}><button onClick={() => void verifyConnection()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available}>{busy === "verify" ? "正在检查…" : "验证已有会话与照片图库"}</button>{config?.connectionStatus !== "connected" && <button className={styles.primary} onClick={() => void startAuthentication()} disabled={busy !== null || !connectionConfigured || !config?.providerInfo?.available || Boolean(auth && activeAuthStates.has(auth.status))}>{busy === "auth" ? "正在启动…" : "开始 Apple 登录"}</button>}</div>
+        {auth && auth.status !== "idle" && <div className={styles.authBox}>
+          <div><strong>{auth.status === "connected" ? "登录成功" : auth.status === "failed" ? "登录失败" : "Apple 登录"}</strong><span>{auth.message}</span></div>
+          {auth.status === "waiting_password" && <form onSubmit={event => void submitAuthInput(event, "password")}><input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" placeholder="Apple ID 密码" aria-label="Apple ID 密码" /><button className={styles.primary} disabled={!password}>提交密码</button></form>}
+          {auth.status === "waiting_mfa" && <form onSubmit={event => void submitAuthInput(event, "mfa")}><input inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={mfaCode} onChange={event => setMfaCode(event.target.value.replace(/\D/g, "").slice(0, 6))} autoComplete="one-time-code" placeholder="六位验证码" aria-label="Apple 六位验证码" /><button className={styles.primary} disabled={mfaCode.length !== 6}>提交验证码</button></form>}
+          {activeAuthStates.has(auth.status) && <button className={styles.cancel} onClick={() => void cancelAuthentication()}>取消登录</button>}
+        </div>}
+        </div>
+        <div className={styles.directorySection} data-icloud-step="1">
+        <h3><span className={styles.stepNumber}>1</span>设置备份目录</h3>
+        <div className={styles.currentPath}><small>当前用户的备份目录</small><strong>{config?.backupDirectory || "尚未设置"}</strong></div>
+        <div className={styles.actions}><button onClick={() => void chooseFolder()} disabled={busy !== null}>{busy === "folder" ? "请稍候…" : readyForConnection ? "更换文件夹" : "选择文件夹"}</button></div>
+        <details className={styles.inlineSettings} open={!readyForConnection}><summary>手动输入路径</summary><form className={styles.manual} onSubmit={saveManualPath}><label>也可以输入上级文件夹的绝对路径<input value={manualPath} onChange={event => setManualPath(event.target.value)} placeholder="例如 D:\\照片备份" disabled={busy !== null} /></label><button disabled={busy !== null || !manualPath.trim()}>{busy === "path" ? "保存中…" : "保存路径"}</button></form></details>
+        </div>
+        <div className={styles.provider}><div><strong>icloudpd</strong></div><span className={config?.providerInfo?.available ? styles.available : styles.missing}>{config?.providerInfo?.available ? config.providerInfo.version || "可用" : "未找到工具"}</span></div>
+      </article>
+        <details className={`${styles.card} ${styles.testCard}`}><summary>测试扫描与备份<small>扫描最近 10 项 · 测试备份 3 项</small></summary><div className={styles.disclosureBody}>
+
+        <div className={styles.capabilities}><div><strong>iCloud 照片与视频</strong><span>支持只读扫描和安全备份</span></div><div><strong>FrameBase 媒体库</strong><span>视频库与独立图片库按格式隔离管理</span></div></div>
+        <p className={styles.libraryHint}>同一备份目录可以分别加入 <a href="/photos">独立图片库</a> 和 <a href="/?library=video">视频库</a>；图片与视频索引会按格式自动分流。</p>
+        <ul><li>测试备份硬性限制为最近 3 个项目</li><li>保存原始尺寸，完成后验证本地文件存在且非空</li><li>不会传入云端删除、移动或自动清理参数</li></ul>
+        <div className={styles.actions}><button onClick={() => void scanRecent()} disabled={busy !== null || config?.connectionStatus !== "connected"}>{busy === "scan" ? "正在只读扫描…" : "扫描最近 10 个项目"}</button><button className={styles.primary} onClick={() => void backupRecent()} disabled={busy !== null || config?.connectionStatus !== "connected" || !config?.scan?.sampleCount || Boolean(config?.backup?.completedAt)}>{busy === "backup" ? "正在安全备份与验证…" : config?.backup?.completedAt ? "测试备份已完成" : "安全备份最近 3 个"}</button></div>
+        {config?.scan?.scannedAt && <div className={styles.scanResult}>
+          <div><strong>最近一次只读扫描</strong><span>{config.scan.sampleCount} 个媒体项目 · {new Date(config.scan.scannedAt).toLocaleString("zh-CN")}</span></div>
+          {config.scan.samples.length > 0 && <ul>{config.scan.samples.map((item, index) => <li key={`${item.name}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong>{item.name}</strong></li>)}</ul>}
+        </div>}
+        {config?.backup?.completedAt && <div className={styles.scanResult}>
+          <div><strong>已验证的安全备份清单</strong><span>{config.backup.fileCount} 个项目 · {new Date(config.backup.completedAt).toLocaleString("zh-CN")}</span></div>
+          {config.backup.files.length > 0 && <ul>{config.backup.files.map((item, index) => <li key={`${item.relativePath}-${index}`}><span>{item.mediaType === "video" ? "视频" : "照片"}</span><strong title={`${item.relativePath}${item.sha256 ? ` · SHA-256 ${item.sha256}` : ""}`}>{item.name} · {formatBytes(item.size)} · {item.sha256 ? "SHA-256 已记录" : "基础校验"}</strong></li>)}</ul>}
+        </div>}
+</div></details>
+        <details className={`${styles.card} ${styles.diagnostics}`}><summary>运行诊断与日志<small>版本、启动信息与日志下载</small></summary><div className={styles.disclosureBody}>
+    <aside className={`${styles.runtimeVersion} ${runtimeVersionUnavailable ? styles.runtimeVersionOld : ""}`} aria-live="polite">{runtimeVersion ? <><strong>后端运行版本 <code>{runtimeVersion.commit !== "unknown" ? runtimeVersion.commit : `v${runtimeVersion.version}`}</code></strong><span>启动于 {new Date(runtimeVersion.startedAt).toLocaleString("zh-CN")} · PID {runtimeVersion.pid} · Node {runtimeVersion.node}</span></> : runtimeVersionUnavailable ? <><strong>未检测到运行版本</strong><span>当前后端可能仍是旧进程；新版后端启动后会在这里显示提交号和启动时间。</span></> : <><strong>正在读取后端运行版本…</strong><span>用于确认 iCloud 任务是否由最新进程执行。</span></>}</aside>
+          <RecentDebugLogs />
+        </div></details>
+        <div className={`${styles.card} ${styles.backupHelp}`}><h2>备份说明</h2><p>保存原始文件；备份任务不会删除云端内容。每个用户拥有独立的目录、认证会话、任务和清单，不保存 Apple 密码。</p><div className={styles.actions}><a href="/photos">打开图片库 →</a><a href="/?library=video">打开视频库 →</a></div></div>
+      </aside>
     </section>
 
     <footer><span>配置只保存在这台电脑，并按 FrameBase 用户隔离</span><a href="/?library=video">返回视频库 →</a></footer>
+    {tutorialOpen && <IcloudTutorial onClose={closeTutorial} />}
     {confirmation && <ConfirmationDialog key={confirmation.title} request={confirmation} onResolve={resolveConfirmation} />}
     {backupCompletion && !confirmation && <ConfirmationDialog key={backupCompletion.title} request={backupCompletion} onResolve={() => setBackupCompletion(null)} />}
   </main>;

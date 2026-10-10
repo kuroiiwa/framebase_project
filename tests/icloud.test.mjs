@@ -255,7 +255,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(page, /安全备份最近 3 个/);
   assert.match(page, /完整增量备份/);
   assert.match(page, /开始完整备份/);
-  assert.match(page, /按时间统计与选择/);
+  assert.match(page, /按时间选择备份/);
   assert.match(page, /每 3 个月/);
   assert.match(page, /备份所选范围/);
   assert.match(page, /备份状态/);
@@ -305,7 +305,7 @@ test("iCloud backup center remains a separate authenticated route", async () => 
   assert.match(server, /icloudProvider\.scanTimeline/);
   assert.match(server, /\/api\/icloud\/timeline/);
   assert.match(server, /\/api\/icloud\/timeline\/status/);
-  assert.match(page, /已读取项目/);
+  assert.match(page, /已确认项目/);
   assert.match(page, /已用时间/);
   assert.match(server, /\/api\/icloud\/backup\/full\/pause/);
   assert.match(server, /\/api\/icloud\/release\/plan/);
