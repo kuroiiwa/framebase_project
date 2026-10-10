@@ -12,7 +12,7 @@ function failWorker() {
   requests.clear();
 }
 
-export async function decodeHeicPreview(file: Blob, options: HeicPreviewOptions = {}) {
+export async function decodeHeicPreview(file: Blob, options: HeicPreviewOptions = {}, workerOnly = false) {
   if (!workerUnavailable && typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined") {
     try {
       if (!worker) {
@@ -38,5 +38,6 @@ export async function decodeHeicPreview(file: Blob, options: HeicPreviewOptions 
       if (!workerUnavailable) throw error; // Invalid images use the legacy codec, not a second WASM decode.
     }
   }
+  if (workerOnly) throw new Error("heic_worker_unavailable");
   return decodeHeicBlob(file, options);
 }

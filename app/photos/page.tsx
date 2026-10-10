@@ -7,6 +7,7 @@ import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
 import ThemeSelector from "../theme-selector";
 import PhotoActionsMenu from "./photo-actions-menu";
+import PhotoSelectionGrid from "./photo-selection-grid";
 import { findLivePhotoVideo } from "../../shared/live-photo.mjs";
 import AppleSessionControls from "../apple-session-controls";
 import styles from "./photos.module.css";
@@ -16,8 +17,9 @@ import { viewerAfterRemoval } from "./viewer-navigation";
 import { decodeHeicPreview } from "./heic-preview";
 import { createBrowserThumbnail } from "./thumbnail-preview";
 import type { HeicPreviewOptions } from "./heic-codec";
-import { schedulePreview, setPreviewScrolling, type PreviewQueue } from "./preview-queue";
+import { schedulePreview, setPreviewScrolling, deferBackgroundPreviews, type PreviewQueue } from "./preview-queue";
 import { findPhotoCloudAsset } from "./cloud-match";
+import { readAutoReleasePreference, saveAutoReleasePreference } from "./release-preferences";
 import { photoTimeKeys, timePeriodLabel, matchesPhotoTime, type TimeGranularity } from "./time-filter";
 import { CloudDeleteProgress, waitForCloudDelete, type CloudDeleteJob } from "../icloud-delete-progress";
 
@@ -49,6 +51,8 @@ type PhotoItem = {
 };
 type PreviewItem = Pick<PhotoItem, "id" | "modified" | "size" | "extension" | "handle">;
 type SourceFolder = { id: string; name: string; handle: DirectoryHandle; lastScan: number; photoCount: number; totalSize: number };
+type ScanCounts = { photos: number; files: number; folders: number; currentPath: string };
+type PhotoScan = ScanCounts & { sourceId: string; sourceName: string; phase: "permission" | "scanning" | "saving" | "completed" | "failed"; startedAt: number; finishedAt?: number; message?: string };
 type PhotoMarks = Record<string, { liked?: boolean; cleanup?: boolean }>;
 type Tab = "all" | "live" | "liked" | "cleanup";
 type Sort = "newest" | "oldest" | "largest" | "smallest" | "name";
@@ -183,17 +187,25 @@ function formatDate(timestamp: number) {
   return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(timestamp);
 }
 
-async function scanDirectory(source: SourceFolder, progress: (count: number) => void) {
+async function scanDirectory(source: SourceFolder, progress: (counts: ScanCounts) => void) {
   const marks = readMarks(source.id);
   const found: PhotoItem[] = [];
+  let files = 0; let folders = 0; let currentPath = source.name; let lastReport = 0;
+  const report = (force = false) => {
+    if (!force && Date.now() - lastReport < 150) return;
+    lastReport = Date.now();
+    progress({ photos: found.length, files, folders, currentPath });
+  };
   async function walk(directory: DirectoryHandle, parts: string[]) {
+    folders++; currentPath = [source.name, ...parts].join("/"); report();
     const entries: Array<FileHandle | DirectoryHandle> = [];
-    for await (const entry of directory.values()) entries.push(entry);
-    const files = entries.filter((entry): entry is FileHandle => entry.kind === "file");
-    const liveVideos = files.filter(entry => entry.name.split(".").pop()?.toLowerCase() === "mov");
-    for (const entry of files) {
+    for await (const entry of directory.values()) { entries.push(entry); if (entry.kind === "file") files++; report(); }
+    const directoryFiles = entries.filter((entry): entry is FileHandle => entry.kind === "file");
+    const liveVideos = directoryFiles.filter(entry => entry.name.split(".").pop()?.toLowerCase() === "mov");
+    for (const entry of directoryFiles) {
       const extension = entry.name.split(".").pop()?.toLowerCase() || "";
       if (!PHOTO_EXTENSIONS.has(extension)) continue;
+      currentPath = [source.name, ...parts, entry.name].join("/"); report();
       const file = await entry.getFile();
       const path = [...parts, entry.name].join("/");
       const companion = LIVE_PHOTO_IMAGE_EXTENSIONS.has(extension) ? findLivePhotoVideo(entry.name, liveVideos) : null;
@@ -211,12 +223,12 @@ async function scanDirectory(source: SourceFolder, progress: (count: number) => 
         liked: Boolean(marks[path]?.liked),
         cleanup: Boolean(marks[path]?.cleanup),
       });
-      if (found.length % 25 === 0) progress(found.length);
+      report();
     }
     for (const entry of entries) if (entry.kind === "directory") await walk(entry, [...parts, entry.name]);
   }
   await walk(source.handle, []);
-  progress(found.length);
+  report(true);
   return found;
 }
 
@@ -239,8 +251,8 @@ async function convertLegacyHeic(file: Blob) {
   return Array.isArray(converted) ? converted[0] : converted;
 }
 
-async function decodeModernHeic(file: Blob, options: HeicPreviewOptions = {}) {
-  return decodeHeicPreview(file, options);
+async function decodeModernHeic(file: Blob, options: HeicPreviewOptions = {}, workerOnly = false) {
+  return decodeHeicPreview(file, options, workerOnly);
 }
 
 async function createPreviewObjectUrl(item: PhotoItem, cancelled: () => boolean) {
@@ -266,15 +278,20 @@ async function createPreviewObjectUrl(item: PhotoItem, cancelled: () => boolean)
   return blob ? URL.createObjectURL(blob) : null;
 }
 
-async function createThumbnailBlob(item: PreviewItem) {
+async function createThumbnailBlob(item: PreviewItem, background = false) {
     let blob: Blob | null;
     if (HEIC_PREVIEW_EXTENSIONS.has(item.extension)) {
       const file = await item.handle.getFile();
-      try { return await decodeModernHeic(file, { width: THUMBNAIL_WIDTH, type: "image/webp", quality: THUMBNAIL_WEBP_QUALITY }); }
-      catch { blob = await convertLegacyHeic(file); }
+      try { return await decodeModernHeic(file, { width: THUMBNAIL_WIDTH, type: "image/webp", quality: THUMBNAIL_WEBP_QUALITY }, background); }
+      catch (error) {
+        // Speculative work must never move expensive decoding to the UI thread.
+        // Visible photos retain compatibility fallback after navigation.
+        if (background) throw error;
+        blob = await convertLegacyHeic(file);
+      }
     } else blob = await createPreviewBlob(item);
     if (!blob) return null;
-    return createBrowserThumbnail(blob, THUMBNAIL_WIDTH, THUMBNAIL_WEBP_QUALITY);
+    return createBrowserThumbnail(blob, THUMBNAIL_WIDTH, THUMBNAIL_WEBP_QUALITY, background);
 }
 
 async function loadThumbnail(item: PreviewItem, cancelled: () => boolean, background = false) {
@@ -291,7 +308,7 @@ async function loadThumbnail(item: PreviewItem, cancelled: () => boolean, backgr
       const persisted = HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? await readPersistentThumbnail(item) : null;
       if (persisted) return persisted;
       if (cancelled()) return null;
-      const created = await createThumbnailBlob(item);
+      const created = await createThumbnailBlob(item, background);
       if (created) writeThumbnailCache(item, created);
       return created;
     })();
@@ -347,7 +364,7 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
     }).catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [previewItem, nearViewport]);
-  return <button ref={buttonRef} className={styles.thumb} onClick={onOpen} aria-label={`查看 ${item.name}`}>
+  return <button ref={buttonRef} data-photo-thumb="" className={styles.thumb} onClick={onOpen} aria-label={`查看 ${item.name}`}>
     {url && !failed ? <img src={url} alt="" loading="lazy" decoding="async" onError={() => setFailed(true)} /> : <span><b>{item.extension.toUpperCase()}</b><small>{nearViewport ? previewStatus(item.extension, failed) : "接近时加载预览"}</small></span>}
   </button>;
 }
@@ -487,6 +504,7 @@ function PhotoLibrary({ username }: { username: string }) {
   useEffect(() => {
     let resumeTimer: ReturnType<typeof setTimeout>;
     const pausePreviews = () => {
+      deferBackgroundPreviews();
       setPreviewScrolling(true);
       clearTimeout(resumeTimer);
       resumeTimer = setTimeout(() => setPreviewScrolling(false), 180);
@@ -494,11 +512,20 @@ function PhotoLibrary({ username }: { username: string }) {
     window.addEventListener("scroll", pausePreviews, { passive: true, capture: true });
     window.addEventListener("wheel", pausePreviews, { passive: true });
     window.addEventListener("touchmove", pausePreviews, { passive: true });
+    const deferOnDrag = (event: PointerEvent) => { if (event.buttons) deferBackgroundPreviews(); };
+    window.addEventListener("pointerdown", deferBackgroundPreviews, { passive: true, capture: true });
+    window.addEventListener("pointerup", deferBackgroundPreviews, { passive: true, capture: true });
+    window.addEventListener("pointermove", deferOnDrag, { passive: true, capture: true });
+    window.addEventListener("keydown", deferBackgroundPreviews, { capture: true });
     return () => {
       clearTimeout(resumeTimer);
       window.removeEventListener("scroll", pausePreviews, true);
       window.removeEventListener("wheel", pausePreviews);
       window.removeEventListener("touchmove", pausePreviews);
+      window.removeEventListener("pointerdown", deferBackgroundPreviews, true);
+      window.removeEventListener("pointerup", deferBackgroundPreviews, true);
+      window.removeEventListener("pointermove", deferOnDrag, true);
+      window.removeEventListener("keydown", deferBackgroundPreviews, true);
       setPreviewScrolling(false);
     };
   }, []);
@@ -507,7 +534,15 @@ function PhotoLibrary({ username }: { username: string }) {
   const libraryStateRef = useRef({ photos, sources, filtered: [] as PhotoItem[] });
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [photoScan, setPhotoScan] = useState<PhotoScan | null>(null);
+  const [scanElapsed, setScanElapsed] = useState(0);
+  const scanActiveRef = useRef(false);
+  useEffect(() => {
+    if (!loading || !photoScan?.startedAt) return;
+    const startedAt = photoScan.startedAt;
+    const timer = setInterval(() => setScanElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [loading, photoScan?.startedAt]);
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [formatFilter, setFormatFilter] = useState("all");
@@ -530,6 +565,16 @@ function PhotoLibrary({ username }: { username: string }) {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bulkDeleteItems, setBulkDeleteItems] = useState<PhotoItem[]>([]);
+  const [autoReleaseAfterReview, setAutoReleaseAfterReview] = useState(false);
+  useEffect(() => {
+    queueMicrotask(() => setAutoReleaseAfterReview(readAutoReleasePreference(username)));
+  }, [username]);
+  function changeAutoReleasePreference(enabled: boolean) {
+    try {
+      saveAutoReleasePreference(username, enabled);
+      setAutoReleaseAfterReview(enabled);
+    } catch { setError("未能保存自动释放设置，请检查浏览器存储权限。"); }
+  }
   const [batchLocalProgress, setBatchLocalProgress] = useState<{ total: number; checked: number; recycled: number; message: string } | null>(null);
   const [deleteItem, setDeleteItem] = useState<PhotoItem | null>(null);
   const [deleteMode, setDeleteMode] = useState<"local" | "icloud" | "both">("local");
@@ -713,7 +758,7 @@ function PhotoLibrary({ username }: { username: string }) {
     setDeleteJob(started.deleteJob);
     const completed = await waitForCloudDelete<DeleteJob>(started.deleteJob.id, setDeleteJob, deletePollAbort.current?.signal);
     setDeleteElapsed(completed.elapsedSeconds || 0);
-    if (completed.result?.releaseResult?.status !== "matched") throw new Error(completed.message || "云端复核未通过，没有执行删除。");
+    if (completed.status !== "completed" || completed.result?.releaseResult?.status !== "matched") throw new Error(completed.message || "云端复核未通过，没有执行删除。");
     return completed.result;
   }
 
@@ -760,7 +805,14 @@ function PhotoLibrary({ username }: { username: string }) {
         const recycleLocal = deleteMode === "both";
         setDeleteElapsed(0); setDeleteJob({ status: "running", phase: "preview", name: '批量删除 ' + selection.assets.length + ' 个云端项目', startedAt: Date.now(), total: selection.assets.length, message: "正在批量核对精确云端资产…" });
         const preview = await previewCloudDeletion(keys, recycleLocal);
-        const confirmation = await requestDeleteConfirmation('将 ' + selection.assets.length + ' 个精确匹配云端项目移入“最近删除”。' + (recycleLocal ? '仅在云端删除成功或确认已在最近删除中后回收本地原片（最多 ' + (preview.localRecyclePlan?.fileCount || 0) + ' 个文件）。' : '本地原片保留。') + '跳过 ' + selection.skipped.length + ' 张未匹配图片。已在云端最近删除中的项目不会重复删除。确认继续？');
+        if (autoReleaseAfterReview) {
+          const results = preview.releaseResult?.results || [];
+          const verifiedKeys = new Set(results.filter(result => result.status === "matched").map(result => result.library + ":" + result.id));
+          if (selection.skipped.length || preview.releaseResult?.status !== "matched" || results.length !== keys.length || verifiedKeys.size !== keys.length || keys.some(key => !verifiedKeys.has(key))) {
+            throw new Error("本批存在未匹配图片或复核结果不完整，已停止自动删除。请查看结果，处理问题或取消自动删除后重新复核。");
+          }
+        }
+        const confirmation = autoReleaseAfterReview || await requestDeleteConfirmation('将 ' + selection.assets.length + ' 个精确匹配云端项目移入“最近删除”。' + (recycleLocal ? '仅在云端删除成功或确认已在最近删除中后回收本地原片（最多 ' + (preview.localRecyclePlan?.fileCount || 0) + ' 个文件）。' : '本地原片保留。') + '跳过 ' + selection.skipped.length + ' 张未匹配图片。已在云端最近删除中的项目不会重复删除。确认继续？');
         if (!confirmation) { setDeleteJob(null); return; }
         const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: keys, recycleLocal, confirmation, background: true }) });
         const started = await response.json() as { deleteJob?: DeleteJob; error?: string };
@@ -836,23 +888,34 @@ function PhotoLibrary({ username }: { username: string }) {
   }, []);
 
   const loadSource = useCallback(async (source: SourceFolder, knownSources?: SourceFolder[]) => {
-    setLoading(true); setProgress(0); setError(""); setNotice("");
+    if (scanActiveRef.current) return;
+    scanActiveRef.current = true;
+    const startedAt = Date.now();
+    setLoading(true); setScanElapsed(0); setError(""); setNotice("");
+    setPhotoScan({ sourceId: source.id, sourceName: source.name, phase: "permission", startedAt, photos: 0, files: 0, folders: 0, currentPath: source.name });
     try {
       const current = await source.handle.queryPermission?.({ mode: "read" });
       const permission = current === "granted" ? current : await source.handle.requestPermission?.({ mode: "read" });
       if (permission !== "granted") throw new Error(`需要“${source.name}”的读取权限。`);
-      const found = await scanDirectory(source, setProgress);
+      setPhotoScan(current => current ? { ...current, phase: "scanning" } : current);
+      const found = await scanDirectory(source, counts => setPhotoScan(current => current ? { ...current, ...counts } : current));
+      setPhotoScan(current => current ? { ...current, phase: "saving" } : current);
       const updatedSource = { ...source, lastScan: Date.now(), photoCount: found.length, totalSize: found.reduce((sum, item) => sum + item.size, 0) };
       const baseSources = knownSources || sources;
       const nextSources = baseSources.some(item => item.id === source.id)
         ? baseSources.map(item => item.id === source.id ? updatedSource : item)
         : [...baseSources, updatedSource];
+      await Promise.all([dbSet(SOURCES_KEY, nextSources), dbSet(`photo-library:${source.id}`, found)]);
       setSources(nextSources);
       setPhotos(currentPhotos => [...currentPhotos.filter(item => item.sourceId !== source.id), ...found]);
-      await Promise.all([dbSet(SOURCES_KEY, nextSources), dbSet(`photo-library:${source.id}`, found)]);
+      setPhotoScan(current => current ? { ...current, phase: "completed", finishedAt: Date.now(), currentPath: "" } : current);
       setNotice(`“${source.name}”已扫描，共 ${found.length} 张图片。`);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "图片扫描失败。"); }
-    finally { setLoading(false); }
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "图片扫描失败。";
+      setError(message);
+      setPhotoScan(current => current ? { ...current, phase: "failed", finishedAt: Date.now(), message } : current);
+    }
+    finally { scanActiveRef.current = false; setLoading(false); setScanElapsed(Math.floor((Date.now() - startedAt) / 1000)); }
   }, [sources]);
 
   async function chooseFolder() {
@@ -902,6 +965,7 @@ function PhotoLibrary({ username }: { username: string }) {
     for (const sourceId of new Set(selectedPhotos.map(item => item.sourceId))) persistMarks(updated, sourceId);
     libraryStateRef.current = { ...libraryStateRef.current, photos: updated };
     setPhotos(updated);
+    setSelectedIds([]);
     setNotice(`已将选中的 ${selectedPhotos.length} 张图片批量加入待整理，可在“待整理”分类查看。`);
   }
 
@@ -975,6 +1039,10 @@ function PhotoLibrary({ username }: { username: string }) {
     if (!selectedIds.includes(id) && selectedPhotos.length >= MAX_PHOTO_SELECTION) { setNotice(`每批最多选择 ${MAX_PHOTO_SELECTION} 张图片。`); return; }
     setSelectedIds(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
   }
+  function toggleSelectionMode() {
+    setSelectionMode(value => !value);
+    setSelectedIds([]);
+  }
   function selectAllFiltered() {
     if (loading || !filtered.length) return;
     setSelectionMode(true);
@@ -1007,13 +1075,20 @@ function PhotoLibrary({ username }: { username: string }) {
     </header>
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {notice && <div className={styles.notice} role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
-    <section className={styles.hero}><div><p>独立图片库</p><h1>图片浏览与整理</h1><span>图片来源、索引和标记与原视频库彻底隔离；移除来源不会删除文件。</span></div><button onClick={() => void chooseFolder()} disabled={loading || releasingAsset !== null}>{loading ? `正在扫描 ${progress} 张…` : "添加图片文件夹"}</button></section>
+    <section className={styles.hero}><div><p>独立图片库</p><h1>图片浏览与整理</h1><span>图片来源、索引和标记与原视频库彻底隔离；移除来源不会删除文件。</span></div><button onClick={() => void chooseFolder()} disabled={loading || releasingAsset !== null}>{loading ? `正在扫描 ${photoScan?.photos || 0} 张…` : "添加图片文件夹"}</button></section>
     {icloudBackupDirectory && <aside className={styles.icloudHint}><div><strong>iCloud 照片与视频备份目录</strong><span>{icloudBackupDirectory}</span></div><p>{releaseCatalog?.releaseHistory.movedCount ? `云端已移入“最近删除” ${releaseCatalog.releaseHistory.movedCount} 个项目，预计 ${formatBytes(releaseCatalog.releaseHistory.movedBytes)}；本地已回收 ${releaseCatalog.releaseHistory.recycledFileCount || 0} 个文件，共 ${formatBytes(releaseCatalog.releaseHistory.recycledBytes || 0)}。` : "可将这个目录同时添加到图片库和视频库；两套标记和索引互不影响。"}</p></aside>}
     {releaseCatalog?.timeline.staleAt && <aside className={styles.timelineStale}><strong>iCloud 统计需要确认</strong><span>{releaseCatalog.timeline.staleReason || "云端内容已变化，请到 iCloud 备份中心重新统计。"}</span><a href="/icloud">立即重新统计</a></aside>}
     <section className={styles.stats}><div><span>图片</span><strong>{photos.length}</strong></div><div><span>来源</span><strong>{sources.length}</strong></div><div><span>收藏</span><strong>{photos.filter(item => item.liked).length}</strong></div><div><span>占用</span><strong>{formatBytes(totalSize)}</strong></div></section>
     <section className={styles.sources} aria-label="图片来源">
-      {sources.length === 0 && ready ? <p>尚未添加图片文件夹。这里不会读取视频库已经选择的目录。</p> : sources.map(source => <article key={source.id}><button onClick={() => { setSourceFilter(source.id); setPage(1); }} className={sourceFilter === source.id ? styles.activeSource : ""}><strong>{source.name}</strong><span>{source.photoCount} 张 · {formatBytes(source.totalSize)}</span></button><button onClick={() => void loadSource(source)} disabled={loading || releasingAsset !== null}>重扫</button><button onClick={() => void removeSource(source)} disabled={loading || releasingAsset !== null}>移除</button></article>)}
+      {sources.length === 0 && ready ? <p>尚未添加图片文件夹。这里不会读取视频库已经选择的目录。</p> : sources.map(source => <article key={source.id}><button onClick={() => { setSourceFilter(source.id); setPage(1); }} className={sourceFilter === source.id ? styles.activeSource : ""}><strong>{source.name}</strong><span>{source.photoCount} 张 · {formatBytes(source.totalSize)}</span></button><button onClick={() => void loadSource(source)} disabled={loading || releasingAsset !== null} aria-busy={loading && photoScan?.sourceId === source.id}>{loading && photoScan?.sourceId === source.id ? `扫描中 · ${photoScan.photos} 张` : "重扫"}</button><button onClick={() => void removeSource(source)} disabled={loading || releasingAsset !== null}>移除</button></article>)}
     </section>
+    {photoScan && <section className={`${styles.scanProgress} ${photoScan.phase === "failed" ? styles.scanFailed : ""}`} role="status" aria-live="polite" aria-label="图片扫描进度">
+      <div><strong>{photoScan.phase === "permission" ? "正在检查文件夹读取权限" : photoScan.phase === "saving" ? "正在保存图片索引" : photoScan.phase === "completed" ? "扫描完成" : photoScan.phase === "failed" ? "扫描失败" : "正在扫描图片"} · {photoScan.sourceName}</strong><span>已发现 {photoScan.files} 个文件 · 已读取 {photoScan.photos} 张图片 · 已遍历 {photoScan.folders} 个文件夹 · 用时 {scanElapsed} 秒</span></div>
+      {!loading && <button className={actionStyles.button} aria-label="关闭扫描结果" onClick={() => setPhotoScan(null)}>关闭</button>}
+      {loading && <progress aria-label="图片扫描进行中" />}
+      {photoScan.currentPath && loading && <small title={photoScan.currentPath}>当前：{photoScan.currentPath}</small>}
+      {photoScan.phase === "failed" && <small>{photoScan.message}</small>}
+    </section>}
     <section className={styles.toolbar}>
       <div><button className={tab === "all" ? styles.active : ""} onClick={() => { setTab("all"); setPage(1); }}>全部</button><button className={tab === "live" ? styles.active : ""} onClick={() => { setTab("live"); setPage(1); }}>实况</button><button className={tab === "liked" ? styles.active : ""} onClick={() => { setTab("liked"); setPage(1); }}>收藏</button><button className={tab === "cleanup" ? styles.active : ""} onClick={() => { setTab("cleanup"); setPage(1); }}>待整理</button></div>
       <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
@@ -1032,14 +1107,14 @@ function PhotoLibrary({ username }: { username: string }) {
       <p>优先使用备份目录中的年、月；其他图片使用文件修改时间。范围数量为整个图片库的图片数。</p>
     </details>
     <section className={styles.selectionToolbar} aria-label="批量选择图片">
-      <button className={actionStyles.button} onClick={() => { setSelectionMode(value => !value); setSelectedIds([]); }}>{selectionMode ? "退出多选" : "批量选择"}</button>
+      <button className={actionStyles.button} onClick={toggleSelectionMode}>{selectionMode ? "退出多选" : "批量选择"}</button>
       <button className={`${actionStyles.button} ${styles.quickSelectAll}`} disabled={loading || !filtered.length} title={`选择当前筛选结果，包含其他分页，每批最多 ${MAX_PHOTO_SELECTION} 张`} onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? `全选前 ${MAX_PHOTO_SELECTION} 张` : "快捷全选"}</button>
-      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择</span></div><div className={styles.selectionActions}><button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={`${actionStyles.button} ${styles.bulkCleanup}`} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>批量加入待整理{selectedPhotos.length ? ` · ${selectedPhotos.length} 张` : ""}</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除选中的 {selectedPhotos.length} 张</button></div></>}
+      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择 · 拖动框选</span></div><div className={styles.selectionActions}><button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={`${actionStyles.button} ${styles.bulkCleanup}`} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>批量加入待整理{selectedPhotos.length ? ` · ${selectedPhotos.length} 张` : ""}</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除选中的 {selectedPhotos.length} 张</button></div></>}
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div ref={paginationRef}><button disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></div>}</section>
-    {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></nav>}
-    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}{item.cleanup && <span className={styles.cleanupBadge} title="已加入待整理">✓ 待整理</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
-    <footer><span>图片来源来自你授权的本地文件夹；删除前需单独确认</span><a href="/?library=video">返回视频库 →</a></footer>
+    {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button><button className={`${actionStyles.button} ${styles.floatingSelect}`} aria-pressed={selectionMode} onClick={toggleSelectionMode}>{selectionMode ? "退出多选" : "进入多选"}</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></nav>}
+    {visible.length ? <PhotoSelectionGrid enabled={selectionMode} selectedIds={selectedIds} limit={MAX_PHOTO_SELECTION} onChange={setSelectedIds} className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id} data-photo-id={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}{item.cleanup && <span className={styles.cleanupBadge} title="已加入待整理">✓ 待整理</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</PhotoSelectionGrid> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    <footer><span>图片来源来自你授权的本地文件夹；批量云端释放可选择复核通过后自动执行</span><a href="/?library=video">返回视频库 →</a></footer>
     {!dialogItems.length && deleteJob?.status === "failed" && <aside className={styles.deleteProgress}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></aside>}
     {dialogItems.length === 0 && deleteJob && deleteJob.status !== "idle" && <aside className={styles.deleteToast}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} />{deleteJob.status !== "running" && <button onClick={() => setDeleteJob(null)} aria-label="关闭删除结果">关闭</button>}</aside>}
     {dialogItems.length > 0 && <dialog ref={deleteDialogRef} className={`${styles.deleteDialog} ${deleteMinimized ? styles.deleteMini : ""}`} aria-modal={!deleteMinimized} aria-labelledby="delete-photo-title" onCancel={event => { event.preventDefault(); if (deleteConfirmation) resolveDeleteConfirmation(false); else if (releasingAsset !== null) minimizeDeleteWindow(); else closeDeleteDialog(); }}>
@@ -1053,6 +1128,11 @@ function PhotoLibrary({ username }: { username: string }) {
         <label htmlFor="photo-delete-icloud" aria-label="仅删除 iCloud"><input id="photo-delete-icloud" type="radio" name="photo-delete-mode" checked={deleteMode === "icloud"} disabled={!cloudDeleteAvailable} onChange={() => setDeleteMode("icloud")} /><span><strong>仅删除 iCloud</strong><small>移入 iCloud“最近删除”，保留本地原片。</small></span></label>
         <label htmlFor="photo-delete-both" aria-label="两边都删除"><input id="photo-delete-both" type="radio" name="photo-delete-mode" checked={deleteMode === "both"} disabled={!cloudDeleteAvailable} onChange={() => setDeleteMode("both")} /><span><strong>两边都删除</strong><small>云端成功移入“最近删除”后，再将本地原片移入回收站。</small></span></label>
       </fieldset>
+      {bulkDeleteItems.length > 0 && deleteMode !== "local" && <fieldset disabled={releasingAsset !== null || appleSessionBusy}>
+        <legend>复核后的操作</legend>
+        <label htmlFor="photo-auto-release"><input id="photo-auto-release" type="checkbox" checked={autoReleaseAfterReview} onChange={event => changeAutoReleasePreference(event.target.checked)} /><span><strong>复核通过后自动删除</strong><small>勾选后，点击开始即可在全部复核通过后按所选范围执行，无需再次人工确认；报错或存在未匹配图片时停止。此选项仅为当前账户保存。</small></span></label>
+        {!autoReleaseAfterReview && <p>未勾选：复核完成后，仍需点击“确认删除”。</p>}
+      </fieldset>}
       {releaseCatalogLoading ? <p>正在刷新云端释放计划…</p> : releaseCatalogError ? <p>{releaseCatalogError}</p> : !dialogCloudSelection.assets.length && <p>{releaseCatalog?.releasePlan?.status === "confirmed" ? "释放计划已确认，但此图片未能唯一匹配计划中的云端项目。请确认图片来源和本地文件大小，或重新生成释放计划。" : "请到 iCloud 备份中心复核并确认释放计划后，再操作 iCloud。"}</p>}
       <div className={styles.sessionControls}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></div>
       </div>}
@@ -1061,7 +1141,7 @@ function PhotoLibrary({ username }: { username: string }) {
       {deleteJob && deleteJob.status !== "idle" && <section className={styles.deleteProgress}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} /></section>}
       {error && <p className={styles.taskError} role="alert">{error}</p>}
       {deleteFinished && notice && <p className={styles.taskResult} role="status">{notice}</p>}
-      </div><div className={styles.deleteActions}>{deleteConfirmation ? <><button ref={confirmationCancelRef} className={actionStyles.button} onClick={() => resolveDeleteConfirmation(false)}>暂不删除</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} onClick={() => resolveDeleteConfirmation(true)}>确认删除</button></> : deleteFinished ? <button className={actionStyles.button} onClick={closeDeleteDialog}>关闭</button> : <><button className={actionStyles.button} disabled={releasingAsset !== null || appleSessionBusy} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode !== "local" && (!cloudDeleteAvailable))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : "继续"}</button></>}</div>
+      </div><div className={styles.deleteActions}>{deleteConfirmation ? <><button ref={confirmationCancelRef} className={actionStyles.button} onClick={() => resolveDeleteConfirmation(false)}>暂不删除</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} onClick={() => resolveDeleteConfirmation(true)}>确认删除</button></> : deleteFinished ? <button className={actionStyles.button} onClick={closeDeleteDialog}>关闭</button> : <><button className={actionStyles.button} disabled={releasingAsset !== null || appleSessionBusy} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode !== "local" && (!cloudDeleteAvailable))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : bulkDeleteItems.length > 0 && deleteMode !== "local" ? autoReleaseAfterReview ? "开始复核并自动删除" : "开始复核" : "继续"}</button></>}</div>
     </dialog>}
     {viewer && <PhotoViewer key={`${viewer.id}:${viewer.liveVideo?.path || ""}`} item={viewer} taskNotice={releasingAsset !== null && dialogItems.some(item => item.id === viewer.id) ? deleteMode === "icloud" ? "当前照片在云端删除任务中，本地图片仍可继续浏览。" : "当前照片在删除任务范围内；本地回收成功后将自动切换到其他照片。" : ""} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onFavorite={() => toggleMark(viewer.id, "liked")} onCleanup={() => toggleMark(viewer.id, "cleanup")} onDelete={mode => openDeleteDialog([viewer], mode)} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
   </main>;

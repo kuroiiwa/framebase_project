@@ -9,7 +9,9 @@ export function findPhotoCloudAsset<T extends MatchedAsset>(item: LocalPhoto, pl
   if (plan?.status !== "confirmed") return null;
   const photoPath = normalize(item.path);
   const sourceName = normalize(item.sourceName);
-  const candidates = plan.assets.filter(asset => asset.mediaType === "photo"
+  // iCloud can classify animated GIFs as videos even though the local library
+  // treats them as photos. Keep the original cloud type for deletion checks.
+  const candidates = plan.assets.filter(asset => (asset.mediaType === "photo" || (asset.mediaType === "video" && asset.name.toLowerCase().endsWith(".gif")))
     && asset.name.toLowerCase() === item.name.toLowerCase()
     && asset.mainBytes === item.size
     && asset.localFiles.some(path => {

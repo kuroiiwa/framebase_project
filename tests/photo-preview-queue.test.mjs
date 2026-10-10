@@ -8,9 +8,14 @@ const source = readFileSync(new URL('../app/photos/preview-queue.ts', import.met
 const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
 function fixture(fallback = false) {
   const callbacks = []; const exports = {};
-  vm.runInNewContext(compiled, { exports, requestIdleCallback: fallback ? undefined : callback => callbacks.push(callback), setTimeout: callback => callbacks.push(callback) });
+  const idleOptions = []; let now = 0;
+  vm.runInNewContext(compiled, {
+    exports, Date: { now: () => now },
+    requestIdleCallback: fallback ? undefined : (callback, options) => { idleOptions.push(options); callbacks.push(deadline => callback(deadline || { didTimeout: false, timeRemaining: () => 50 })); },
+    setTimeout: (callback, delay) => { callbacks.push(() => { now += delay; callback(); }); return callbacks.length; },
+  });
   const queue = { pending: [], active: 0, limit: 1 };
-  return { ...exports, queue, idle: async () => { callbacks.shift()?.(); await new Promise(resolve => setImmediate(resolve)); }, callbacks };
+  return { ...exports, queue, idle: async (index = 0, deadline) => { callbacks.splice(index, 1)[0]?.(deadline); await new Promise(resolve => setImmediate(resolve)); }, callbacks, idleOptions, now: () => now, advance: ms => { now += ms; } };
 }
 
 for (const fallback of [false, true]) {
@@ -96,4 +101,50 @@ test('stale next-page prefetch never decodes after page changes', async () => {
   const f = fixture(); let cancelled = false; let started = false;
   const background = f.schedulePreview(f.queue, async () => { started = true; }, () => cancelled, false, true);
   cancelled = true; await f.idle(); assert.equal(await background, null); assert.equal(started, false);
+});
+
+for (const fallback of [false, true]) {
+  test(`prefetch rests after each decode without delaying visible work (${fallback ? 'timer' : 'idle callback'})`, async () => {
+    const f = fixture(fallback); const starts = [];
+    const first = f.schedulePreview(f.queue, async () => { starts.push(f.now()); }, () => false, false, true);
+    await f.idle(); await first;
+    const second = f.schedulePreview(f.queue, async () => { starts.push(f.now()); }, () => false, false, true);
+    const visible = f.schedulePreview(f.queue, async () => 'visible', () => false);
+    await f.idle(1); assert.equal(await visible, 'visible');
+    assert.equal(starts.length, 1);
+    await f.idle(); assert.equal(starts.length, 1);
+    await f.idle(); await second;
+    assert.ok(starts[1] - starts[0] >= 250);
+  });
+}
+
+test('slow background decoding gets a longer break and never runs concurrently across codecs', async () => {
+  const f = fixture(); const other = { pending: [], active: 0, limit: 2 }; let complete; let nextStarted = false;
+  const first = f.schedulePreview(f.queue, () => new Promise(resolve => { complete = resolve; }), () => false, false, true);
+  await f.idle();
+  const next = f.schedulePreview(other, async () => { nextStarted = true; }, () => false, false, true);
+  assert.equal(f.callbacks.length, 0); assert.equal(nextStarted, false);
+  f.advance(800); complete(); await first; await new Promise(resolve => setImmediate(resolve));
+  await f.idle(); assert.equal(f.now(), 1600); assert.equal(nextStarted, false);
+  await f.idle(); await next; assert.equal(nextStarted, true);
+});
+
+test('input defers pending prefetch and repeated input extends the quiet period', async () => {
+  const f = fixture(); let startedAt;
+  const pending = f.schedulePreview(f.queue, async () => { startedAt = f.now(); }, () => false, false, true);
+  f.deferBackgroundPreviews(); await f.idle(); assert.equal(startedAt, undefined);
+  f.advance(200); f.deferBackgroundPreviews();
+  await f.idle(); assert.equal(startedAt, undefined);
+  await f.idle(); await pending;
+  assert.ok(startedAt >= 800);
+});
+
+test('prefetch requires real idle budget without a forced timeout', async () => {
+  const f = fixture(); let started = false;
+  const pending = f.schedulePreview(f.queue, async () => { started = true; }, () => false, false, true);
+  assert.equal(f.idleOptions[0], undefined);
+  await f.idle(0, { didTimeout: true, timeRemaining: () => 50 }); assert.equal(started, false);
+  await f.idle();
+  await f.idle(0, { didTimeout: false, timeRemaining: () => 2 }); assert.equal(started, false);
+  await f.idle(); await f.idle(); await pending; assert.equal(started, true);
 });

@@ -64,7 +64,7 @@ test('all HEIC image handles are released on decoding failure', async () => {
   assert.equal(state.encodes.length, 0);
 });
 
-function clientFixture({ unavailable = false } = {}) {
+function clientFixture({ unavailable = false, supported = true } = {}) {
   const state = { workers: [], fallback: 0, timers: new Set() };
   class Worker {
     constructor() { if (unavailable) throw new Error('blocked'); state.workers.push(this); this.sent = []; }
@@ -72,7 +72,7 @@ function clientFixture({ unavailable = false } = {}) {
     terminate() { this.terminated = true; }
   }
   const client = load('heic-preview', {
-    Worker, OffscreenCanvas: class {},
+    Worker: supported ? Worker : undefined, OffscreenCanvas: class {},
     setTimeout: callback => { state.timers.add(callback); return callback; },
     clearTimeout: timer => state.timers.delete(timer),
     require: () => ({ decodeHeicBlob: async () => { state.fallback++; return new Blob(['fallback']); } }),
@@ -116,4 +116,21 @@ test('blocked worker creation uses the main-thread compatibility path', async ()
   await client.decodeHeicPreview(new Blob(['a']));
   await client.decodeHeicPreview(new Blob(['b']));
   assert.equal(state.fallback, 2);
+});
+
+test('background HEIC decoding stays in workers and never uses the UI codec', async () => {
+  const { client, state } = clientFixture();
+  const pending = client.decodeHeicPreview(new Blob(['heic']), { width: 384 }, true);
+  const result = new Blob(['ready']);
+  state.workers[0].onmessage({ data: { id: 1, blob: result } });
+  assert.equal(await pending, result);
+  const background = client.decodeHeicPreview(new Blob(['b']), {}, true);
+  const failure = assert.rejects(background, /heic_worker_unavailable/);
+  state.workers[0].onerror(); await failure;
+  assert.equal(state.fallback, 0); assert.equal(state.timers.size, 0);
+  await client.decodeHeicPreview(new Blob(['visible'])); assert.equal(state.fallback, 1);
+  for (const f of [clientFixture({ unavailable: true }), clientFixture({ supported: false })]) {
+    await assert.rejects(f.client.decodeHeicPreview(new Blob(['heic']), {}, true), /heic_worker_unavailable/);
+    assert.equal(f.state.fallback, 0);
+  }
 });

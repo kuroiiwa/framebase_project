@@ -11,7 +11,7 @@ function load(name, globals) {
   vm.runInNewContext(compiled, { exports, Blob, URL, Error, ...globals });
   return exports;
 }
-function fixture(blocked = false) {
+function fixture(blocked = false, supported = true) {
   const state = { workers: [], fallback: 0, timers: new Set() };
   class Worker {
     constructor() { if (blocked) throw new Error('blocked'); state.workers.push(this); this.sent = []; }
@@ -19,7 +19,7 @@ function fixture(blocked = false) {
     terminate() { this.terminated = true; }
   }
   const client = load('thumbnail-preview', {
-    Worker, OffscreenCanvas: class {},
+    Worker: supported ? Worker : undefined, OffscreenCanvas: class {},
     setTimeout: callback => { state.timers.add(callback); return callback; },
     clearTimeout: timer => state.timers.delete(timer),
     require: () => ({ encodeThumbnail: async () => { state.fallback++; return new Blob(['fallback']); } }),
@@ -51,6 +51,24 @@ test('worker failure releases pending tasks and retains compatibility fallback',
   assert.equal(state.fallback, 2); assert.equal(state.timers.size, 0); assert.equal(state.workers[0].terminated, true);
   const blocked = fixture(true);
   await blocked.client.createBrowserThumbnail(new Blob(['a']), 384, .72); assert.equal(blocked.state.fallback, 1);
+});
+
+test('background thumbnails use the worker and never fall back on worker failure', async () => {
+  const { client, state } = fixture();
+  const pending = client.createBrowserThumbnail(new Blob(['a']), 384, .72, true);
+  const result = new Blob(['ready']);
+  state.workers[0].onmessage({ data: { id: 1, blob: result } });
+  assert.equal(await pending, result);
+  const background = client.createBrowserThumbnail(new Blob(['b']), 384, .72, true);
+  const failure = assert.rejects(background, /thumbnail_worker_unavailable/);
+  state.workers[0].onerror(); await failure;
+  assert.equal(state.fallback, 0); assert.equal(state.timers.size, 0);
+  await client.createBrowserThumbnail(new Blob(['visible']), 384, .72);
+  assert.equal(state.fallback, 1);
+  for (const f of [fixture(true), fixture(false, false)]) {
+    await assert.rejects(f.client.createBrowserThumbnail(new Blob(['a']), 384, .72, true), /thumbnail_worker_unavailable/);
+    assert.equal(f.state.fallback, 0);
+  }
 });
 for (const failure of [false, true]) {
   test(`thumbnail encoding frees bitmap and canvas on ${failure ? 'failure' : 'success'}`, async () => {

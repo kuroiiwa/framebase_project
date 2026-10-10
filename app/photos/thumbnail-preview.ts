@@ -13,7 +13,7 @@ function failWorker() {
   requests.clear();
 }
 
-export async function createBrowserThumbnail(blob: Blob, width: number, quality: number) {
+export async function createBrowserThumbnail(blob: Blob, width: number, quality: number, workerOnly = false) {
   if (!unavailable && typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined") {
     try {
       if (!worker) {
@@ -37,5 +37,6 @@ export async function createBrowserThumbnail(blob: Blob, width: number, quality:
       failWorker();
     }
   }
+  if (workerOnly) throw new Error("thumbnail_worker_unavailable");
   return encodeThumbnail(blob, width, quality);
 }

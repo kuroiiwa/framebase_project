@@ -17,6 +17,29 @@ test("confirmed cloud photos match backup paths independently of local download 
   assert.equal(findPhotoCloudAsset(item, { ...plan, assets: [asset, { ...asset, id: "ambiguous" }] }), null);
 });
 
+test("cloud video GIFs match verified photos without weakening release guards", async () => {
+  const asset = { id: "gif-1", library: "PrimarySync", name: "IMG_2342.GIF", mediaType: "video", mainBytes: 2341404, localFiles: ["2023/11/21/IMG_2342.GIF"] };
+  const plan = { status: "confirmed", assets: [asset] };
+  const item = { name: asset.name, path: asset.localFiles[0], size: asset.mainBytes, sourceName: "zhang" };
+  assert.equal(findPhotoCloudAsset(item, plan), asset);
+  assert.equal(findPhotoCloudAsset({ ...item, name: "img_2342.gif", sourceName: "11", path: "21/img_2342.gif" }, plan), asset);
+  assert.equal(asset.mediaType, "video");
+  assert.equal(findPhotoCloudAsset({ ...item, size: item.size - 1 }, plan), null);
+  assert.equal(findPhotoCloudAsset({ ...item, path: "2023/11/22/IMG_2342.GIF" }, plan), null);
+  assert.equal(findPhotoCloudAsset({ ...item, name: "OTHER.GIF" }, plan), null);
+  assert.equal(findPhotoCloudAsset(item, { ...plan, status: "ready" }), null);
+  assert.equal(findPhotoCloudAsset(item, { ...plan, assets: [asset, { ...asset, id: "duplicate" }] }), null);
+  assert.equal(findPhotoCloudAsset(item, { ...plan, assets: [asset, { ...asset, id: "photo-copy", mediaType: "photo" }] }), null);
+  for (const extension of ["MOV", "MP4", "M4V"]) {
+    const video = { ...asset, name: `IMG_2342.${extension}`, localFiles: [`2023/11/21/IMG_2342.${extension}`] };
+    assert.equal(findPhotoCloudAsset({ ...item, name: video.name, path: video.localFiles[0] }, { ...plan, assets: [video] }), null);
+  }
+  const { collectCloudSelection } = await import("../app/photos/bulk-selection.ts");
+  const selection = collectCloudSelection([item], photo => findPhotoCloudAsset(photo, plan));
+  assert.deepEqual(selection.assets, [asset]);
+  assert.equal(selection.skipped.length, 0);
+});
+
 test("photo library remains isolated from the existing video library", async () => {
   const [photos, photoStyles, icloud, videos, accountGate, globalStyles, heicCodec, thumbnailCodec, previewQueue] = await Promise.all([
     readFile(new URL("../app/photos/page.tsx", import.meta.url), "utf8"),

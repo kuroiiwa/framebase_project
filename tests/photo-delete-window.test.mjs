@@ -11,9 +11,11 @@ const source = readFileSync(new URL('../app/photos/page.tsx', import.meta.url), 
 const ast = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 let workflow;
 let recyclingWorkflow;
+let previewWorkflow;
 function find(node) {
   if (ts.isFunctionDeclaration(node) && node.name?.text === 'deleteBatchPhotos') workflow = node.getText(ast);
   if (ts.isFunctionDeclaration(node) && node.name?.text === 'applyBatchRecycling') recyclingWorkflow = node.getText(ast);
+  if (ts.isFunctionDeclaration(node) && node.name?.text === 'previewCloudDeletion') previewWorkflow = node.getText(ast);
   ts.forEachChild(node, find);
 }
 find(ast);
@@ -28,7 +30,7 @@ function fixture(mode = 'icloud') {
   let ready;
   const waiting = new Promise(resolve => { ready = resolve; });
   const context = {
-    MAX_PHOTO_SELECTION, collectCloudSelection, deleteMode: mode, releasingAsset: null, appleSessionBusy: false,
+    MAX_PHOTO_SELECTION, collectCloudSelection, deleteMode: mode, releasingAsset: null, appleSessionBusy: false, autoReleaseAfterReview: false,
     releaseCatalog: { releasePlan: { id: 'fake-plan' } }, deletePollAbort: { current: null },
     cloudAssetFor: item => ({ id: item.id, library: 'test', localFiles: [] }),
     setReleasingAsset: value => { state.releasingAsset = value; context.releasingAsset = value; },
@@ -80,6 +82,7 @@ test('accepted confirmation submits one background task and retains the result w
 
 test('canceling local confirmation never hashes or recycles files', async () => {
   const f = fixture('local');
+  f.context.autoReleaseAfterReview = true;
   const pending = f.run(photos);
   await f.waiting;
   f.confirm(false);
@@ -87,6 +90,64 @@ test('canceling local confirmation never hashes or recycles files', async () => 
   assert.equal(f.calls.length, 0);
   assert.equal(f.state.error, '');
   assert.equal(f.state.releasingAsset, null);
+});
+
+test('failed and partial background reviews cannot authorize deletion even with a matched summary', async () => {
+  const compiledPreview = ts.transpileModule(previewWorkflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const status of ['failed', 'partial', 'completed']) {
+    const result = { releaseResult: { status: 'matched', results: [{ id: 'one', library: 'test', status: 'matched' }] } };
+    const preview = vm.runInNewContext(`${compiledPreview}\npreviewCloudDeletion`, {
+      releaseCatalog: { releasePlan: { id: 'plan' } }, deletePollAbort: { current: null }, setDeleteJob() {}, setDeleteElapsed() {},
+      fetch: async () => ({ ok: true, json: async () => ({ deleteJob: { id: 'review' } }) }),
+      waitForCloudDelete: async () => ({ status, result, message: 'review_status' }),
+    });
+    if (status === 'completed') assert.equal(await preview(['test:one'], false), result);
+    else await assert.rejects(preview(['test:one'], false), /review_status/);
+  }
+});
+
+for (const mode of ['icloud', 'both']) {
+  test(`opted-in batch release submits only after full successful review (${mode})`, async () => {
+    const f = fixture(mode); f.context.autoReleaseAfterReview = true;
+    let completeReview; let prompted = false;
+    f.context.requestDeleteConfirmation = () => { prompted = true; return true; };
+    f.context.previewCloudDeletion = () => new Promise(resolve => { completeReview = resolve; });
+    f.context.applyBatchRecycling = async () => {};
+    const pending = f.run(photos);
+    assert.equal(f.calls.length, 0);
+    completeReview({ releaseResult: { status: 'matched', results: [{ id: 'fake-photo', library: 'test', status: 'matched' }] } });
+    await pending;
+    assert.equal(prompted, false); assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0].body.confirmation, true);
+    assert.equal(f.calls[0].body.recycleLocal, mode === 'both');
+    assert.deepEqual(f.calls[0].body.assetKeys, ['test:fake-photo']);
+    assert.equal(f.state.finished, true); assert.equal(f.state.error, '');
+  });
+}
+
+test('auto release stops on review errors, incomplete results, foreign assets and skipped photos', async () => {
+  const good = { id: 'fake-photo', library: 'test', status: 'matched' };
+  const variants = [
+    () => { throw new Error('network_failed'); },
+    () => ({ releaseResult: { status: 'partial', results: [good] } }),
+    () => ({ releaseResult: { status: 'matched', results: [] } }),
+    () => ({ releaseResult: { status: 'matched', results: [{ ...good, id: 'foreign' }] } }),
+    () => ({ releaseResult: { status: 'matched', results: [{ ...good, status: 'failed' }] } }),
+    () => ({ releaseResult: { status: 'matched', results: [good, good] } }),
+  ];
+  for (const review of variants) {
+    const f = fixture(); f.context.autoReleaseAfterReview = true;
+    f.context.previewCloudDeletion = async () => review();
+    let prompted = false; f.context.requestDeleteConfirmation = () => { prompted = true; return true; };
+    await f.run(photos);
+    assert.equal(f.calls.length, 0); assert.equal(prompted, false);
+    assert.ok(f.state.error); assert.equal(f.state.finished, false); assert.equal(f.state.releasingAsset, null);
+  }
+  const f = fixture(); f.context.autoReleaseAfterReview = true;
+  f.context.cloudAssetFor = item => item.id === 'fake-photo' ? { id: item.id, library: 'test', localFiles: [] } : null;
+  f.context.previewCloudDeletion = async () => ({ releaseResult: { status: 'matched', results: [good] } });
+  await f.run([...photos, { ...photos[0], id: 'unmatched' }]);
+  assert.equal(f.calls.length, 0); assert.match(f.state.error, /未匹配/);
 });
 
 test('deleted open photo advances past other deleted photos in the latest browsing order', () => {
