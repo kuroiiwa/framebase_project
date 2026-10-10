@@ -13,6 +13,7 @@ export function handlePlaybackKey(event: KeyboardEvent, video: HTMLVideoElement 
       if (event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
       const target = event.target;
       if (target instanceof HTMLElement && (target.isContentEditable || target.closest('textarea,select,input:not([type="range"])'))) return;
+      if (target instanceof HTMLElement && target.closest('[data-player-volume]') && event.key.startsWith("Arrow")) return;
       if (!video || !["Escape", " ", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "m", "M", "f", "F"].includes(event.key)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -29,6 +30,9 @@ export function handlePlaybackKey(event: KeyboardEvent, video: HTMLVideoElement 
       } else if (event.key.toLowerCase() === "m" && !event.repeat) video.muted = !video.muted;
       else if (event.key.toLowerCase() === "f" && !event.repeat) {
         if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
-        else void video.requestFullscreen?.().catch(() => undefined);
+        else {
+          const fullscreenTarget = video.closest?.<HTMLElement>(".player-stage") || video;
+          void fullscreenTarget.requestFullscreen?.().catch(() => undefined);
+        }
       }
 }

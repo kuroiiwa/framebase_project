@@ -441,6 +441,9 @@ function Library({ username }: { username: string }) {
   const [playerFeedback, setPlayerFeedback] = useState("");
   const [playerTime, setPlayerTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
+  const [playerPaused, setPlayerPaused] = useState(true);
+  const [playerVolume, setPlayerVolume] = useState({ volume: 1, muted: false });
+  const [playerFullscreen, setPlayerFullscreen] = useState(false);
   const [storyboard, setStoryboard] = useState<StoryboardView[]>([]);
   const [storyboardLoading, setStoryboardLoading] = useState(false);
   const [storyboardError, setStoryboardError] = useState("");
@@ -456,12 +459,27 @@ function Library({ username }: { username: string }) {
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playerVideoRef = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const syncFullscreen = () => setPlayerFullscreen(Boolean(document.fullscreenElement?.classList.contains("player-stage")));
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
   const savedVolumeRef = useRef({ volume: 1, muted: false });
   const playerOpenRef = useRef(false);
   const playerUrlRef = useRef<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!error) return;
+    const timer = setTimeout(() => setError(null), 5000);
+    return () => clearTimeout(timer);
+  }, [error]);
+  useEffect(() => {
+    if (!notice || error) return;
+    const timer = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(timer);
+  }, [notice, error]);
   const [releaseCatalog, setReleaseCatalog] = useState<ReleaseCatalog | null>(null);
   const [releasingAsset, setReleasingAsset] = useState<string | null>(null);
 
@@ -924,6 +942,7 @@ function Library({ username }: { username: string }) {
       });
       if (sort === "popular" || sort === "leastPopular") setPopularitySeed(crypto.getRandomValues(new Uint32Array(1))[0]);
       setPlayerTime(0);
+      setPlayerPaused(true);
       setPlayerFeedback("");
       setPlayerDuration(item.duration || 0);
       setPlayer(openedItem); setPlayerUrl(url);
@@ -945,12 +964,27 @@ function Library({ username }: { username: string }) {
   function applySavedVolume(video: HTMLVideoElement) {
     video.volume = savedVolumeRef.current.volume;
     video.muted = savedVolumeRef.current.muted;
+    setPlayerVolume({ volume: video.volume, muted: video.muted });
   }
 
   function savePlayerVolume(video: HTMLVideoElement) {
     const preference = { volume: video.volume, muted: video.muted };
+    setPlayerVolume(preference);
     savedVolumeRef.current = preference;
     localStorage.setItem(accountKey("framebase-player-volume"), JSON.stringify(preference));
+  }
+
+  function togglePlayback() {
+    const video = playerVideoRef.current;
+    if (!video) return;
+    if (video.paused) void video.play().catch(() => setPlayerFeedback("暂时无法播放，请重试。"));
+    else video.pause();
+  }
+
+  function togglePlayerFullscreen() {
+    const stage = playerVideoRef.current?.closest<HTMLElement>(".player-stage");
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => setPlayerFeedback("无法退出全屏，请重试。"));
+    else if (stage?.requestFullscreen) void stage.requestFullscreen().catch(() => setPlayerFeedback("无法进入全屏，请重试。"));
   }
 
   function shuffleVideos() {
@@ -1141,8 +1175,8 @@ function Library({ username }: { username: string }) {
         </div>
       </header>
 
-      {error && <div className="toast error-toast"><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-      {notice && <div className="toast"><span>{notice}</span><button onClick={() => setNotice(null)}>×</button></div>}
+      {error && <div className="toast error-toast" role="alert"><span>{error}</span><button onClick={() => setError(null)} aria-label="关闭错误提示">×</button></div>}
+      {notice && !error && <div className="toast" role="status"><span>{notice}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>}
 
       {shortcutHelp && <section className="shortcut-help" role="dialog" aria-label="快捷键说明"><button onClick={() => setShortcutHelp(false)} aria-label="关闭快捷键说明">×</button><strong>播放器快捷键</strong><p>空格：播放 / 暂停 / ← / →：快退 / 快进 10 秒 / ↑ / ↓：音量 ±5%</p><p>M：静音 / F：全屏 / Esc：退出全屏或关闭播放器</p><p>选择模式：按住 Shift 点击卡片或勾选按钮，连续选中两个位置之间的视频（支持跨页）。输入文字时不触发播放快捷键。</p></section>}
       {scanTask && <section className="scan-task" aria-label="扫描任务"><div><strong>{scanTask.name} · {scanTask.paused ? "已暂停" : scanTask.phase}</strong><p>{scanTask.phase === "扫描目录" ? `已发现 ${scanTask.count} 个视频` : `已处理 ${scanTask.count} / ${scanTask.total} 个预览`}{scanTask.failed > 0 ? ` · ${scanTask.failed} 个失败` : ""}</p>{scanTask.total > 0 && <progress value={scanTask.count} max={scanTask.total} aria-label="预览生成进度" />}<small>暂停或取消在当前文件处理结束后生效；取消目录扫描会保留原清单，已完成的预览会保留。</small></div><div className="scan-task-actions">{scanTask.active ? <><button onClick={() => { const control = scanControlRef.current; if (!control) return; control.paused = !control.paused; setScanTask(current => current && ({ ...current, paused: control.paused })); }}>{scanTask.paused ? "继续" : "暂停"}</button><button onClick={() => { const control = scanControlRef.current; if (control) { control.cancelled = true; control.paused = false; } setScanTask(current => current && ({ ...current, phase: "正在取消…", paused: false })); }}>取消任务</button></> : <>{videos.some(video => !video.thumb) && <button onClick={() => void retryPreviews(true)}>生成未完成预览</button>}<button onClick={() => setScanTask(null)}>收起</button></>}</div></section>}
@@ -1248,8 +1282,9 @@ function Library({ username }: { username: string }) {
           <section className="library-head">
             <p>{filtered.length.toLocaleString()} 个视频 <span>· {filtered.length ? `当前显示 ${pageStart + 1}–${Math.min(pageStart + pageSize, filtered.length)}` : "当前视图"}{query || format !== "all" || resolutionFilter !== "all" || durationFilter !== "all" || selectedTagIds.size ? " · 已筛选" : ""}</span></p>
             <div className="selection-actions">
-              {selecting && <><button onClick={() => { selectionAnchor.current = null; setSelected(current => new Set([...current, ...paginatedVideos.map(v => v.id)])); }}>全选本页</button><button onClick={() => { selectionAnchor.current = null; setSelected(new Set(filtered.map(v => v.id))); }}>全选全部筛选结果</button><button onClick={() => { selectionAnchor.current = null; setSelected(current => { const next = new Set(current); paginatedVideos.forEach(video => { if (next.has(video.id)) next.delete(video.id); else next.add(video.id); }); return next; }); }}>反选本页</button><button disabled={!selected.size} onClick={() => { setSelected(new Set()); selectionAnchor.current = null; }}>取消全部</button><span>已选 {selected.size} 个</span>{selected.size > 0 && <button className="danger-text" onClick={() => setConfirmDelete(true)}>删除</button>}</>}
-              <button className="select" onClick={() => { setSelecting(value => !value); setSelected(new Set()); selectionAnchor.current = null; }}>{selecting ? "取消" : "选择"}</button>
+              <button className="select-all" disabled={loading || !filtered.length} title={`选中当前筛选结果中的全部 ${filtered.length} 个视频（包含所有分页）`} onClick={() => { setSelecting(true); selectionAnchor.current = null; setSelected(new Set(filtered.map(video => video.id))); }}>全部选中</button>
+              {selecting && <><button onClick={() => { selectionAnchor.current = null; setSelected(current => new Set([...current, ...paginatedVideos.map(v => v.id)])); }}>全选本页</button><button onClick={() => { selectionAnchor.current = null; setSelected(current => { const next = new Set(current); paginatedVideos.forEach(video => { if (next.has(video.id)) next.delete(video.id); else next.add(video.id); }); return next; }); }}>反选本页</button><button disabled={!selected.size} onClick={() => { setSelected(new Set()); selectionAnchor.current = null; }}>取消全部</button><span>已选 {selected.size} 个</span>{selected.size > 0 && <button className="danger-text" onClick={() => setConfirmDelete(true)}>删除</button>}</>}
+              <button className="select" aria-pressed={selecting} onClick={() => { setSelecting(value => !value); setSelected(new Set()); selectionAnchor.current = null; }}>{selecting ? "退出选择" : "选择"}</button>
             </div>
           </section>
 
@@ -1326,7 +1361,7 @@ function Library({ username }: { username: string }) {
         <section className="player-modal" role="dialog" aria-modal="true" aria-label={`播放 ${player.name}`}>
           <aside className="player-sidebar">
             <header className="player-sidebar-head"><span className="brand-mark">F</span><span>播放详情</span><button type="button" className="player-close" onClick={event => { event.preventDefault(); event.stopPropagation(); requestClosePlayer(); }} title="关闭播放窗口并返回视频列表" aria-label="关闭播放窗口并返回视频列表"><b>×</b><em>返回</em></button></header>
-            <div className="player-title-block"><p className="eyebrow">正在播放</p><h2>{player.name}</h2><span>{player.sourceName}</span></div>
+            <div className="player-title-block"><div className="player-now-playing"><span className="status-dot" />正在播放<span>{player.sourceName}</span></div><h2 title={player.name}>{player.name}</h2></div>
             <dl className="player-info">
               <div><dt>时长</dt><dd>{formatDuration(player.duration)}</dd></div>
               <div><dt>文件大小</dt><dd>{formatBytes(player.size)}</dd></div>
@@ -1335,14 +1370,14 @@ function Library({ username }: { username: string }) {
               <div><dt>点击次数</dt><dd>{player.clicks.toLocaleString()} 次</dd></div>
               <div><dt>修改时间</dt><dd>{formatDate(player.modified)}</dd></div>
             </dl>
-            <div className="player-path"><span>文件位置</span><p>{player.sourceName} / {player.path}</p></div>
+            <details className="player-path" key={player.id}><summary>文件位置<span>展开查看</span></summary><p>{player.sourceName} / {player.path}</p></details>
             <div className="player-actions">
               <button disabled={switchingVideo || !previousVideo} onClick={() => previousVideo && void openPlayer(previousVideo, true)}>← 上一个</button>
               <button disabled={switchingVideo || !nextVideo} onClick={() => nextVideo && void openPlayer(nextVideo, true)}>下一个 →</button>
-              <span>{switchingVideo ? "正在打开视频…" : `${queuePosition + 1} / ${availableQueue.length}`}</span>
               <button className={player.liked ? "liked active" : ""} onClick={() => updatePlayerMark("liked")} aria-pressed={player.liked}><span className="player-mark-icon"><MarkIcon type="liked" /></span>{player.liked ? "已点赞" : "点赞"}</button>
               <button className={player.cleanup ? "cleanup-player active" : ""} onClick={() => updatePlayerMark("cleanup")} aria-pressed={player.cleanup}><span className="player-mark-icon"><MarkIcon type="cleanup" /></span>{player.cleanup ? "已标记待清理" : "标记待清理"}</button>
             </div>
+            {switchingVideo && <p className="player-switching" role="status">正在打开视频…</p>}
             <section className="play-queue" aria-label="播放队列"><header><strong>播放队列 · {queuePosition + 1} / {availableQueue.length}</strong><button onClick={() => setShortcutHelp(true)}>快捷键</button></header><div className="queue-controls"><select aria-label="播放模式" value={queueMode} onChange={event => changeQueueMode(event.target.value as typeof queueMode)}><option value="sequence">顺序播放</option><option value="random">随机播放</option><option value="repeat">单条循环</option></select>{queueMode === "random" && <button onClick={() => changeQueueMode("random")}>重新打乱</button>}<label><input type="checkbox" checked={autoAdvance} onChange={event => setAutoAdvance(event.target.checked)} /> 自动连播</label></div><input className="queue-search" value={queueQuery} onChange={event => setQueueQuery(event.target.value)} placeholder="在队列中查找…" aria-label="搜索播放队列" /><ol>{availableQueue.map((id, index) => ({ item: videoById.get(id)!, index })).filter(({ item }) => item.name.toLowerCase().includes(queueQuery.toLowerCase())).map(({ item, index }) => <li key={item.id}><button disabled={switchingVideo} aria-current={player.id === item.id ? "true" : undefined} onClick={() => void openPlayer(item, true)} title={`${item.sourceName} / ${item.path}`}><span>{player.id === item.id ? "▶" : index + 1}</span><span><strong>{item.name}</strong><small>{item.sourceName} · {formatDuration(item.duration)}</small></span></button></li>)}</ol></section>
             <section className="player-tags" aria-label="视频标签"><span>视频标签</span>{customTags.length ? <div>{customTags.map(tag => <button className={player.tagIds.includes(tag.id) ? "custom-tag selected" : "custom-tag"} style={{ "--tag-color": tag.color } as CSSProperties} onClick={() => toggleVideoTag(player.id, tag.id)} aria-pressed={player.tagIds.includes(tag.id)} key={tag.id}><i />{tag.name}</button>)}</div> : <button className="player-create-tag" onClick={() => { requestClosePlayer(); setTagManagerOpen(true); }}>＋ 创建第一个标签</button>}</section>
             <section className="storyboard-status"><span>故事板预览</span><p>{storyboardLoading ? "正在生成首个故事板…" : storyboard.length ? `${storyboard.length} 帧已就绪 · 将鼠标移到时间轴查看` : storyboardError || "准备中"}</p></section>
@@ -1353,20 +1388,24 @@ function Library({ username }: { username: string }) {
             <header><span>{player.name}</span><small>← / → 10 秒 · ↑ / ↓ 音量 · 空格播放/暂停 · {formatDuration(player.duration)} · {player.ext.toUpperCase()}</small></header>
             {/* Local personal videos do not have a captions track available to the app. */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-            <video ref={playerVideoRef} src={playerUrl} controls autoPlay playsInline preload="auto" loop={queueMode === "repeat"} onEnded={() => { if (autoAdvance && nextVideo) void openPlayer(nextVideo, true); }} onLoadedMetadata={event => { applySavedVolume(event.currentTarget); setPlayerDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0); }} onTimeUpdate={event => setPlayerTime(event.currentTarget.currentTime)} onDurationChange={event => setPlayerDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)} onVolumeChange={event => savePlayerVolume(event.currentTarget)} aria-label={`正在播放 ${player.name}`} aria-keyshortcuts="ArrowLeft ArrowRight" />
-            <div className="player-progress">
+            <video ref={playerVideoRef} src={playerUrl} autoPlay playsInline preload="auto" loop={queueMode === "repeat"} onClick={togglePlayback} onKeyDown={event => { if (event.key === "Enter" && !event.repeat) { event.preventDefault(); togglePlayback(); } }} tabIndex={0} role="button" aria-pressed={!playerPaused} title={playerPaused ? "点击画面开始播放" : "点击画面暂停"} onPlay={() => setPlayerPaused(false)} onPause={() => setPlayerPaused(true)} onEnded={() => { setPlayerPaused(true); if (autoAdvance && nextVideo) void openPlayer(nextVideo, true); }} onLoadedMetadata={event => { applySavedVolume(event.currentTarget); setPlayerDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0); }} onTimeUpdate={event => setPlayerTime(event.currentTarget.currentTime)} onDurationChange={event => setPlayerDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)} onVolumeChange={event => savePlayerVolume(event.currentTarget)} aria-label={`${player.name}，${playerPaused ? "点击开始播放" : "点击暂停"}`} aria-keyshortcuts="Space Enter ArrowLeft ArrowRight" />
+            <div className="player-progress" role="group" aria-label="播放控制">
+              <button className="player-control" onClick={togglePlayback} aria-label={playerPaused ? "播放" : "暂停"} title={playerPaused ? "播放（空格）" : "暂停（空格）"}><svg viewBox="0 0 24 24" aria-hidden="true">{playerPaused ? <path d="M8 5v14l11-7z" fill="currentColor" stroke="none" /> : <path d="M8 5v14M16 5v14" strokeWidth="4" />}</svg></button>
               <span>{formatDuration(playerTime)}</span>
               <div className="storyboard-timeline" onPointerMove={event => { if (!storyboard.length || !playerDuration) return; const bounds = event.currentTarget.getBoundingClientRect(); const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)); setStoryboardHover({ ratio, index: Math.min(storyboard.length - 1, Math.floor(ratio * storyboard.length)) }); }} onPointerLeave={() => setStoryboardHover(null)}>
                 {storyboardHover && storyboard[storyboardHover.index] && <figure className="storyboard-popover" style={{ left: `clamp(126px, ${storyboardHover.ratio * 100}%, calc(100% - 126px))` }}><img src={storyboard[storyboardHover.index].url} alt="" /><figcaption>{formatDuration(storyboardHover.ratio * playerDuration)}</figcaption></figure>}
-                <input type="range" min={0} max={playerDuration || 1} step={0.1} value={Math.min(playerTime, playerDuration || 1)} onPointerDown={event => { if (!playerDuration) return; const bounds = event.currentTarget.getBoundingClientRect(); const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)); const time = ratio * playerDuration; if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} onChange={event => { const time = Number(event.target.value); if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} style={{ "--progress": `${playerDuration ? playerTime / playerDuration * 100 : 0}%` } as CSSProperties} aria-label="视频播放进度（悬停可查看故事板）" aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Space" />
+                <input type="range" min={0} max={playerDuration || 1} step={0.1} disabled={!playerDuration} value={Math.min(playerTime, playerDuration || 1)} onChange={event => { const time = Number(event.target.value); if (playerVideoRef.current) playerVideoRef.current.currentTime = time; setPlayerTime(time); }} style={{ "--progress": `${playerDuration ? playerTime / playerDuration * 100 : 0}%` } as CSSProperties} aria-label="视频播放进度（悬停可查看故事板）" aria-valuetext={`${formatDuration(playerTime)} / ${formatDuration(playerDuration)}`} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Space" />
               </div>
               <span>{formatDuration(playerDuration)}</span>
+              <button className="player-control" onClick={() => { const video = playerVideoRef.current; if (video) { if (video.volume === 0) { video.volume = savedVolumeRef.current.volume || .5; video.muted = false; } else video.muted = !video.muted; } }} aria-label={playerVolume.muted || playerVolume.volume === 0 ? "取消静音" : "静音"} title="静音 / 取消静音（M）"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4 5 9H2v6h3l6 5z" />{playerVolume.muted || playerVolume.volume === 0 ? <path d="m16 9 6 6m0-6-6 6" /> : <path d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14" />}</svg></button>
+              <input className="player-volume" data-player-volume type="range" min={0} max={1} step={.05} value={playerVolume.muted ? 0 : playerVolume.volume} onChange={event => { const video = playerVideoRef.current; if (video) { video.volume = Number(event.target.value); video.muted = false; } }} style={{ "--progress": `${playerVolume.muted ? 0 : playerVolume.volume * 100}%` } as CSSProperties} aria-label="音量" aria-valuetext={`${Math.round((playerVolume.muted ? 0 : playerVolume.volume) * 100)}%`} />
+              <button className="player-control" onClick={togglePlayerFullscreen} aria-label={playerFullscreen ? "退出全屏" : "全屏"} title={playerFullscreen ? "退出全屏（F / Esc）" : "全屏（F）"}><svg viewBox="0 0 24 24" aria-hidden="true"><path d={playerFullscreen ? "M3 8h5V3m8 0v5h5M3 16h5v5m8 0v-5h5" : "M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5"} /></svg></button>
             </div>
           </div>
         </section>
       </div>}
 
-      {confirmDelete && <div className="modal-backdrop">
+      {confirmDelete && <div className="modal-backdrop confirmation-backdrop">
         <section className="confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
           <span className="warning">!</span><h2 id="delete-title">永久删除 {selected.size} 个视频？</h2>
           <p>将释放约 <strong>{formatBytes(selectedSize)}</strong>。文件会从源文件夹直接删除，且不经过本应用的回收站，此操作无法撤销。</p>

@@ -2,7 +2,7 @@
 
 /* eslint-disable @next/next/no-img-element, @next/next/no-html-link-for-pages, jsx-a11y/media-has-caption -- previews use local Blob URLs; Live Photo MOV files contain no caption track; hard navigation avoids losing File System Access state. */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
 import ThemeSelector from "../theme-selector";
@@ -11,6 +11,7 @@ import AppleSessionControls from "../apple-session-controls";
 import styles from "./photos.module.css";
 import actionStyles from "../media-actions.module.css";
 import { collectCloudSelection, MAX_PHOTO_SELECTION } from "./bulk-selection";
+import { viewerAfterRemoval } from "./viewer-navigation";
 import { findPhotoCloudAsset } from "./cloud-match";
 import { CloudDeleteProgress, waitForCloudDelete, type CloudDeleteJob } from "../icloud-delete-progress";
 
@@ -366,7 +367,7 @@ function PhotoThumb({ item, onOpen }: { item: PhotoItem; onOpen: () => void }) {
   </button>;
 }
 
-function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCleanup, cloudAvailable, cloudLoading, cloudMessage, releaseBusy }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void; onDelete: (mode: "local" | "icloud" | "both") => void; onFavorite: () => void; onCleanup: () => void; cloudAvailable: boolean; cloudLoading: boolean; cloudMessage: string; releaseBusy: boolean }) {
+function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCleanup, cloudAvailable, cloudLoading, cloudMessage, releaseBusy, taskNotice = "" }: { item: PhotoItem; previous: () => void; next: () => void; onClose: () => void; onDelete: (mode: "local" | "icloud" | "both") => void; onFavorite: () => void; onCleanup: () => void; cloudAvailable: boolean; cloudLoading: boolean; cloudMessage: string; releaseBusy: boolean; taskNotice?: string }) {
   const [previewItem] = useState(item);
   const [initialUrl] = useState<string | null>(() => {
     const thumbnail = readThumbnailCache(item);
@@ -435,7 +436,8 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCl
   useEffect(() => () => { if (liveUrl) URL.revokeObjectURL(liveUrl); }, [liveUrl]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
-      if (document.querySelector("dialog[open]")) return;
+      const target = event.target;
+      if (document.querySelector("dialog:modal") || (target instanceof HTMLElement && target.closest('dialog,input,select,textarea,summary,[contenteditable="true"]'))) return;
       if (event.key === "Escape") onClose();
       if (event.key === "+" || event.key === "=") setZoom(value => Math.min(8, value * 1.25));
       if (event.key === "-") setZoom(value => Math.max(1, value / 1.25));
@@ -457,7 +459,7 @@ function PhotoViewer({ item, previous, next, onClose, onDelete, onFavorite, onCl
       {playingLive && liveUrl ? <video src={liveUrl} controls autoPlay playsInline preload="metadata" aria-label={item.name + " 实况视频"} onError={() => { setLiveFailed(true); setPlayingLive(false); }} onEnded={() => setPlayingLive(false)} /> : url && !failed ? <img src={url} alt={item.name} draggable={false} style={{ transform: `translate(${zoom === 1 ? 0 : pan.x}px,${zoom === 1 ? 0 : pan.y}px) scale(${zoom * rotatedFit}) rotate(${rotation}deg)` }} onLoad={event => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} onDoubleClick={() => { if (zoom > 1) fitImage(); else setZoom(2); }} onError={() => setFailed(true)} /> : <div className={styles.unsupported}><strong>{item.extension.toUpperCase()}</strong><span>{HEIC_PREVIEW_EXTENSIONS.has(item.extension) ? previewStatus(item.extension, failed) : "浏览器无法直接显示此原始格式，但文件仍已纳入图片库。"}</span></div>}
       {item.liveVideo && <button className={styles.liveToggle} onClick={() => { setLiveFailed(false); setPlayingLive(value => !value); }}>{playingLive ? liveUrl ? "显示照片" : "正在读取实况…" : "▶ 播放实况"}</button>}
       {liveFailed && <span className={styles.liveError}>实况视频无法播放，请检查 Windows HEVC 解码支持。</span>}
-    </div><figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}{item.liveVideo ? " · 实况 " + item.liveVideo.name : ""}</span></figcaption></figure>
+    </div><figcaption><strong title={item.path}>{item.name}</strong><span>{item.sourceName} · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}{item.liveVideo ? " · 实况 " + item.liveVideo.name : ""}</span>{taskNotice && <p className={styles.viewerTaskNotice} role="status">{taskNotice}</p>}</figcaption></figure>
     <button className={styles.viewerNext} onClick={next} aria-label="下一张">›</button>
     <aside className={styles.viewerSidebar} aria-label="图片操作">
       <h2>图片操作</h2><p>{item.name}</p>
@@ -476,6 +478,7 @@ export default function PhotosPage() {
 function PhotoLibrary({ username }: { username: string }) {
   const [sources, setSources] = useState<SourceFolder[]>([]);
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
+  const libraryStateRef = useRef({ photos, sources, filtered: [] as PhotoItem[] });
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -488,6 +491,9 @@ function PhotoLibrary({ username }: { username: string }) {
   const [previewRatio, setPreviewRatio] = useState<PreviewRatio>("standard");
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [page, setPage] = useState(1);
+  const paginationRef = useRef<HTMLDivElement>(null);
+  const libraryHeadRef = useRef<HTMLElement>(null);
+  const [paginationVisible, setPaginationVisible] = useState(true);
   const [viewerId, setViewerId] = useState<string | null>(null);
   const [icloudBackupDirectory, setIcloudBackupDirectory] = useState<string | null>(null);
   const [releaseCatalog, setReleaseCatalog] = useState<ReleaseCatalog | null>(null);
@@ -501,6 +507,11 @@ function PhotoLibrary({ username }: { username: string }) {
   const [deleteItem, setDeleteItem] = useState<PhotoItem | null>(null);
   const [deleteMode, setDeleteMode] = useState<"local" | "icloud" | "both">("local");
   const deleteDialogRef = useRef<HTMLDialogElement>(null);
+  const [deleteMinimized, setDeleteMinimized] = useState(false);
+  const [deleteFinished, setDeleteFinished] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState<string | null>(null);
+  const deleteConfirmationResolver = useRef<((confirmed: boolean) => void) | null>(null);
+  const confirmationCancelRef = useRef<HTMLButtonElement>(null);
   const [deleteJob, setDeleteJob] = useState<DeleteJob | null>(null);
   const [deleteElapsed, setDeleteElapsed] = useState(0);
   const deletePollAbort = useRef<AbortController | null>(null);
@@ -577,8 +588,30 @@ function PhotoLibrary({ username }: { username: string }) {
   const cloudAssetFor = useCallback((item: PhotoItem) => findPhotoCloudAsset(item, releaseCatalog?.releasePlan, icloudBackupDirectory), [releaseCatalog, icloudBackupDirectory]);
 
   useEffect(() => {
-    if ((deleteItem || bulkDeleteItems.length) && !deleteDialogRef.current?.open) deleteDialogRef.current?.showModal();
-  }, [deleteItem, bulkDeleteItems]);
+    const dialog = deleteDialogRef.current;
+    if (!dialog || (!deleteItem && !bulkDeleteItems.length)) return;
+    if (dialog.open) dialog.close();
+    if (deleteMinimized) dialog.show();
+    else dialog.showModal();
+  }, [deleteItem, bulkDeleteItems, deleteMinimized]);
+
+  useEffect(() => {
+    if (deleteConfirmation) confirmationCancelRef.current?.focus();
+  }, [deleteConfirmation]);
+  useEffect(() => () => { deleteConfirmationResolver.current?.(false); }, []);
+
+  function requestDeleteConfirmation(message: string) {
+    return new Promise<boolean>(resolve => {
+      deleteConfirmationResolver.current = resolve;
+      setDeleteConfirmation(message);
+    });
+  }
+  function resolveDeleteConfirmation(confirmed: boolean) {
+    const resolve = deleteConfirmationResolver.current;
+    deleteConfirmationResolver.current = null;
+    setDeleteConfirmation(null);
+    resolve?.(confirmed);
+  }
 
   useEffect(() => {
     const controller = new AbortController();
@@ -602,17 +635,14 @@ function PhotoLibrary({ username }: { username: string }) {
   }, [deleteStartedAt, deleteJobStatus]);
 
   async function removeRecycledPhoto(item: PhotoItem) {
-    const nextPhotos = photos.filter(photo => photo.id !== item.id);
-    const nextSources = sources.map(source => source.id === item.sourceId ? { ...source, photoCount: Math.max(0, source.photoCount - 1), totalSize: Math.max(0, source.totalSize - item.size) } : source);
-    setPhotos(nextPhotos); setSources(nextSources);
-    if (viewerId === item.id) setViewerId(null);
-    await Promise.all([dbSet('photo-library:' + item.sourceId, nextPhotos.filter(photo => photo.sourceId === item.sourceId)), dbSet(SOURCES_KEY, nextSources)]);
+    await applyBatchRecycling([item], [{ item, mainDeleted: true, companionDeleted: Boolean(item.liveVideo) }]);
   }
 
   async function recycleLocalPhoto(item: PhotoItem) {
     setReleasingAsset(item.id); setError(""); setNotice(""); setDeleteJob(null);
     try {
-      if (!window.confirm('将“' + item.name + '”' + (item.liveVideo ? '及其配对实况视频' : '') + '移入 Windows 回收站？iCloud 内容会保留。接下来请选择图片来源文件夹“' + item.sourceName + '”。')) return;
+      if (!await requestDeleteConfirmation('将“' + item.name + '”' + (item.liveVideo ? '及其配对实况视频' : '') + '移入 Windows 回收站？iCloud 内容会保留。接下来请选择图片来源文件夹“' + item.sourceName + '”。')) return false;
+      setBatchLocalProgress({ total: 1, checked: 0, recycled: 0, message: "正在读取并校验本地图片…" });
       const entries = [{ relativePath: item.path, handle: item.handle }, ...(item.liveVideo ? [{ relativePath: item.liveVideo.path, handle: item.liveVideo.handle }] : [])];
       const files = await Promise.all(entries.map(async entry => {
         const file = await entry.handle.getFile();
@@ -621,28 +651,31 @@ function PhotoLibrary({ username }: { username: string }) {
       }));
       const response = await fetch("/api/photos/recycle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceName: item.sourceName, files, confirmation: "移入本地回收站" }) });
       const data = await response.json() as { cancelled?: boolean; recycleResult?: { status: string; message: string; results: Array<{ relativePath: string; status: string }> }; error?: string };
-      if (data.cancelled) return;
+      if (data.cancelled) { setBatchLocalProgress(null); return false; }
       if (!response.ok || !data.recycleResult) throw new Error(data.error || "本地删除失败。");
       if (data.recycleResult.results.some(result => result.relativePath === item.path && result.status === "recycled")) await removeRecycledPhoto(item);
       else if (item.liveVideo && data.recycleResult.results.some(result => result.relativePath === item.liveVideo?.path && result.status === "recycled")) {
-        const next = photos.map(photo => photo.id === item.id ? { ...photo, liveVideo: null } : photo);
-        setPhotos(next); await dbSet('photo-library:' + item.sourceId, next.filter(photo => photo.sourceId === item.sourceId));
+        await applyBatchRecycling([item], [{ item, mainDeleted: false, companionDeleted: true }]);
       }
       const catalogResponse = await fetch("/api/icloud/release/catalog", { cache: "no-store" }).catch(() => null);
       if (catalogResponse?.ok) setReleaseCatalog(await catalogResponse.json() as ReleaseCatalog);
       if (data.recycleResult.status === "recycled") setNotice(data.recycleResult.message + " iCloud 内容已保留。");
       else setError(data.recycleResult.message + " iCloud 内容已保留。");
+      setBatchLocalProgress({ total: 1, checked: 1, recycled: data.recycleResult.results.some(result => result.relativePath === item.path && result.status === "recycled") ? 1 : 0, message: data.recycleResult.message });
+      return true;
     } catch (reason) { setError(reason instanceof Error ? reason.message : "本地删除失败。"); }
     finally { setReleasingAsset(null); }
   }
 
   async function applyBatchRecycling(items: PhotoItem[], results: Array<{ item: PhotoItem; mainDeleted: boolean; companionDeleted: boolean }>) {
+    const current = libraryStateRef.current;
     const removed = new Set(results.filter(result => result.mainDeleted).map(result => result.item.id));
     const companions = new Set(results.filter(result => !result.mainDeleted && result.companionDeleted).map(result => result.item.id));
-    const next = photos.filter(photo => !removed.has(photo.id)).map(photo => companions.has(photo.id) ? { ...photo, liveVideo: null } : photo);
-    const nextSources = sources.map(source => ({ ...source, photoCount: next.filter(photo => photo.sourceId === source.id).length, totalSize: next.filter(photo => photo.sourceId === source.id).reduce((sum, photo) => sum + photo.size, 0) }));
+    const next = current.photos.filter(photo => !removed.has(photo.id)).map(photo => companions.has(photo.id) ? { ...photo, liveVideo: null } : photo);
+    const nextSources = current.sources.map(source => ({ ...source, photoCount: next.filter(photo => photo.sourceId === source.id).length, totalSize: next.filter(photo => photo.sourceId === source.id).reduce((sum, photo) => sum + photo.size, 0) }));
+    libraryStateRef.current = { photos: next, sources: nextSources, filtered: current.filtered.filter(photo => !removed.has(photo.id)) };
     setPhotos(next); setSources(nextSources); setSelectedIds(current => current.filter(id => !removed.has(id)));
-    if (viewerId && removed.has(viewerId)) setViewerId(null);
+    setViewerId(currentId => viewerAfterRemoval(currentId, current.filtered.map(photo => photo.id), new Set(next.map(photo => photo.id))));
     await Promise.all([dbSet(SOURCES_KEY, nextSources), ...[...new Set(items.map(item => item.sourceId))].map(sourceId => dbSet('photo-library:' + sourceId, next.filter(photo => photo.sourceId === sourceId)))]);
   }
 
@@ -664,7 +697,7 @@ function PhotoLibrary({ username }: { username: string }) {
       if (deleteMode === "local") {
         const bySource = new Map<string, PhotoItem[]>();
         for (const item of items) bySource.set(item.sourceId, [...(bySource.get(item.sourceId) || []), item]);
-        if (!window.confirm('将选中的 ' + items.length + ' 张图片及其配对实况视频移入 Windows 回收站？iCloud 内容会保留。接下来需要为 ' + bySource.size + ' 个图片来源分别选择对应文件夹。')) return;
+        if (!await requestDeleteConfirmation('将选中的 ' + items.length + ' 张图片及其配对实况视频移入 Windows 回收站？iCloud 内容会保留。接下来需要为 ' + bySource.size + ' 个图片来源分别选择对应文件夹。')) return;
         const outcomes: Array<{ item: PhotoItem; mainDeleted: boolean; companionDeleted: boolean }> = [];
         const issues: string[] = [];
         let checked = 0;
@@ -700,7 +733,7 @@ function PhotoLibrary({ username }: { username: string }) {
         const recycleLocal = deleteMode === "both";
         setDeleteElapsed(0); setDeleteJob({ status: "running", phase: "preview", name: '批量删除 ' + selection.assets.length + ' 个云端项目', startedAt: Date.now(), total: selection.assets.length, message: "正在批量核对精确云端资产…" });
         const preview = await previewCloudDeletion(keys, recycleLocal);
-        const confirmation = window.confirm('将 ' + selection.assets.length + ' 个精确匹配云端项目移入“最近删除”。' + (recycleLocal ? '仅在云端删除成功或确认已在最近删除中后回收本地原片（最多 ' + (preview.localRecyclePlan?.fileCount || 0) + ' 个文件）。' : '本地原片保留。') + '跳过 ' + selection.skipped.length + ' 张未匹配图片。已在云端最近删除中的项目不会重复删除。确认继续？');
+        const confirmation = await requestDeleteConfirmation('将 ' + selection.assets.length + ' 个精确匹配云端项目移入“最近删除”。' + (recycleLocal ? '仅在云端删除成功或确认已在最近删除中后回收本地原片（最多 ' + (preview.localRecyclePlan?.fileCount || 0) + ' 个文件）。' : '本地原片保留。') + '跳过 ' + selection.skipped.length + ' 张未匹配图片。已在云端最近删除中的项目不会重复删除。确认继续？');
         if (!confirmation) { setDeleteJob(null); return; }
         const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: keys, recycleLocal, confirmation, background: true }) });
         const started = await response.json() as { deleteJob?: DeleteJob; error?: string };
@@ -718,22 +751,24 @@ function PhotoLibrary({ username }: { username: string }) {
         if (completed.status !== "completed") setError(completed.message || "部分项目未完成，失败项已保留。");
       }
       void refreshReleaseCatalog();
-      setBulkDeleteItems([]); setDeleteItem(null);
+      setDeleteFinished(true);
     } catch (reason) { const message = reason instanceof Error ? reason.message : "批量删除失败。"; setError(message); setDeleteJob(current => current ? { ...current, status: (current.deleted || 0) > 0 ? "partial" : "failed", message } : current); }
     finally { setReleasingAsset(null); }
   }
 
   async function deleteSelectedPhoto() {
+    if (deleteFinished || deleteConfirmation) return;
     if (bulkDeleteItems.length) { await deleteBatchPhotos(bulkDeleteItems); return; }
     if (!deleteItem || releasingAsset !== null || appleSessionBusy) return;
     const item = deleteItem;
-    if (deleteMode === "local") await recycleLocalPhoto(item);
+    let completed: boolean | undefined;
+    if (deleteMode === "local") completed = await recycleLocalPhoto(item);
     else {
       const asset = cloudAssetFor(item);
       if (!asset) { setError("请先在 iCloud 备份中心完成释放计划复核和确认。"); return; }
-      await releaseFromIcloud(item, asset, deleteMode === "both");
+      completed = await releaseFromIcloud(item, asset, deleteMode === "both");
     }
-    setDeleteItem(null);
+    if (completed) setDeleteFinished(true);
   }
 
   async function releaseFromIcloud(item: PhotoItem, asset: IcloudAsset, recycleLocal: boolean) {
@@ -743,7 +778,7 @@ function PhotoLibrary({ username }: { username: string }) {
     try {
       const preview = await previewCloudDeletion([key], recycleLocal);
       const localSummary = recycleLocal ? `同时将 ${preview.localRecyclePlan?.fileCount || 0} 个本地原文件（${formatBytes(preview.localRecyclePlan?.bytes || 0)}）移入 Windows 回收站。` : "本地备份会保留。";
-      const confirmation = window.confirm(`已精确匹配“${item.name}”。${preview.releaseResult?.results?.some(result => result.alreadyDeleted) ? "云端已在最近删除中，不会重复删除。" : `云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。`}${localSummary}\n\n已在云端最近删除中的项目不会重复删除。确认继续？`);
+      const confirmation = await requestDeleteConfirmation(`已精确匹配“${item.name}”。${preview.releaseResult?.results?.some(result => result.alreadyDeleted) ? "云端已在最近删除中，不会重复删除。" : `云端项目将移入“最近删除”，预计 ${formatBytes(asset.originalBytes)}。`}${localSummary}\n\n已在云端最近删除中的项目不会重复删除。确认继续？`);
       if (!confirmation) { setDeleteJob(null); return; }
       setDeleteJob({ status: "running", phase: "preparing", name: item.name, startedAt: Date.now(), total: 1, processed: 0, deleted: 0, message: "已确认删除，正在启动后台任务…" }); setDeleteElapsed(0);
       const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: [key], confirmation, recycleLocal, background: true }) });
@@ -758,9 +793,12 @@ function PhotoLibrary({ username }: { username: string }) {
       setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(candidate => `${candidate.library}:${candidate.id}` !== key) } : null, releaseHistory: data.releaseHistory || current.releaseHistory, timeline: data.timeline || current.timeline } : current);
       if (data.recycleResult?.results?.some(result => result.status === "recycled" && result.relativePath.replaceAll("\\", "/").split("/").pop()?.toLowerCase() === item.name.toLowerCase())) {
         await removeRecycledPhoto(item);
+      } else if (item.liveVideo && data.recycleResult?.results?.some(result => result.status === "recycled" && result.relativePath.replaceAll("\\", "/").split("/").pop()?.toLowerCase() === item.liveVideo?.name.toLowerCase())) {
+        await applyBatchRecycling([item], [{ item, mainDeleted: false, companionDeleted: true }]);
       }
       if (data.recycleResult && data.recycleResult.status !== "recycled") setError("iCloud 删除已成功。" + data.recycleResult.message);
       setNotice(data.recycleResult ? `“${item.name}”已移入 iCloud“最近删除”。${data.recycleResult.message}` : `“${item.name}”已移入 iCloud“最近删除”，本地文件未删除。预计可释放 ${formatBytes(asset.originalBytes)}；彻底释放需清空“最近删除”。`);
+      return true;
     } catch (reason) { const message = reason instanceof Error ? reason.message : "iCloud 删除失败。"; setError(message); setDeleteJob(current => current ? { ...current, status: (current.deleted || 0) > 0 ? "partial" : "failed", message } : current); }
     finally { setReleasingAsset(null); }
   }
@@ -828,11 +866,16 @@ function PhotoLibrary({ username }: { username: string }) {
   }
 
   function markSelectedForCleanup() {
+    if (loading || !selectedIds.length) return;
     const selected = new Set(selectedIds);
-    const updated = photos.map(item => selected.has(item.id) ? { ...item, cleanup: true } : item);
-    for (const sourceId of new Set(photos.filter(item => selected.has(item.id)).map(item => item.sourceId))) persistMarks(updated, sourceId);
+    const current = libraryStateRef.current.photos;
+    const selectedPhotos = current.filter(item => selected.has(item.id));
+    if (!selectedPhotos.length) return;
+    const updated = current.map(item => selected.has(item.id) ? { ...item, cleanup: true } : item);
+    for (const sourceId of new Set(selectedPhotos.map(item => item.sourceId))) persistMarks(updated, sourceId);
+    libraryStateRef.current = { ...libraryStateRef.current, photos: updated };
     setPhotos(updated);
-    setNotice(`已将 ${photos.filter(item => selected.has(item.id)).length} 张图片加入待整理。`);
+    setNotice(`已将选中的 ${selectedPhotos.length} 张图片批量加入待整理，可在“待整理”分类查看。`);
   }
 
   const formats = useMemo(() => [...new Set(photos.map(item => item.extension))].sort(), [photos]);
@@ -848,8 +891,22 @@ function PhotoLibrary({ username }: { username: string }) {
     });
     return result.sort((left, right) => sort === "oldest" ? left.modified - right.modified : sort === "largest" ? right.size - left.size : sort === "smallest" ? left.size - right.size : sort === "name" ? left.name.localeCompare(right.name, "zh-CN") : right.modified - left.modified);
   }, [formatFilter, photos, query, sort, sourceFilter, tab]);
+  useLayoutEffect(() => { libraryStateRef.current = { photos, sources, filtered }; }, [photos, sources, filtered]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
+  useEffect(() => {
+    const target = paginationRef.current;
+    if (!target) return;
+    const observer = new IntersectionObserver(entries => {
+      setPaginationVisible(entries.some(entry => entry.isIntersecting));
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [pageCount]);
+  function changePhotoPage(nextPage: number) {
+    setPage(Math.max(1, Math.min(pageCount, nextPage)));
+    libraryHeadRef.current?.scrollIntoView({ block: "start", behavior: "instant" });
+  }
   const visible = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
   const viewerIndex = viewerId ? filtered.findIndex(item => item.id === viewerId) : -1;
   const viewer = viewerId ? photos.find(item => item.id === viewerId) : null;
@@ -863,11 +920,31 @@ function PhotoLibrary({ username }: { username: string }) {
   const dialogCloudSelection = collectCloudSelection(dialogItems, cloudAssetFor);
   const cloudDeleteAvailable = !releaseCatalogLoading && !releaseCatalogError && dialogCloudSelection.assets.length > 0;
   function toggleSelection(id: string) {
-    if (releasingAsset !== null) return;
     if (!selectedIds.includes(id) && selectedPhotos.length >= MAX_PHOTO_SELECTION) { setNotice(`每批最多选择 ${MAX_PHOTO_SELECTION} 张图片。`); return; }
     setSelectedIds(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
   }
-  function closeDeleteDialog() { setDeleteItem(null); setBulkDeleteItems([]); }
+  function selectAllFiltered() {
+    if (loading || !filtered.length) return;
+    setSelectionMode(true);
+    setSelectedIds(filtered.slice(0, MAX_PHOTO_SELECTION).map(item => item.id));
+    if (filtered.length > MAX_PHOTO_SELECTION) setNotice(`当前筛选共 ${filtered.length} 张图片，每批最多 ${MAX_PHOTO_SELECTION} 张，已选中排序靠前的 ${MAX_PHOTO_SELECTION} 张（支持跨页）。`);
+  }
+  function closeDeleteDialog() {
+    if (releasingAsset !== null) return;
+    resolveDeleteConfirmation(false);
+    deleteDialogRef.current?.close();
+    setDeleteItem(null); setBulkDeleteItems([]); setDeleteMinimized(false); setDeleteFinished(false);
+    setDeleteJob(null); setBatchLocalProgress(null);
+  }
+  function openDeleteDialog(items: PhotoItem[], mode: "local" | "icloud" | "both" = "local") {
+    if (releasingAsset !== null || appleSessionBusy) return;
+    setDeleteMinimized(false); setDeleteFinished(false); setDeleteConfirmation(null);
+    setViewerId(null);
+    setBulkDeleteItems(items.length > 1 ? items : []); setDeleteItem(items.length === 1 ? items[0] : null);
+    setDeleteMode(mode); setBatchLocalProgress(null); setDeleteJob(null); setError(""); setNotice("");
+    void refreshReleaseCatalog();
+  }
+  function minimizeDeleteWindow() { setSelectionMode(false); setDeleteMinimized(true); }
   const totalSize = photos.reduce((sum, item) => sum + item.size, 0);
 
   return <main className={styles.page}>
@@ -890,16 +967,21 @@ function PhotoLibrary({ username }: { username: string }) {
       <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
     </section>
     <section className={styles.selectionToolbar} aria-label="批量选择图片">
-      <button className={actionStyles.button} disabled={releasingAsset !== null} onClick={() => { setSelectionMode(value => !value); setSelectedIds([]); }}>{selectionMode ? "退出多选" : "批量选择"}</button>
-      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择</span></div><div className={styles.selectionActions}><button className={actionStyles.button} disabled={releasingAsset !== null} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={releasingAsset !== null || !selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={actionStyles.button} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={markSelectedForCleanup}>加入待整理</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => { setDeleteItem(null); setBulkDeleteItems(selectedPhotos); setDeleteMode("local"); setBatchLocalProgress(null); setDeleteJob(null); void refreshReleaseCatalog(); }}>删除选中的 {selectedPhotos.length} 张</button></div></>}
+      <button className={actionStyles.button} onClick={() => { setSelectionMode(value => !value); setSelectedIds([]); }}>{selectionMode ? "退出多选" : "批量选择"}</button>
+      <button className={`${actionStyles.button} ${styles.quickSelectAll}`} disabled={loading || !filtered.length} title={`选择当前筛选结果，包含其他分页，每批最多 ${MAX_PHOTO_SELECTION} 张`} onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? `全选前 ${MAX_PHOTO_SELECTION} 张` : "快捷全选"}</button>
+      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择</span></div><div className={styles.selectionActions}><button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={`${actionStyles.button} ${styles.bulkCleanup}`} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>批量加入待整理{selectedPhotos.length ? ` · ${selectedPhotos.length} 张` : ""}</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除选中的 {selectedPhotos.length} 张</button></div></>}
     </section>
-    <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div><button disabled={currentPage === 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button></div>}</section>
-    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} disabled={releasingAsset !== null} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => { setBulkDeleteItems([]); setBatchLocalProgress(null); setDeleteJob(null); setDeleteMode("local"); setDeleteItem(item); void refreshReleaseCatalog(); }} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    <section ref={libraryHeadRef} className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div ref={paginationRef}><button disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页</button></div>}</section>
+    {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button></nav>}
+    {visible.length ? <section className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</section> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
     <footer><span>图片来源来自你授权的本地文件夹；删除前需单独确认</span><a href="/?library=video">返回视频库 →</a></footer>
     {!dialogItems.length && deleteJob?.status === "failed" && <aside className={styles.deleteProgress}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></aside>}
     {dialogItems.length === 0 && deleteJob && deleteJob.status !== "idle" && <aside className={styles.deleteToast}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} />{deleteJob.status !== "running" && <button onClick={() => setDeleteJob(null)} aria-label="关闭删除结果">关闭</button>}</aside>}
-    {dialogItems.length > 0 && <dialog ref={deleteDialogRef} className={styles.deleteDialog} aria-labelledby="delete-photo-title" onCancel={event => { if (releasingAsset !== null) event.preventDefault(); else closeDeleteDialog(); }}>
-      <header className={styles.deleteHeader}><h2 id="delete-photo-title">{bulkDeleteItems.length ? `批量删除 ${dialogItems.length} 张图片` : "删除这张图片"}</h2><p>确认图片与删除范围，再继续复核。</p></header><div className={styles.deleteBody}><ul className={styles.deleteItemList}>{dialogItems.map(item => <li key={item.id}>{item.name}{item.liveVideo ? " · 包含配对实况视频" : ""}</li>)}</ul>{bulkDeleteItems.length > 0 && <p>精确匹配 {dialogCloudSelection.matched.length} 张图片，对应 {dialogCloudSelection.assets.length} 个云端项目；云端操作跳过 {dialogCloudSelection.skipped.length} 张未匹配图片。失败及跳过的图片保留选择。</p>}
+    {dialogItems.length > 0 && <dialog ref={deleteDialogRef} className={`${styles.deleteDialog} ${deleteMinimized ? styles.deleteMini : ""}`} aria-modal={!deleteMinimized} aria-labelledby="delete-photo-title" onCancel={event => { event.preventDefault(); if (deleteConfirmation) resolveDeleteConfirmation(false); else if (releasingAsset !== null) minimizeDeleteWindow(); else closeDeleteDialog(); }}>
+      <header className={styles.deleteHeader}><div><h2 id="delete-photo-title">{bulkDeleteItems.length ? `批量删除 ${dialogItems.length} 张图片` : "删除这张图片"}</h2><p>{deleteConfirmation ? "等待确认 · 尚未执行此次删除" : deleteFinished ? "操作已结束，可查看结果后关闭" : releasingAsset !== null ? "任务继续进行，可缩小后浏览图片库" : "确认图片与删除范围，再继续复核"}</p></div><button className={actionStyles.button} onClick={() => { if (deleteMinimized) setDeleteMinimized(false); else minimizeDeleteWindow(); }} aria-label={deleteMinimized ? "恢复删除大窗" : "缩小删除窗口"}>{deleteMinimized ? "恢复" : "缩小"}</button></header>
+      <div className={styles.deleteBody}>
+      {deleteConfirmation && <section className={styles.confirmationPanel} role="alert" aria-labelledby="delete-confirm-title"><span>!</span><h3 id="delete-confirm-title">确认删除</h3><p>{deleteConfirmation}</p><small>只有点击下方“确认删除”才会继续执行。</small></section>}
+      {!deleteFinished && <div className={styles.deleteSetup}><ul className={styles.deleteItemList}>{dialogItems.map(item => <li key={item.id}>{item.name}{item.liveVideo ? " · 包含配对实况视频" : ""}</li>)}</ul>{bulkDeleteItems.length > 0 && <p>精确匹配 {dialogCloudSelection.matched.length} 张图片，对应 {dialogCloudSelection.assets.length} 个云端项目；云端操作跳过 {dialogCloudSelection.skipped.length} 张未匹配图片。失败及跳过的图片保留选择。</p>}
       <fieldset disabled={releasingAsset !== null}>
         <legend>选择删除范围</legend>
         <label htmlFor="photo-delete-local" aria-label="仅删除本地"><input id="photo-delete-local" type="radio" name="photo-delete-mode" checked={deleteMode === "local"} onChange={() => setDeleteMode("local")} /><span><strong>仅删除本地</strong><small>移入 Windows 回收站，保留 iCloud 内容。</small></span></label>
@@ -908,10 +990,14 @@ function PhotoLibrary({ username }: { username: string }) {
       </fieldset>
       {releaseCatalogLoading ? <p>正在刷新云端释放计划…</p> : releaseCatalogError ? <p>{releaseCatalogError}</p> : !dialogCloudSelection.assets.length && <p>{releaseCatalog?.releasePlan?.status === "confirmed" ? "释放计划已确认，但此图片未能唯一匹配计划中的云端项目。请确认图片来源和本地文件大小，或重新生成释放计划。" : "请到 iCloud 备份中心复核并确认释放计划后，再操作 iCloud。"}</p>}
       <div className={styles.sessionControls}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></div>
-      {batchLocalProgress && <p role="status">{batchLocalProgress.message}<br />已校验 {batchLocalProgress.checked}/{batchLocalProgress.total} 张 · 已回收 {batchLocalProgress.recycled} 张</p>}
+      </div>}
+      {deleteMinimized && !deleteConfirmation && !deleteFinished && releasingAsset === null && <p>已暂存 {dialogItems.length} 张图片 · {deleteMode === "local" ? "仅删除本地" : deleteMode === "icloud" ? "仅删除 iCloud" : "两边都删除"}。可恢复大窗调整范围，或点击“继续”开始复核。</p>}
+      {batchLocalProgress && <section className={styles.localDeleteProgress} role="status"><strong>{deleteFinished ? "本地回收已结束" : "正在校验 / 回收本地"}</strong><p>{batchLocalProgress.message}</p><progress max={batchLocalProgress.total} value={batchLocalProgress.checked} aria-label="本地校验进度" /><span>已校验 {batchLocalProgress.checked}/{batchLocalProgress.total} 张 · 已回收 {batchLocalProgress.recycled} 张</span></section>}
       {deleteJob && deleteJob.status !== "idle" && <section className={styles.deleteProgress}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} /></section>}
-      </div><div className={styles.deleteActions}><button className={actionStyles.button} disabled={releasingAsset !== null} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode !== "local" && (!cloudDeleteAvailable))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : "继续"}</button></div>
+      {error && <p className={styles.taskError} role="alert">{error}</p>}
+      {deleteFinished && notice && <p className={styles.taskResult} role="status">{notice}</p>}
+      </div><div className={styles.deleteActions}>{deleteConfirmation ? <><button ref={confirmationCancelRef} className={actionStyles.button} onClick={() => resolveDeleteConfirmation(false)}>暂不删除</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} onClick={() => resolveDeleteConfirmation(true)}>确认删除</button></> : deleteFinished ? <button className={actionStyles.button} onClick={closeDeleteDialog}>关闭</button> : <><button className={actionStyles.button} disabled={releasingAsset !== null || appleSessionBusy} onClick={closeDeleteDialog}>取消</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={appleSessionBusy || releasingAsset !== null || (deleteMode !== "local" && (!cloudDeleteAvailable))} onClick={() => void deleteSelectedPhoto()}>{releasingAsset !== null ? deleteMode === "local" ? "正在校验/回收本地…" : deleteJob?.phase === "preview" ? "正在核对云端…" : deleteJob?.phase === "recycling" ? "正在回收本地…" : "等待云端结果…" : "继续"}</button></>}</div>
     </dialog>}
-    {viewer && <PhotoViewer key={viewer.id} item={viewer} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onFavorite={() => toggleMark(viewer.id, "liked")} onCleanup={() => toggleMark(viewer.id, "cleanup")} onDelete={mode => { setBulkDeleteItems([]); setBatchLocalProgress(null); setDeleteJob(null); setDeleteMode(mode); setDeleteItem(viewer); void refreshReleaseCatalog(); }} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
+    {viewer && <PhotoViewer key={`${viewer.id}:${viewer.liveVideo?.path || ""}`} item={viewer} taskNotice={releasingAsset !== null && dialogItems.some(item => item.id === viewer.id) ? deleteMode === "icloud" ? "当前照片在云端删除任务中，本地图片仍可继续浏览。" : "当前照片在删除任务范围内；本地回收成功后将自动切换到其他照片。" : ""} previous={() => moveViewer(-1)} next={() => moveViewer(1)} onClose={() => setViewerId(null)} onFavorite={() => toggleMark(viewer.id, "liked")} onCleanup={() => toggleMark(viewer.id, "cleanup")} onDelete={mode => openDeleteDialog([viewer], mode)} cloudAvailable={Boolean(cloudAssetFor(viewer)) && !releaseCatalogError} cloudLoading={releaseCatalogLoading} releaseBusy={releasingAsset !== null} cloudMessage={releaseCatalogError || (releaseCatalog?.releasePlan?.status === "confirmed" ? "此图片未能唯一匹配已确认计划中的云端项目。" : "请先到 iCloud 备份中心生成计划并启用逐项删除。")} />}
   </main>;
 }

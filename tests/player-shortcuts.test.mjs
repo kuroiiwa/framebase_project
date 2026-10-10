@@ -35,3 +35,40 @@ test('typing, composing and browser modifier shortcuts never control playback', 
   assert.equal(press(' ', { isComposing: true }).event.prevented, undefined);
   assert.equal(video.paused, true); assert.equal(video.currentTime, 5);
 });
+
+test('fullscreen uses the stage so the custom playback controls remain available', async () => {
+  const { video, press } = fixture();
+  let entered = 0;
+  video.closest = selector => {
+    assert.equal(selector, '.player-stage');
+    return { requestFullscreen() { entered++; return Promise.resolve(); } };
+  };
+  press('f');
+  assert.equal(entered, 1);
+  press('f', { repeat: true });
+  assert.equal(entered, 1);
+  let exited = 0;
+  document.fullscreenElement = {};
+  document.exitFullscreen = () => { exited++; return Promise.resolve(); };
+  try {
+    press('F');
+    assert.equal(exited, 1);
+    assert.equal(press('Escape').closed, false);
+    assert.equal(exited, 2);
+  } finally {
+    document.fullscreenElement = null;
+  }
+});
+
+test('volume slider arrow keys retain native range behavior', () => {
+  const { video, press } = fixture();
+  const target = new HTMLElement();
+  target.closest = selector => selector === '[data-player-volume]' ? target : null;
+  for (const key of ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) {
+    assert.equal(press(key, { target }).event.prevented, undefined);
+  }
+  assert.equal(video.currentTime, 5);
+  assert.equal(video.volume, .98);
+  press('M', { target });
+  assert.equal(video.muted, false);
+});
