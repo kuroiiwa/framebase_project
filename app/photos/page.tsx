@@ -20,7 +20,7 @@ import type { HeicPreviewOptions } from "./heic-codec";
 import { schedulePreview, setPreviewScrolling, deferBackgroundPreviews, type PreviewQueue } from "./preview-queue";
 import { findPhotoCloudAsset } from "./cloud-match";
 import { readAutoReleasePreference, saveAutoReleasePreference } from "./release-preferences";
-import { photoTimeKeys, timePeriodLabel, matchesPhotoTime, type TimeGranularity } from "./time-filter";
+import { photoTimeKeys, photoDate, timePeriodLabel, matchesPhotoTime, type TimeGranularity } from "./time-filter";
 import { CloudDeleteProgress, waitForCloudDelete, type CloudDeleteJob } from "../icloud-delete-progress";
 
 type FsPermission = "granted" | "denied" | "prompt";
@@ -55,7 +55,7 @@ type ScanCounts = { photos: number; files: number; folders: number; currentPath:
 type PhotoScan = ScanCounts & { sourceId: string; sourceName: string; phase: "permission" | "scanning" | "saving" | "completed" | "failed"; startedAt: number; finishedAt?: number; message?: string };
 type PhotoMarks = Record<string, { liked?: boolean; cleanup?: boolean }>;
 type Tab = "all" | "live" | "liked" | "cleanup";
-type Sort = "newest" | "oldest" | "largest" | "smallest" | "name";
+type Sort = "newest" | "oldest" | "largest" | "smallest" | "name" | "modified";
 type PreviewRatio = "standard" | "phone";
 type PhotoPreferences = { compact: boolean; previewRatio: PreviewRatio; sort: Sort };
 type IcloudAsset = { id: string; library: string; name: string; created: string; mediaType: "photo" | "video"; originalBytes: number; mainBytes: number; livePhotoBytes: number; livePhoto: boolean; localFiles: string[] };
@@ -563,6 +563,16 @@ function PhotoLibrary({ username }: { username: string }) {
   const [releaseCatalogError, setReleaseCatalogError] = useState("");
   const [appleSessionBusy, setAppleSessionBusy] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
+  const [sourceManagerOpen, setSourceManagerOpen] = useState(false);
+  const filterToolbarRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const closePanels = () => filterToolbarRef.current?.querySelectorAll("details[open]").forEach(panel => panel.removeAttribute("open"));
+    const onPointerDown = (event: PointerEvent) => { if (!filterToolbarRef.current?.contains(event.target as Node)) closePanels(); };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") closePanels(); };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => { document.removeEventListener("pointerdown", onPointerDown); document.removeEventListener("keydown", onKeyDown); };
+  }, []);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bulkDeleteItems, setBulkDeleteItems] = useState<PhotoItem[]>([]);
   const [autoReleaseAfterReview, setAutoReleaseAfterReview] = useState(false);
@@ -603,7 +613,7 @@ function PhotoLibrary({ username }: { username: string }) {
     queueMicrotask(() => {
       if (typeof saved.compact === "boolean") setCompact(saved.compact);
       if (saved.previewRatio === "standard" || saved.previewRatio === "phone") setPreviewRatio(saved.previewRatio);
-      if (["newest", "oldest", "largest", "smallest", "name"].includes(saved.sort || "")) setSort(saved.sort as Sort);
+      if (["newest", "oldest", "largest", "smallest", "name", "modified"].includes(saved.sort || "")) setSort(saved.sort as Sort);
       setPreferencesReady(true);
     });
   }, []);
@@ -1004,7 +1014,11 @@ function PhotoLibrary({ username }: { username: string }) {
       if (tab === "cleanup" && !item.cleanup) return false;
       return !normalized || `${item.name} ${item.path}`.toLocaleLowerCase("zh-CN").includes(normalized);
     });
-    return result.sort((left, right) => sort === "oldest" ? left.modified - right.modified : sort === "largest" ? right.size - left.size : sort === "smallest" ? left.size - right.size : sort === "name" ? left.name.localeCompare(right.name, "zh-CN") : right.modified - left.modified);
+    const dates = new Map(result.map(item => [item.id, photoDate(item)]));
+    return result.sort((left, right) => {
+      const difference = sort === "oldest" ? dates.get(left.id)! - dates.get(right.id)! : sort === "largest" ? right.size - left.size : sort === "smallest" ? left.size - right.size : sort === "modified" ? right.modified - left.modified : sort === "name" ? 0 : dates.get(right.id)! - dates.get(left.id)!;
+      return difference || left.name.localeCompare(right.name, "zh-CN", { numeric: true }) || left.path.localeCompare(right.path);
+    });
   }, [formatFilter, photos, photoTimes, query, selectedTimePeriods, sort, sourceFilter, tab, timeGranularity]);
   useLayoutEffect(() => { libraryStateRef.current = { photos, sources, filtered }; }, [photos, sources, filtered]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -1089,13 +1103,12 @@ function PhotoLibrary({ username }: { username: string }) {
     </header>
     {error && <div className={styles.error} role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
     {notice && <div className={styles.notice} role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
-    <section className={styles.hero}><div><p>独立图片库</p><h1>图片浏览与整理</h1><span>图片来源、索引和标记与原视频库彻底隔离；移除来源不会删除文件。</span></div><button onClick={() => void chooseFolder()} disabled={loading || releasingAsset !== null}>{loading ? `正在扫描 ${photoScan?.photos || 0} 张…` : "添加图片文件夹"}</button></section>
-    {icloudBackupDirectory && <aside className={styles.icloudHint}><div><strong>iCloud 照片与视频备份目录</strong><span>{icloudBackupDirectory}</span></div><p>{releaseCatalog?.releaseHistory.movedCount ? `云端已移入“最近删除” ${releaseCatalog.releaseHistory.movedCount} 个项目，预计 ${formatBytes(releaseCatalog.releaseHistory.movedBytes)}；本地已回收 ${releaseCatalog.releaseHistory.recycledFileCount || 0} 个文件，共 ${formatBytes(releaseCatalog.releaseHistory.recycledBytes || 0)}。` : "可将这个目录同时添加到图片库和视频库；两套标记和索引互不影响。"}</p></aside>}
+    <section className={styles.hero}><div><h1>图片库</h1><div className={styles.libraryStats}><span>图片 <strong>{photos.length.toLocaleString()}</strong></span><span>来源 <strong>{sources.length}</strong></span><span>收藏 <strong>{photos.filter(item => item.liked).length}</strong></span><span>占用 <strong>{formatBytes(totalSize)}</strong></span></div></div><div className={styles.heroActions}><button className={`${actionStyles.button} ${styles.addFolder}`} onClick={() => void chooseFolder()} disabled={loading || releasingAsset !== null}>{loading ? `正在扫描 ${photoScan?.photos || 0} 张…` : "+ 添加文件夹"}</button><button className={actionStyles.button} aria-expanded={sourceManagerOpen} aria-controls="photo-source-manager" onClick={() => setSourceManagerOpen(value => !value)}>管理来源</button></div></section>
+    {icloudBackupDirectory && <details className={styles.icloudHint}><summary><strong>☁ iCloud 备份</strong><span title={icloudBackupDirectory}>{icloudBackupDirectory}</span><small>详情</small></summary><div className={styles.icloudDetails}><strong>iCloud 照片与视频备份目录</strong><p>{releaseCatalog?.releaseHistory.movedCount ? `云端已移入“最近删除” ${releaseCatalog.releaseHistory.movedCount} 个项目，预计 ${formatBytes(releaseCatalog.releaseHistory.movedBytes)}；本地已回收 ${releaseCatalog.releaseHistory.recycledFileCount || 0} 个文件，共 ${formatBytes(releaseCatalog.releaseHistory.recycledBytes || 0)}。` : "可将这个目录同时添加到图片库和视频库；两套标记和索引互不影响。"}</p></div></details>}
     {releaseCatalog?.timeline.staleAt && <aside className={styles.timelineStale}><strong>iCloud 统计需要确认</strong><span>{releaseCatalog.timeline.staleReason || "云端内容已变化，请到 iCloud 备份中心重新统计。"}</span><a href="/icloud">立即重新统计</a></aside>}
-    <section className={styles.stats}><div><span>图片</span><strong>{photos.length}</strong></div><div><span>来源</span><strong>{sources.length}</strong></div><div><span>收藏</span><strong>{photos.filter(item => item.liked).length}</strong></div><div><span>占用</span><strong>{formatBytes(totalSize)}</strong></div></section>
-    <section className={styles.sources} aria-label="图片来源">
+    {sourceManagerOpen && <section className={styles.sourceManager} id="photo-source-manager" aria-label="管理图片来源"><header><div><strong>图片来源</strong><p>图片来源、索引和标记与原视频库彻底隔离；移除来源不会删除文件。</p></div><button className={actionStyles.button} onClick={() => setSourceManagerOpen(false)}>收起</button></header><div className={styles.sources} aria-label="图片来源">
       {sources.length === 0 && ready ? <p>尚未添加图片文件夹。这里不会读取视频库已经选择的目录。</p> : sources.map(source => <article key={source.id}><button onClick={() => { setSourceFilter(source.id); setPage(1); }} className={sourceFilter === source.id ? styles.activeSource : ""}><strong>{source.name}</strong><span>{source.photoCount} 张 · {formatBytes(source.totalSize)}</span></button><button onClick={() => void loadSource(source)} disabled={loading || releasingAsset !== null} aria-busy={loading && photoScan?.sourceId === source.id}>{loading && photoScan?.sourceId === source.id ? `扫描中 · ${photoScan.photos} 张` : "重扫"}</button><button onClick={() => void removeSource(source)} disabled={loading || releasingAsset !== null}>移除</button></article>)}
-    </section>
+    </div></section>}
     {photoScan && <section className={`${styles.scanProgress} ${photoScan.phase === "failed" ? styles.scanFailed : ""}`} role="status" aria-live="polite" aria-label="图片扫描进度">
       <div><strong>{photoScan.phase === "permission" ? "正在检查文件夹读取权限" : photoScan.phase === "saving" ? "正在保存图片索引" : photoScan.phase === "completed" ? "扫描完成" : photoScan.phase === "failed" ? "扫描失败" : "正在扫描图片"} · {photoScan.sourceName}</strong><span>已发现 {photoScan.files} 个文件 · 已读取 {photoScan.photos} 张图片 · 已遍历 {photoScan.folders} 个文件夹 · 用时 {scanElapsed} 秒</span></div>
       {!loading && <button className={actionStyles.button} aria-label="关闭扫描结果" onClick={() => setPhotoScan(null)}>关闭</button>}
@@ -1103,13 +1116,16 @@ function PhotoLibrary({ username }: { username: string }) {
       {photoScan.currentPath && loading && <small title={photoScan.currentPath}>当前：{photoScan.currentPath}</small>}
       {photoScan.phase === "failed" && <small>{photoScan.message}</small>}
     </section>}
-    <section className={styles.toolbar}>
+    <section className={styles.toolbar} aria-label="图片分类">
       <div><button className={tab === "all" ? styles.active : ""} onClick={() => { setTab("all"); setPage(1); }}>全部</button><button className={tab === "live" ? styles.active : ""} onClick={() => { setTab("live"); setPage(1); }}>实况</button><button className={tab === "liked" ? styles.active : ""} onClick={() => { setTab("liked"); setPage(1); }}>收藏</button><button className={tab === "cleanup" ? styles.active : ""} onClick={() => { setTab("cleanup"); setPage(1); }}>待整理</button></div>
-      <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
     </section>
-    <details className={styles.timeFilter}>
+    <section ref={filterToolbarRef} className={styles.filterToolbar} aria-label="图片筛选与排序">
+      <div className={styles.filterGroup}>
+        <select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select>
+        <select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select>
+    <details name="photo-filter-panels" className={styles.timeFilter}>
       <summary>时间筛选 · {selectedTimePeriods.length ? `已选 ${selectedTimePeriods.length} 个${timeGranularity === "years" ? "年份" : timeGranularity === "quarters" ? "季度" : "月份"}` : "全部时间"}</summary>
-      <div className={styles.timeFilterControls}>
+      <div className={styles.filterPopover}><div className={styles.timeFilterControls}>
         <label>按时间范围筛选 <select aria-label="时间筛选粒度" value={timeGranularity} onChange={event => { setTimeGranularity(event.target.value as TimeGranularity); setSelectedTimePeriods([]); setPage(1); }}><option value="years">按年</option><option value="quarters">按季度</option><option value="months">按月</option></select></label>
         <button className={actionStyles.button} disabled={!selectedTimePeriods.length} onClick={() => { setSelectedTimePeriods([]); setPage(1); }}>全部时间</button>
         <span>可选择多个范围，与来源、格式和分类一起筛选。</span>
@@ -1119,15 +1135,34 @@ function PhotoLibrary({ username }: { username: string }) {
         {!timePeriods.length && <span>添加图片后可选择时间范围。</span>}
       </div>
       <p>优先使用备份目录中的年、月；其他图片使用文件修改时间。范围数量为整个图片库的图片数。</p>
-    </details>
-    <section className={styles.selectionToolbar} aria-label="批量选择图片">
+      </div></details>
+
+      </div>
+      <div className={styles.viewGroup}>
+        <select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">图片日期：新 → 旧</option><option value="oldest">图片日期：旧 → 新</option><option value="largest">大小：大 → 小</option><option value="smallest">大小：小 → 大</option><option value="name">按名称</option><option value="modified">修改时间：新 → 旧</option></select>
+        <details name="photo-filter-panels" className={styles.viewSettings}><summary>⚙ 视图设置</summary><div className={styles.viewPopover}><label>预览比例<select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select></label><label>显示密度<select value={compact ? "compact" : "comfortable"} onChange={event => setCompact(event.target.value === "compact")} aria-label="显示密度"><option value="comfortable">舒适视图</option><option value="compact">紧凑视图</option></select></label></div></details>
+      </div>
+    </section>
+    {(sourceFilter !== "all" || formatFilter !== "all" || selectedTimePeriods.length > 0 || query.trim()) && <div className={styles.filterChips} aria-label="当前筛选条件">
+      {sourceFilter !== "all" && <button onClick={() => { setSourceFilter("all"); setPage(1); }} aria-label="清除来源筛选">{sources.find(source => source.id === sourceFilter)?.name} ×</button>}
+      {formatFilter !== "all" && <button onClick={() => { setFormatFilter("all"); setPage(1); }} aria-label="清除格式筛选">{formatFilter.toUpperCase()} ×</button>}
+      {selectedTimePeriods.map(period => <button key={period} onClick={() => { setSelectedTimePeriods(current => current.filter(value => value !== period)); setPage(1); }} aria-label={"取消筛选 " + timePeriodLabel(period, timeGranularity)}>{timePeriodLabel(period, timeGranularity)} ×</button>)}
+      {query.trim() && <button onClick={() => { setQuery(""); setPage(1); }} aria-label="清除搜索">搜索：{query.trim()} ×</button>}
+      <button className={styles.clearFilters} onClick={() => { setSourceFilter("all"); setFormatFilter("all"); setSelectedTimePeriods([]); setQuery(""); setPage(1); }}>清除筛选</button>
+    </div>}
+    <section className={styles.selectionToolbar} data-selecting={selectionMode} aria-label="批量选择图片">
       <button className={actionStyles.button} onClick={toggleSelectionMode}>{selectionMode ? "退出多选" : "批量选择"}</button>
-      <button className={`${actionStyles.button} ${styles.quickSelectAll}`} disabled={loading || !filtered.length} title={`选择当前筛选结果，包含其他分页，每批最多 ${MAX_PHOTO_SELECTION} 张`} onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? `全选前 ${MAX_PHOTO_SELECTION} 张` : "快捷全选"}</button>
-      {selectionMode && <><div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 可跨页选择 · 拖动框选</span></div><div className={styles.selectionActions}><button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button><button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空选择</button><button className={`${actionStyles.button} ${styles.bulkCleanup}`} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>批量加入待整理{selectedPhotos.length ? ` · ${selectedPhotos.length} 张` : ""}</button><button className={`${actionStyles.button} ${actionStyles.dangerButton}`} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除选中的 {selectedPhotos.length} 张</button></div></>}
+      {selectionMode && <div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 支持跨页与拖动框选</span></div>}
+      <div className={styles.selectionTools}>
+        {selectionMode && <button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button>}
+        <button className={actionStyles.button} disabled={loading || !filtered.length} title="选择当前筛选结果，可跨页选择" onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? '全选前 ' + MAX_PHOTO_SELECTION + ' 张' : selectionMode ? '全选筛选结果' : '快捷全选'}</button>
+        {selectionMode && <button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空</button>}
+      </div>
+      {selectionMode && <div className={styles.selectionActions}><button className={actionStyles.button + ' ' + styles.bulkCleanup} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>加入待整理</button><button className={actionStyles.button + ' ' + actionStyles.dangerButton} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除 {selectedPhotos.length} 张</button></div>}
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div ref={paginationRef}><button disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></div>}</section>
     {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button><button className={`${actionStyles.button} ${styles.floatingSelect}`} aria-pressed={selectionMode} onClick={toggleSelectionMode}>{selectionMode ? "退出多选" : "进入多选"}</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></nav>}
-    {visible.length ? <PhotoSelectionGrid enabled={selectionMode} selectedIds={selectedIds} limit={MAX_PHOTO_SELECTION} onChange={setSelectedIds} className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id} data-photo-id={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} />{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}{item.cleanup && <span className={styles.cleanupBadge} title="已加入待整理">✓ 待整理</span>}<PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={`${item.sourceName} · ${item.extension.toUpperCase()} · ${formatBytes(item.size)} · ${formatDate(item.modified)}`}><span>{item.sourceName}</span> · {item.extension.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified)}</p></div></article>; })}</PhotoSelectionGrid> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
+    {visible.length ? <PhotoSelectionGrid enabled={selectionMode} selectedIds={selectedIds} limit={MAX_PHOTO_SELECTION} onChange={setSelectedIds} className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id} data-photo-id={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} /><div className={styles.cardBadges}>{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}{item.cleanup && <span className={styles.cleanupBadge} title="已加入待整理">✓ 待整理</span>}</div><PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={item.sourceName + " · " + item.extension.toUpperCase() + " · 文件修改时间：" + formatDate(item.modified)}>{photoDate(item) ? new Date(photoDate(item)).toLocaleDateString("zh-CN") : "时间未知"} · {formatBytes(item.size)}</p></div></article>; })}</PhotoSelectionGrid> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
     <footer><span>图片来源来自你授权的本地文件夹；批量云端释放可选择复核通过后自动执行</span><a href="/?library=video">返回视频库 →</a></footer>
     {!dialogItems.length && deleteJob?.status === "failed" && <aside className={styles.deleteProgress}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></aside>}
     {dialogItems.length === 0 && deleteJob && deleteJob.status !== "idle" && <aside className={styles.deleteToast}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} />{deleteJob.status !== "running" && <button onClick={() => setDeleteJob(null)} aria-label="关闭删除结果">关闭</button>}</aside>}

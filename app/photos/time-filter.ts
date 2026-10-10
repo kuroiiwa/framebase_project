@@ -1,6 +1,17 @@
 export type TimeGranularity = "years" | "quarters" | "months";
 type DatedPhoto = { path: string; sourceName: string; modified: number };
 
+export function photoDate(item: DatedPhoto): number {
+  const path = `${item.sourceName}/${item.path}`.replaceAll("\\", "/");
+  const match = /(?:^|\/)((?:19|20)\d{2})\/(0?[1-9]|1[0-2])(?:\/(0?[1-9]|[12]\d|3[01]))?(?=\/)/.exec(path);
+  if (match) {
+    const year = Number(match[1]); const month = Number(match[2]); const day = Number(match[3] || 1);
+    const date = new Date(year, month - 1, day);
+    if (date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day) return date.getTime();
+  }
+  return Number.isFinite(item.modified) && item.modified > 0 ? item.modified : 0;
+}
+
 export function photoTimeKeys(item: DatedPhoto): Record<TimeGranularity, string> | null {
   // Backup directory dates survive copying and match the iCloud backup ranges.
   const path = `${item.sourceName}/${item.path}`.replaceAll("\\", "/");

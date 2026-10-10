@@ -3,7 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
-import { photoTimeKeys, timePeriodLabel, matchesPhotoTime } from "../app/photos/time-filter.ts";
+import { photoTimeKeys, photoDate, timePeriodLabel, matchesPhotoTime } from "../app/photos/time-filter.ts";
 
 const modified = new Date(2026, 9, 10, 12).getTime();
 
@@ -57,8 +57,17 @@ test("actual photo library combines time selection with source, format and favor
   const compiled = ts.transpileModule(`const filter = ${filter};`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   const result = vm.runInNewContext(`${compiled}\nfilter();`, {
     photos, photoTimes: new Map(photos.map(item => [item.id, photoTimeKeys(item)])),
-    matchesPhotoTime, timeGranularity: 'months', selectedTimePeriods: ['2024-03'],
+    matchesPhotoTime, photoDate, timeGranularity: 'months', selectedTimePeriods: ['2024-03'],
     sourceFilter: 'backup', formatFilter: 'jpg', tab: 'liked', query: '', sort: 'newest',
   });
   assert.deepEqual(Array.from(result, item => item.id), ['match']);
+});
+
+test('photo date sorting survives copied timestamps and validates backup days', () => {
+  assert.equal(photoDate({ sourceName: 'backup', path: '2024/03/31/one.jpg', modified }), new Date(2024, 2, 31).getTime());
+  assert.equal(photoDate({ sourceName: '2024', path: '02/29/one.jpg', modified }), new Date(2024, 1, 29).getTime());
+  assert.equal(photoDate({ sourceName: 'backup', path: '2023/02/29/one.jpg', modified }), modified);
+  assert.equal(photoDate({ sourceName: 'backup', path: '2024/03/one.jpg', modified }), new Date(2024, 2, 1).getTime());
+  assert.equal(photoDate({ sourceName: 'local', path: 'one.jpg', modified }), modified);
+  assert.equal(photoDate({ sourceName: 'local', path: 'one.jpg', modified: NaN }), 0);
 });
