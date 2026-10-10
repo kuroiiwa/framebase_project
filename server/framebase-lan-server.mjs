@@ -14,6 +14,8 @@ import { createIcloudPdProvider } from "./icloud-providers/icloudpd-provider.mjs
 import { createRecycleBin } from "./framebase-recycle-bin.mjs";
 import { preparePhotoRecycle, preparePhotoBatchRecycle } from "./framebase-photo-recycle.mjs";
 import { createReleaseDeleteJobs } from "./framebase-release-jobs.mjs";
+import { runBackupWithRetries } from "./framebase-backup-retry.mjs";
+import { createIcloudOperationGuard, icloudOperationKind } from "./framebase-icloud-operation-guard.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeStartedAt = new Date().toISOString();
@@ -76,6 +78,10 @@ const icloudProvider = createIcloudPdProvider({
 const icloudBackupUsers = new Set();
 const releaseDeleteJobs = createReleaseDeleteJobs({ icloud, provider: icloudProvider, recycleBin, debugLogs });
 const icloudFullBackupJobs = new Map();
+const icloudOperationGuard = createIcloudOperationGuard({
+  backupRunning: username => icloudBackupUsers.has(username) || icloudFullBackupJobs.has(username),
+  releaseRunning: username => releaseDeleteJobs.read(username).status === "running" || icloud.readReleaseProgress(username).status === "running",
+});
 const icloudTimelineJobs = new Map();
 const mobileSessions = new Map();
 const publicPort = Number(process.env.FRAMEBASE_LAN_PORT || 3000);
@@ -471,6 +477,15 @@ async function handleIcloud(request, response, url) {
   const current = requirePc(request, response);
   if (!current) return;
   if (request.method === "POST" && request.headers.origin !== `http://${request.headers.host}`) return json(response, 403, { error: "请从 Framebase 页面发起操作。" });
+  const kind = icloudOperationKind(request.method, url.pathname);
+  if (!kind) return handleIcloudOperation(request, response, url, current);
+  const reservation = icloudOperationGuard.acquire(current.username, kind);
+  if (reservation.error) return json(response, 409, { error: reservation.error });
+  try { return await handleIcloudOperation(request, response, url, current); }
+  finally { reservation.release(); }
+}
+
+async function handleIcloudOperation(request, response, url, current) {
   if (request.method === "GET" && url.pathname === "/api/icloud/debug/logs") return json(response, 200, { logs: debugLogs.list(current.username) });
   if (request.method === "GET" && url.pathname.startsWith("/api/icloud/debug/logs/")) {
     const id = url.pathname.slice("/api/icloud/debug/logs/".length);
@@ -618,7 +633,8 @@ async function handleIcloud(request, response, url) {
     icloudFullBackupJobs.set(current.username, job);
     icloudBackupUsers.add(current.username);
     const startedAt = url.pathname.endsWith("/resume") && previousState.startedAt ? previousState.startedAt : new Date().toISOString();
-    const initial = await icloud.writeFullBackup(current.username, {
+    let initial;
+    try { initial = await icloud.writeFullBackup(current.username, {
       status: "planning", phase: "planning", message: previousManifest.files.length ? "正在检查增量变化并准备继续…" : "正在读取完整 iCloud 图库清单…",
       startedAt, completedAt: null, currentLibrary: null, currentRange: resumingExisting ? previousState.currentRange : null,
       rangeIndex: resumingExisting ? previousState.rangeIndex : 0, rangeCount: ranges.length || 1,
@@ -630,48 +646,65 @@ async function handleIcloud(request, response, url) {
       skipped: resumingExisting ? previousState.skipped : 0, failed: 0, photoCount: resumingExisting ? previousState.photoCount : 0,
       videoCount: resumingExisting ? previousState.videoCount : 0, verifiedBytes: resumingExisting ? previousState.verifiedBytes : 0,
       ranges,
-    });
+    }); } catch (error) {
+      icloudFullBackupJobs.delete(current.username);
+      icloudBackupUsers.delete(current.username);
+      throw error;
+    }
     void (async () => {
       try {
-        const result = await icloudProvider.backupAll({
-          ...context, jobKey: current.username, previousFiles: previousManifest.files, ranges,
-          initialCompletedRanges, signal: controller.signal,
-          onProgress: update => icloud.writeFullBackup(current.username, resumingExisting ? {
-            ...update,
-            planned: Math.max(previousState.planned, Number(update.planned) || 0),
-            downloaded: Math.max(previousState.downloaded, Number(update.downloaded) || 0),
-            plannedPhotoCount: Math.max(previousState.plannedPhotoCount, Number(update.plannedPhotoCount) || 0),
-            plannedVideoCount: Math.max(previousState.plannedVideoCount, Number(update.plannedVideoCount) || 0),
-            syncedPhotoCount: Math.max(previousState.syncedPhotoCount, Number(update.syncedPhotoCount) || 0),
-            syncedVideoCount: Math.max(previousState.syncedVideoCount, Number(update.syncedVideoCount) || 0),
-            downloadedBytes: Math.max(previousState.downloadedBytes, Number(update.downloadedBytes) || 0),
-            verified: Math.max(previousState.verified, Number(update.verified) || 0),
-            skipped: Math.max(previousState.skipped, Number(update.skipped) || 0),
-            verifiedBytes: Math.max(previousState.verifiedBytes, Number(update.verifiedBytes) || 0),
-          } : update),
-          onRangeComplete: async update => {
-            const savedManifest = update.files.length ? await icloud.writeFullManifest(current.username, update.files) : await icloud.readFullManifest(current.username);
-            await icloud.recordCompletedRanges(current.username, ranges.filter(range => update.completedRanges.includes(range.key)));
-            await icloud.writeFullBackup(current.username, { completedRanges: update.completedRanges, manifestFileCount: savedManifest.files.length });
+        const result = await runBackupWithRetries({
+          signal: controller.signal,
+          onRetry: ({ retry, waitMs, result }) => icloud.writeFullBackup(current.username, { status: "planning", phase: "retrying", transferRateBps: 0, message: `${result.message} ${waitMs / 1000} 秒后自动重试（${retry}/2），保留已下载文件并跳过已完成范围。` }),
+          run: async attempt => {
+            const checkpoint = attempt ? await icloud.readFullBackup(current.username) : previousState;
+            const manifest = attempt ? await icloud.readFullManifest(current.username) : previousManifest;
+            const preserveProgress = resumingExisting || attempt > 0;
+            const attemptResult = await icloudProvider.backupAll({
+              ...context, jobKey: current.username, previousFiles: manifest.files, ranges,
+              initialCompletedRanges: attempt ? checkpoint.completedRanges : initialCompletedRanges, signal: controller.signal,
+              onProgress: update => icloud.writeFullBackup(current.username, preserveProgress ? {
+                ...update,
+                planned: Math.max(checkpoint.planned, Number(update.planned) || 0),
+                downloaded: Math.max(checkpoint.downloaded, Number(update.downloaded) || 0),
+                plannedPhotoCount: Math.max(checkpoint.plannedPhotoCount, Number(update.plannedPhotoCount) || 0),
+                plannedVideoCount: Math.max(checkpoint.plannedVideoCount, Number(update.plannedVideoCount) || 0),
+                syncedPhotoCount: Math.max(checkpoint.syncedPhotoCount, Number(update.syncedPhotoCount) || 0),
+                syncedVideoCount: Math.max(checkpoint.syncedVideoCount, Number(update.syncedVideoCount) || 0),
+                downloadedBytes: Math.max(checkpoint.downloadedBytes, Number(update.downloadedBytes) || 0),
+                verified: Math.max(checkpoint.verified, Number(update.verified) || 0),
+                skipped: Math.max(checkpoint.skipped, Number(update.skipped) || 0),
+                verifiedBytes: Math.max(checkpoint.verifiedBytes, Number(update.verifiedBytes) || 0),
+              } : update),
+              onRangeComplete: async update => {
+                const savedManifest = update.files.length ? await icloud.writeFullManifest(current.username, update.files) : await icloud.readFullManifest(current.username);
+                await icloud.recordCompletedRanges(current.username, ranges.filter(range => update.completedRanges.includes(range.key)));
+                await icloud.writeFullBackup(current.username, { completedRanges: update.completedRanges, manifestFileCount: savedManifest.files.length });
+              },
+            });
+            if (attemptResult.files?.length) await icloud.writeFullManifest(current.username, attemptResult.files);
+            if (attemptResult.completedRanges) await icloud.writeFullBackup(current.username, { completedRanges: attemptResult.completedRanges });
+            return attemptResult;
           },
         });
         if (result.status === "aborted") {
           await icloud.writeFullBackup(current.username, { status: job.stopAs, phase: job.stopAs, transferRateBps: 0, message: job.stopAs === "cancelled" ? "完整备份已取消；已下载的本地文件会保留。" : result.message });
           return;
         }
-        const savedManifest = result.files?.length ? await icloud.writeFullManifest(current.username, result.files) : previousManifest;
+        const savedManifest = await icloud.readFullManifest(current.username);
+        const latestProgress = await icloud.readFullBackup(current.username);
         const completed = result.status === "completed";
         if (completed) await icloud.recordCompletedRanges(current.username, ranges.filter(range => result.completedRanges?.includes(range.key)));
         await icloud.writeFullBackup(current.username, {
           status: completed ? "completed" : "failed", phase: completed ? "completed" : "failed", message: result.message,
           completedAt: completed ? new Date().toISOString() : null, currentLibrary: null, currentRange: null,
-          rangeIndex: result.completedRanges?.length || 0, rangeCount: ranges.length || 1, completedRanges: result.completedRanges || [],
-          planned: result.planned || 0, downloaded: result.files?.length || 0, verified: result.files?.length || 0,
-          plannedPhotoCount: result.plannedPhotoCount || result.photoCount || 0, plannedVideoCount: result.plannedVideoCount || result.videoCount || 0,
-          syncedPhotoCount: result.photoCount || 0, syncedVideoCount: result.videoCount || 0,
-          downloadedBytes: result.downloadedBytes || result.verifiedBytes || 0, transferRateBps: 0,
-          skipped: result.skipped || 0, failed: result.failed || 0, photoCount: result.photoCount || 0,
-          videoCount: result.videoCount || 0, verifiedBytes: result.verifiedBytes || 0, manifestFileCount: savedManifest.files.length,
+          rangeIndex: (result.completedRanges || latestProgress.completedRanges).length, rangeCount: ranges.length || 1, completedRanges: result.completedRanges || latestProgress.completedRanges,
+          planned: Math.max(latestProgress.planned, result.planned || 0), downloaded: Math.max(latestProgress.downloaded, result.files?.length || 0), verified: Math.max(latestProgress.verified, result.files?.length || 0),
+          plannedPhotoCount: Math.max(latestProgress.plannedPhotoCount, result.plannedPhotoCount || result.photoCount || 0), plannedVideoCount: Math.max(latestProgress.plannedVideoCount, result.plannedVideoCount || result.videoCount || 0),
+          syncedPhotoCount: Math.max(latestProgress.syncedPhotoCount, result.photoCount || 0), syncedVideoCount: Math.max(latestProgress.syncedVideoCount, result.videoCount || 0),
+          downloadedBytes: Math.max(latestProgress.downloadedBytes, result.downloadedBytes || result.verifiedBytes || 0), transferRateBps: 0,
+          skipped: Math.max(latestProgress.skipped, result.skipped || 0), failed: result.failed || 0, photoCount: Math.max(latestProgress.photoCount, result.photoCount || 0),
+          videoCount: Math.max(latestProgress.videoCount, result.videoCount || 0), verifiedBytes: Math.max(latestProgress.verifiedBytes, result.verifiedBytes || 0), manifestFileCount: savedManifest.files.length,
         });
         if (result.status === "needs_auth") await icloud.recordConnectionCheck(current.username, result);
       } catch {

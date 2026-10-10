@@ -469,14 +469,18 @@ test("full backup verifies local files with a bounded two-worker pool", async ()
   const mediaPaths = Array.from({ length: 5 }, (_, index) => join(mediaDirectory, `IMG_${index}.JPG`));
   let activeHashes = 0;
   let peakHashes = 0;
+  let progressDuringHash = false;
+  let savingRange = false;
+  let progressDuringSave = false;
   try {
     await writeFile(executablePath, "test");
     const provider = createIcloudPdProvider({
       executablePath,
+      progressInterval: 10,
       hashFile: async path => {
         activeHashes += 1;
         peakHashes = Math.max(peakHashes, activeHashes);
-        await new Promise(resolve => setTimeout(resolve, 15));
+        await new Promise(resolve => setTimeout(resolve, 35));
         activeHashes -= 1;
         return createHash("sha256").update(path).digest("hex");
       },
@@ -493,11 +497,19 @@ test("full backup verifies local files with a bounded two-worker pool", async ()
     const result = await provider.backupAll({
       jobKey: "alice", appleAccount: "alice@example.com", domain: "cn", sessionDirectory: join(root, "session"), backupDirectory,
       ranges: [{ key: "2025-06", label: "2025 年 6 月", start: "2025-06-01T00:00:00", end: "2025-06-30T23:59:59" }],
-      onProgress: update => progress.push(update),
+      onProgress: update => {
+        progress.push(update);
+        if (update.phase === "verifying" && activeHashes > 0 && update.message.includes("当前文件") && update.message.includes("本批已用")) progressDuringHash = true;
+        if (update.phase === "recording" && savingRange && update.message.includes("已用")) progressDuringSave = true;
+      },
+      onRangeComplete: async () => { savingRange = true; await new Promise(resolve => setTimeout(resolve, 35)); savingRange = false; },
     });
     assert.equal(result.status, "completed");
     assert.equal(result.files.length, 5);
     assert.equal(peakHashes, 2);
+    assert.equal(progressDuringHash, true);
+    assert.equal(progressDuringSave, true);
+    assert.ok(progress.some(item => item.phase === "scanning_local"));
     assert.ok(result.files.every(item => /^[a-f0-9]{64}$/.test(item.sha256)));
     assert.ok(progress.some(item => item.phase === "verifying" && item.message.includes("2 路并行校验")));
   } finally {
@@ -541,6 +553,7 @@ test("full backup reports live transfer rate and photo/video download counts", a
     assert.ok(live.some(item => item.syncedPhotoCount >= 1 && item.downloadedBytes >= 4096));
     assert.ok(live.some(item => item.transferRateBps > 0));
     assert.ok(live.some(item => item.syncedPhotoCount === 1 && item.syncedVideoCount === 1));
+    assert.ok(live.some(item => item.message.includes("等待 iCloud 下载工具") && item.message.includes("尚未开始完整性校验")));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

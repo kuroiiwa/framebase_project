@@ -16,6 +16,7 @@ import { decodeHeicPreview } from "./heic-preview";
 import type { HeicPreviewOptions } from "./heic-codec";
 import { schedulePreview, setPreviewScrolling, type PreviewQueue } from "./preview-queue";
 import { findPhotoCloudAsset } from "./cloud-match";
+import { photoTimeKeys, timePeriodLabel, matchesPhotoTime, type TimeGranularity } from "./time-filter";
 import { CloudDeleteProgress, waitForCloudDelete, type CloudDeleteJob } from "../icloud-delete-progress";
 
 type FsPermission = "granted" | "denied" | "prompt";
@@ -493,6 +494,8 @@ function PhotoLibrary({ username }: { username: string }) {
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [formatFilter, setFormatFilter] = useState("all");
+  const [timeGranularity, setTimeGranularity] = useState<TimeGranularity>("years");
+  const [selectedTimePeriods, setSelectedTimePeriods] = useState<string[]>([]);
   const [tab, setTab] = useState<Tab>("all");
   const [sort, setSort] = useState<Sort>("newest");
   const [compact, setCompact] = useState(false);
@@ -886,18 +889,28 @@ function PhotoLibrary({ username }: { username: string }) {
   }
 
   const formats = useMemo(() => [...new Set(photos.map(item => item.extension))].sort(), [photos]);
+  const photoTimes = useMemo(() => new Map(photos.map(item => [item.id, photoTimeKeys(item)])), [photos]);
+  const timePeriods = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const keys of photoTimes.values()) {
+      const key = keys?.[timeGranularity] || "unknown";
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts].sort(([left], [right]) => left === "unknown" ? 1 : right === "unknown" ? -1 : right.localeCompare(left));
+  }, [photoTimes, timeGranularity]);
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
     const result = photos.filter(item => {
       if (sourceFilter !== "all" && item.sourceId !== sourceFilter) return false;
       if (formatFilter !== "all" && item.extension !== formatFilter) return false;
+      if (!matchesPhotoTime(photoTimes.get(item.id) || null, timeGranularity, selectedTimePeriods)) return false;
       if (tab === "live" && !item.liveVideo) return false;
       if (tab === "liked" && !item.liked) return false;
       if (tab === "cleanup" && !item.cleanup) return false;
       return !normalized || `${item.name} ${item.path}`.toLocaleLowerCase("zh-CN").includes(normalized);
     });
     return result.sort((left, right) => sort === "oldest" ? left.modified - right.modified : sort === "largest" ? right.size - left.size : sort === "smallest" ? left.size - right.size : sort === "name" ? left.name.localeCompare(right.name, "zh-CN") : right.modified - left.modified);
-  }, [formatFilter, photos, query, sort, sourceFilter, tab]);
+  }, [formatFilter, photos, photoTimes, query, selectedTimePeriods, sort, sourceFilter, tab, timeGranularity]);
   useLayoutEffect(() => { libraryStateRef.current = { photos, sources, filtered }; }, [photos, sources, filtered]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
@@ -972,6 +985,19 @@ function PhotoLibrary({ username }: { username: string }) {
       <div><button className={tab === "all" ? styles.active : ""} onClick={() => { setTab("all"); setPage(1); }}>全部</button><button className={tab === "live" ? styles.active : ""} onClick={() => { setTab("live"); setPage(1); }}>实况</button><button className={tab === "liked" ? styles.active : ""} onClick={() => { setTab("liked"); setPage(1); }}>收藏</button><button className={tab === "cleanup" ? styles.active : ""} onClick={() => { setTab("cleanup"); setPage(1); }}>待整理</button></div>
       <div><select value={sourceFilter} onChange={event => { setSourceFilter(event.target.value); setPage(1); }} aria-label="来源"><option value="all">全部来源</option>{sources.map(source => <option value={source.id} key={source.id}>{source.name}</option>)}</select><select value={formatFilter} onChange={event => { setFormatFilter(event.target.value); setPage(1); }} aria-label="格式"><option value="all">全部格式</option>{formats.map(format => <option value={format} key={format}>{format.toUpperCase()}</option>)}</select><select value={sort} onChange={event => { setSort(event.target.value as Sort); setPage(1); }} aria-label="排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="largest">最大优先</option><option value="smallest">最小优先</option><option value="name">按名称</option></select><select value={previewRatio} onChange={event => setPreviewRatio(event.target.value as PreviewRatio)} aria-label="预览比例"><option value="standard">标准比例</option><option value="phone">手机比例 9:16</option></select><button onClick={() => setCompact(value => !value)}>{compact ? "舒适视图" : "紧凑视图"}</button></div>
     </section>
+    <details className={styles.timeFilter}>
+      <summary>时间筛选 · {selectedTimePeriods.length ? `已选 ${selectedTimePeriods.length} 个${timeGranularity === "years" ? "年份" : timeGranularity === "quarters" ? "季度" : "月份"}` : "全部时间"}</summary>
+      <div className={styles.timeFilterControls}>
+        <label>按时间范围筛选 <select aria-label="时间筛选粒度" value={timeGranularity} onChange={event => { setTimeGranularity(event.target.value as TimeGranularity); setSelectedTimePeriods([]); setPage(1); }}><option value="years">按年</option><option value="quarters">按季度</option><option value="months">按月</option></select></label>
+        <button className={actionStyles.button} disabled={!selectedTimePeriods.length} onClick={() => { setSelectedTimePeriods([]); setPage(1); }}>全部时间</button>
+        <span>可选择多个范围，与来源、格式和分类一起筛选。</span>
+      </div>
+      <div className={styles.timePeriods} role="group" aria-label="选择图片时间范围">
+        {timePeriods.map(([key, count]) => <label key={key} className={selectedTimePeriods.includes(key) ? styles.selectedTimePeriod : ""}><input type="checkbox" checked={selectedTimePeriods.includes(key)} onChange={() => { setSelectedTimePeriods(current => current.includes(key) ? current.filter(value => value !== key) : [...current, key]); setPage(1); }} /><span>{timePeriodLabel(key, timeGranularity)}</span><small>{count} 张</small></label>)}
+        {!timePeriods.length && <span>添加图片后可选择时间范围。</span>}
+      </div>
+      <p>优先使用备份目录中的年、月；其他图片使用文件修改时间。范围数量为整个图片库的图片数。</p>
+    </details>
     <section className={styles.selectionToolbar} aria-label="批量选择图片">
       <button className={actionStyles.button} onClick={() => { setSelectionMode(value => !value); setSelectedIds([]); }}>{selectionMode ? "退出多选" : "批量选择"}</button>
       <button className={`${actionStyles.button} ${styles.quickSelectAll}`} disabled={loading || !filtered.length} title={`选择当前筛选结果，包含其他分页，每批最多 ${MAX_PHOTO_SELECTION} 张`} onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? `全选前 ${MAX_PHOTO_SELECTION} 张` : "快捷全选"}</button>

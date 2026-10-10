@@ -2,11 +2,13 @@
 
 /* eslint-disable @next/next/no-html-link-for-pages -- hard navigation is required by the Vinext compatibility router. */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import AccountGate, { signOut } from "../account-gate";
 import ThemeSelector from "../theme-selector";
+import ConfirmationDialog, { type ConfirmationRequest } from "../confirmation-dialog";
 import { RecentDebugLogs, DebugLogLink, type DebugLog } from "../icloud-debug-log";
 import styles from "./icloud.module.css";
+import { createBackupNotifier } from "./backup-notifier";
 
 type IcloudConfig = {
   selectedDirectory: string | null;
@@ -89,6 +91,42 @@ function IcloudCenter({ username }: { username: string }) {
   const [message, setMessage] = useState("");
   const [runtimeVersion, setRuntimeVersion] = useState<RuntimeVersion | null>(null);
   const [runtimeVersionUnavailable, setRuntimeVersionUnavailable] = useState(false);
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
+  const confirmationResolver = useRef<((value: string | null) => void) | null>(null);
+  const backupNotifier = useRef<ReturnType<typeof createBackupNotifier> | null>(null);
+  const [backupCompletion, setBackupCompletion] = useState<ConfirmationRequest | null>(null);
+  const [desktopReminder, setDesktopReminder] = useState(false);
+  useEffect(() => () => { confirmationResolver.current?.(null); }, []);
+  useEffect(() => {
+    backupNotifier.current = createBackupNotifier();
+    queueMicrotask(() => setDesktopReminder(typeof Notification !== "undefined" && Notification.permission === "granted"));
+    return () => { backupNotifier.current?.dispose(); backupNotifier.current = null; };
+  }, []);
+  useEffect(() => {
+    if (!backupCompletion) return;
+    const originalTitle = document.title;
+    document.title = `${backupCompletion.title} · FrameBase`;
+    return () => { document.title = originalTitle; };
+  }, [backupCompletion]);
+
+  async function enableBackupReminders() {
+    void backupNotifier.current?.prepareSound();
+    const permission = await backupNotifier.current?.enableDesktop();
+    setDesktopReminder(permission === "granted");
+    setMessage(permission === "granted" ? "桌面提醒已启用。保持此备份页签打开，切换到其他页签时也会提醒。" : permission === "denied" ? "浏览器已禁止桌面通知，请在网站权限中允许；页面完成弹窗仍会显示。" : "当前浏览器不支持桌面通知；页面完成弹窗仍会显示。");
+  }
+
+  function requestConfirmation(request: ConfirmationRequest) {
+    if (confirmationResolver.current) return Promise.resolve(null);
+    return new Promise<string | null>(resolve => { confirmationResolver.current = resolve; setConfirmation(request); });
+  }
+
+  function resolveConfirmation(value: string | null) {
+    const resolve = confirmationResolver.current;
+    confirmationResolver.current = null;
+    setConfirmation(null);
+    resolve?.(value);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -158,13 +196,33 @@ function IcloudCenter({ username }: { username: string }) {
   const fullBackupActive = Boolean(config?.fullBackup && ["planning", "downloading", "verifying"].includes(config.fullBackup.status));
   useEffect(() => {
     if (!fullBackupActive) return;
-    const timer = setInterval(() => {
-      void fetch("/api/icloud/config", { cache: "no-store" })
-        .then(response => response.json() as Promise<IcloudConfig>)
-        .then(data => setConfig(data))
-        .catch(() => undefined);
-    }, 1000);
-    return () => clearInterval(timer);
+    let cancelled = false;
+    let polling = false;
+    let notified = false;
+    const poll = async () => {
+      if (polling || notified) return;
+      polling = true;
+      try {
+        const response = await fetch("/api/icloud/config", { cache: "no-store" });
+        if (!response.ok) return;
+        const data = await response.json() as IcloudConfig;
+        if (cancelled) return;
+        setConfig(data);
+        if (data.fullBackup && ["completed", "failed"].includes(data.fullBackup.status)) {
+          notified = true;
+          const failed = data.fullBackup.status === "failed";
+          const title = failed ? "完整增量备份未完成" : "完整增量备份完成";
+          const message = data.fullBackup.message;
+          setBackupCompletion({ title, message, choices: [{ label: "知道了", value: "dismiss" }] });
+          backupNotifier.current?.notify(title, message, failed);
+        }
+      } catch { /* Keep reading background status after a temporary connection error. */ }
+      finally { polling = false; }
+    };
+    const onVisible = () => { if (document.visibilityState === "visible") void poll(); };
+    const timer = setInterval(() => void poll(), 1000);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { cancelled = true; clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
   }, [fullBackupActive]);
 
   const releaseStatus = releaseProgress?.status;
@@ -294,7 +352,7 @@ function IcloudCenter({ username }: { username: string }) {
   }
 
   async function backupRecent() {
-    if (!window.confirm("将最近 3 个 iCloud 媒体项目复制到当前用户的备份目录。此操作不会删除或移动 iCloud 原文件，是否继续？")) return;
+    if (await requestConfirmation({ title: "确认测试备份", message: "将最近 3 个 iCloud 媒体项目复制到当前用户的备份目录。此操作不会删除或移动 iCloud 原文件，是否继续？", choices: [{ label: "开始测试备份", value: "confirm" }] }) !== "confirm") return;
     setBusy("backup"); setError(""); setMessage("");
     try {
       const response = await fetch("/api/icloud/backup/test", { method: "POST" });
@@ -308,8 +366,9 @@ function IcloudCenter({ username }: { username: string }) {
   }
 
   async function controlFullBackup(action: "start" | "resume" | "pause" | "cancel", ranges: BackupRange[] = []) {
-    if (action === "start" && !window.confirm(ranges.length ? `将增量备份所选的 ${ranges.length} 个时间范围，包含图片、视频、Live Photo 和 RAW 原件。不会删除或移动云端内容，是否开始？` : "将开始备份当前用户 iCloud 中的全部图片和视频原文件。任务不会删除或移动任何云端内容；可以暂停并稍后继续。是否开始？")) return;
-    if (action === "cancel" && !window.confirm("取消任务会停止当前下载，但保留已下载文件和已验证清单。是否取消？")) return;
+    if (action === "start" || action === "resume") { void backupNotifier.current?.prepareSound(); setBackupCompletion(null); }
+    if (action === "start" && await requestConfirmation({ title: "确认开始增量备份", message: ranges.length ? `将增量备份所选的 ${ranges.length} 个时间范围，包含图片、视频、Live Photo 和 RAW 原件。不会删除或移动云端内容，是否开始？` : "将开始备份当前用户 iCloud 中的全部图片和视频原文件。任务不会删除或移动任何云端内容；可以暂停并稍后继续。是否开始？", choices: [{ label: "开始备份", value: "confirm" }] }) !== "confirm") return;
+    if (action === "cancel" && await requestConfirmation({ title: "确认取消备份任务", message: "取消任务会停止当前下载，但保留已下载文件和已验证清单。是否取消？", choices: [{ label: "确认取消任务", value: "confirm", danger: true }] }) !== "confirm") return;
     setBusy("full"); setError(""); setMessage("");
     try {
       const response = await fetch(`/api/icloud/backup/full/${action}`, { method: "POST", headers: action === "start" || action === "resume" ? { "Content-Type": "application/json" } : undefined, body: action === "start" || action === "resume" ? JSON.stringify({ ranges }) : undefined });
@@ -448,7 +507,9 @@ function IcloudCenter({ username }: { username: string }) {
   const progressDone = fullBackup?.phase === "verifying" || fullBackup?.status === "completed" ? fullBackup.verified : fullBackup?.downloaded || 0;
   const progressTotal = Math.max(progressDone, fullBackup?.planned || plannedPhotoCount + plannedVideoCount);
   const progressPercent = progressTotal ? Math.min(100, Math.round(progressDone / progressTotal * 100)) : 0;
-  const planningIndeterminate = Boolean(fullBackupActive && fullBackup?.phase === "planning" && !progressTotal);
+  const backupPhaseLabel = ({ planning: "读取云端清单", downloading: "下载及云端收尾", scanning_local: "扫描本地文件", verifying: "完整性校验", recording: "保存备份记录", retrying: "等待自动重试" } as Record<string, string>)[fullBackup?.phase || ""] || "准备备份";
+  const stageIndeterminate = Boolean(fullBackupActive && ["planning", "scanning_local", "recording", "retrying"].includes(fullBackup?.phase || ""));
+  const progressLabel = fullBackup?.phase === "verifying" ? "校验进度" : fullBackup?.status === "completed" ? "备份完成" : "已规划文件的本地进度";
   const verifiedManifestCount = config?.fullManifest?.fileCount || 0;
   const hasPreciseCloudCatalog = Boolean(config?.timeline?.assetCount);
   const backupStateForBucket = (bucket: TimelineBucket) => {
@@ -539,11 +600,12 @@ function IcloudCenter({ username }: { username: string }) {
         <div className={styles.cardHead}><span>5</span><div><h2>完整增量备份</h2><p>备份全部图片、视频、Live Photo 与 RAW 原文件；未变文件复用本地校验清单，仅对新增或变化文件重算 SHA-256。</p></div></div>
         <div className={styles.safetyBanner}><strong>安全边界</strong><span>此任务不带任何云端删除参数。暂停或取消只会停止本机任务，已下载文件会保留。</span></div>
         <div className={styles.fullStatus}>
-          <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? "任务运行中" : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>
+          <div><strong>{config?.fullBackup?.status === "completed" ? "备份完成" : config?.fullBackup?.status === "paused" ? "已暂停" : config?.fullBackup?.status === "cancelled" ? "已取消" : config?.fullBackup?.status === "failed" ? "需要重试" : fullBackupActive ? `正在${backupPhaseLabel}` : "尚未开始"}</strong><span>{config?.fullBackup?.message || "准备好后由当前用户手动开始。"}</span></div>
+          {fullBackupActive && <small>每个时间范围依次进行：读取清单 → 下载 → 校验 → 保存记录。文件本地进度达到 100% 后仍需完成校验和保存。</small>}
           {config?.fullBackup?.rangeCount ? <div className={styles.rangeStatus}><strong>时间范围 {config.fullBackup.rangeIndex || 1}/{config.fullBackup.rangeCount}</strong><span>{config.fullBackup.currentRange || "正在准备"} · 已完成 {config.fullBackup.completedRanges.length} 个范围</span></div> : null}
           {config?.fullBackup && <div className={styles.liveMetrics}><div><span>实时同步速率</span><strong>{config.fullBackup.phase === "downloading" ? `${formatBytes(config.fullBackup.transferRateBps || 0)}/秒` : "—"}</strong></div><div><span>图片进度</span><strong>{syncedPhotoCount} / {plannedPhotoCount || "—"}</strong></div><div><span>视频进度</span><strong>{syncedVideoCount} / {plannedVideoCount || "—"}</strong></div><div><span>总同步进度</span><strong>{config.fullBackup.downloaded} / {config.fullBackup.planned || "—"}</strong></div></div>}
           {config?.fullBackup && <dl><div><dt>计划</dt><dd>{config.fullBackup.planned}</dd></div><div><dt>已验证</dt><dd>{config.fullBackup.verified}</dd></div><div><dt>增量跳过</dt><dd>{config.fullBackup.skipped}</dd></div><div><dt>失败</dt><dd>{config.fullBackup.failed}</dd></div><div><dt>图片</dt><dd>{config.fullBackup.photoCount}</dd></div><div><dt>视频</dt><dd>{config.fullBackup.videoCount}</dd></div></dl>}
-          {progressTotal ? <div className={styles.progressLine}><div className={styles.progress} aria-label={`完整备份进度 ${progressPercent}%`}><i style={{ width: `${progressPercent}%` }} /></div><strong>{progressPercent}%</strong></div> : planningIndeterminate ? <div className={styles.progressLine}><div className={`${styles.progress} ${styles.progressIndeterminate}`} aria-label="正在查询 iCloud 清单"><i /></div><strong>等待 iCloud</strong></div> : null}
+          {stageIndeterminate ? <div className={styles.progressLine}><div className={`${styles.progress} ${styles.progressIndeterminate}`} aria-label={backupPhaseLabel}><i /></div><strong>{backupPhaseLabel}</strong></div> : progressTotal ? <div className={styles.progressLine}><div className={styles.progress} aria-label={`${progressLabel} ${progressPercent}%`}><i style={{ width: `${progressPercent}%` }} /></div><strong>{progressLabel} {progressPercent}%</strong></div> : null}
           {config?.fullBackup?.downloadedBytes ? <small>本地已存在或写入：{formatBytes(config.fullBackup.downloadedBytes)}</small> : null}
           {config?.fullBackup?.verifiedBytes ? <small>已通过完整性校验：{formatBytes(config.fullBackup.verifiedBytes)} · 清单共 {config.fullManifest?.fileCount || config.fullBackup.verified} 个文件</small> : null}
         </div>
@@ -553,7 +615,9 @@ function IcloudCenter({ username }: { username: string }) {
           {config?.fullBackup?.status === "completed" && <button className={styles.primary} onClick={() => void controlFullBackup("resume")} disabled={busy !== null || config?.connectionStatus !== "connected"}>检查新增项目</button>}
           {fullBackupActive && <button onClick={() => void controlFullBackup("pause")} disabled={busy !== null}>暂停</button>}
           {fullBackupActive && <button className={styles.danger} onClick={() => void controlFullBackup("cancel")} disabled={busy !== null}>取消任务</button>}
+          <button onClick={() => void enableBackupReminders()}>{desktopReminder ? "桌面提醒已启用" : "启用桌面提醒"}</button>
         </div>
+        <p>任务完成或最终失败时会弹窗并播放提示音；桌面提醒需允许浏览器通知。请保持此备份页签打开，浏览器静音或限制后台活动可能影响提醒。</p>
       </article>
 
       <article className={`${styles.card} ${verifiedManifestCount === 0 ? styles.disabled : ""}`}>
@@ -580,5 +644,7 @@ function IcloudCenter({ username }: { username: string }) {
     </section>
 
     <footer><span>配置只保存在这台电脑，并按 FrameBase 用户隔离</span><a href="/?library=video">返回视频库 →</a></footer>
+    {confirmation && <ConfirmationDialog key={confirmation.title} request={confirmation} onResolve={resolveConfirmation} />}
+    {backupCompletion && !confirmation && <ConfirmationDialog key={backupCompletion.title} request={backupCompletion} onResolve={() => setBackupCompletion(null)} />}
   </main>;
 }
