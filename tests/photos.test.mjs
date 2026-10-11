@@ -22,7 +22,7 @@ for (const [file, functionName] of [["photos/page.tsx", "releaseAllFilteredCloud
     const run = vm.runInNewContext(`${ts.transpileModule(workflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText}\n${functionName}`, {
       releasingAsset: null, appleSessionBusy: false, releaseCatalogLoading: false, releaseCatalogError: "", dialogItems: [],
       filtered: [...assets, { id: "unmatched" }], cloudAssetFor: item => item.library ? item : null, collectCloudSelection, releaseCatalog: catalog,
-      window: { confirm: message => { prompts.push(message); return confirmed; } },
+      window: { confirm: () => assert.fail("automatic release must use the application's themed confirmation dialog") },
       requestCloudConfirmation: async prompt => { prompts.push(prompt.message); return confirmed ? "confirm" : "cancel"; },
       setReleasingAsset() {}, setError() {}, setNotice() {}, setDeleteJob: value => { job = value; }, setVideoDeleteJob: value => { job = value; },
       setReleaseCatalog: update => { if (typeof update === "function") catalog.releasePlan = update(catalog).releasePlan; },

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import AccountGate, { signOut } from "../account-gate";
 import { accountDbName, accountKey } from "../account-storage";
 import ThemeSelector from "../theme-selector";
+import ConfirmationDialog, { type ConfirmationRequest } from "../confirmation-dialog";
 import PhotoActionsMenu from "./photo-actions-menu";
 import PhotoSelectionGrid from "./photo-selection-grid";
 import { findLivePhotoVideo } from "../../shared/live-photo.mjs";
@@ -592,6 +593,19 @@ function PhotoLibrary({ username }: { username: string }) {
   const [deleteMinimized, setDeleteMinimized] = useState(false);
   const [deleteFinished, setDeleteFinished] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState<string | null>(null);
+  const [cloudConfirmation, setCloudConfirmation] = useState<ConfirmationRequest | null>(null);
+  const cloudConfirmationResolver = useRef<((value: string | null) => void) | null>(null);
+  useEffect(() => () => { cloudConfirmationResolver.current?.(null); }, []);
+  function requestCloudConfirmation(request: ConfirmationRequest) {
+    if (cloudConfirmationResolver.current) return Promise.resolve(null);
+    return new Promise<string | null>(resolve => { cloudConfirmationResolver.current = resolve; setCloudConfirmation(request); });
+  }
+  function resolveCloudConfirmation(value: string | null) {
+    const resolve = cloudConfirmationResolver.current;
+    cloudConfirmationResolver.current = null;
+    setCloudConfirmation(null);
+    resolve?.(value);
+  }
   const deleteConfirmationResolver = useRef<((confirmed: boolean) => void) | null>(null);
   const confirmationCancelRef = useRef<HTMLButtonElement>(null);
   const [deleteJob, setDeleteJob] = useState<DeleteJob | null>(null);
@@ -1071,10 +1085,10 @@ function PhotoLibrary({ username }: { username: string }) {
     if (releasingAsset !== null || appleSessionBusy || releaseCatalogLoading || releaseCatalogError || dialogItems.length) return;
     const selection = collectCloudSelection(filtered, cloudAssetFor);
     if (!selection.assets.length) return;
-    const confirmed = window.confirm(`自动释放当前筛选下全部 ${selection.assets.length} 个未释放云端项目？\n\n共 ${Math.ceil(selection.assets.length / 100)} 批，每批最多 100 个；确认后后台将逐批复核并删除，无需逐批确认。遇到异常自动停止。\n\n本地原片保留，未匹配文件跳过。云端项目移入“最近删除”。\n\n如需处理整个图片库，请先取消所有筛选。`);
-    if (!confirmed) return;
     setReleasingAsset("all"); setError(""); setNotice("");
     try {
+      const confirmation = await requestCloudConfirmation({ title: "自动分批释放全部云端图片", message: `将处理当前筛选下全部 ${selection.assets.length} 个未释放云端项目，共 ${Math.ceil(selection.assets.length / 100)} 批，每批最多 100 个。\n\n确认后后台逐批复核并移入“最近删除”，无需逐批确认；遇到异常自动停止。可停止后续批次。\n\n本地原片保留，未匹配文件跳过。如需处理整个图片库，请先取消所有筛选。`, choices: [{ label: "确认自动分批释放全部", value: "confirm", danger: true }] });
+      if (confirmation !== "confirm") return;
       const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: selection.assets.map(asset => `${asset.library}:${asset.id}`), recycleLocal: false, confirmation: true, autoBatches: true, background: true }) });
       const started = await response.json() as { deleteJob?: DeleteJob; error?: string };
       if (!response.ok || !started.deleteJob?.id) throw new Error(started.error || "自动分批任务未启动。");
@@ -1196,6 +1210,7 @@ function PhotoLibrary({ username }: { username: string }) {
     {visible.length ? <PhotoSelectionGrid enabled={selectionMode} selectedIds={selectedIds} limit={MAX_PHOTO_SELECTION} onChange={setSelectedIds} className={`${styles.grid} ${compact ? styles.compact : ""} ${previewRatio === "phone" ? styles.phoneRatio : ""}`}>{visible.map(item => { return <article className={`${styles.card} ${selectionMode && selectedIds.includes(item.id) ? styles.selectedCard : ""}`} key={item.id} data-photo-id={item.id}><div className={styles.preview}>{selectionMode && <label className={styles.selectionCheckbox}><input type="checkbox" aria-label={`选择 ${item.name}`} checked={selectedIds.includes(item.id)} onChange={() => toggleSelection(item.id)} /></label>}<PhotoThumb item={item} onOpen={() => { if (selectionMode) toggleSelection(item.id); else { setViewerId(item.id); void refreshReleaseCatalog(); } }} /><div className={styles.cardBadges}>{item.liveVideo && <span className={styles.liveBadge} title={`配对视频：${item.liveVideo.name}`}>● 实况</span>}{item.cleanup && <span className={styles.cleanupBadge} title="已加入待整理">✓ 待整理</span>}</div><PhotoActionsMenu name={item.name} liked={item.liked} cleanup={item.cleanup} busy={releasingAsset !== null} onOpen={() => { setViewerId(item.id); void refreshReleaseCatalog(); }} onFavorite={() => toggleMark(item.id, "liked")} onCleanup={() => toggleMark(item.id, "cleanup")} onDelete={() => openDeleteDialog([item])} /></div><div className={styles.cardMeta}><h2 title={item.path}>{item.name}</h2><p title={item.sourceName + " · " + item.extension.toUpperCase() + " · 文件修改时间：" + formatDate(item.modified)}>{photoDate(item) ? new Date(photoDate(item)).toLocaleDateString("zh-CN") : "时间未知"} · {formatBytes(item.size)}</p></div></article>; })}</PhotoSelectionGrid> : <section className={styles.empty}><strong>{ready ? "没有符合条件的图片" : "正在读取图片库…"}</strong><span>{sources.length ? "可以调整筛选条件或重新扫描来源。" : "点击“添加图片文件夹”开始建立独立图片库。"}</span></section>}
     <footer><span>图片来源来自你授权的本地文件夹；批量云端释放可选择复核通过后自动执行</span><a href="/?library=video">返回视频库 →</a></footer>
     {!dialogItems.length && deleteJob?.status === "failed" && <aside className={styles.deleteProgress}><AppleSessionControls disabled={releasingAsset !== null} onBusyChange={setAppleSessionBusy} onVerified={handleSessionVerified} /></aside>}
+    {cloudConfirmation && <ConfirmationDialog request={cloudConfirmation} onResolve={resolveCloudConfirmation} />}
     {dialogItems.length === 0 && deleteJob && deleteJob.status !== "idle" && <aside className={styles.deleteToast}><CloudDeleteProgress job={deleteJob} elapsedSeconds={deleteElapsed} />{deleteJob.status !== "running" && <button onClick={() => setDeleteJob(null)} aria-label="关闭删除结果">关闭</button>}</aside>}
     {dialogItems.length > 0 && <dialog ref={deleteDialogRef} className={`${styles.deleteDialog} ${deleteMinimized ? styles.deleteMini : ""}`} aria-modal={!deleteMinimized} aria-labelledby="delete-photo-title" onCancel={event => { event.preventDefault(); if (deleteConfirmation) resolveDeleteConfirmation(false); else if (releasingAsset !== null) minimizeDeleteWindow(); else closeDeleteDialog(); }}>
       <header className={styles.deleteHeader}><div><h2 id="delete-photo-title">{bulkDeleteItems.length ? `批量删除 ${dialogItems.length} 张图片` : "删除这张图片"}</h2><p>{deleteConfirmation ? "等待确认 · 尚未执行此次删除" : deleteFinished ? "操作已结束，可查看结果后关闭" : releasingAsset !== null ? "任务继续进行，可缩小后浏览图片库" : "确认图片与删除范围，再继续复核"}</p></div><button className={actionStyles.button} onClick={() => { if (deleteMinimized) setDeleteMinimized(false); else minimizeDeleteWindow(); }} aria-label={deleteMinimized ? "恢复删除大窗" : "缩小删除窗口"}>{deleteMinimized ? "恢复" : "缩小"}</button></header>
