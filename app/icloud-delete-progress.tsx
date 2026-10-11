@@ -2,6 +2,7 @@
 
 import { DebugLogLink, type DebugLog } from "./icloud-debug-log";
 import styles from "./media-actions.module.css";
+import { useState } from "react";
 
 export type CloudDeleteJob = {
   autoBatches?: boolean; stopRequested?: boolean;
@@ -33,20 +34,25 @@ export async function waitForCloudDelete<T extends CloudDeleteJob>(id: string, o
 }
 
 export function CloudDeleteProgress({ job, elapsedSeconds }: { job: CloudDeleteJob; elapsedSeconds?: number }) {
+  const [stopState, setStopState] = useState<{ id?: string; pending: boolean; error: string } | null>(null);
+  const stopping = job.stopRequested || (stopState?.id === job.id && stopState?.pending);
   return <div className={styles.progress} role="status" aria-live="polite">
     <strong>{job.status === "running" ? job.preview || job.phase === "preview" ? "确认前：正在复核云端项目" : "已确认，云端删除任务执行中" : job.status === "completed" ? job.preview ? "云端复核通过，尚未删除" : "删除完成" : job.status === "partial" ? job.preview ? "部分云端项目复核通过，尚未删除" : "部分操作完成" : "删除未完成"}</strong>
     <p>{job.name}</p><p>{job.message}</p>
     <dl><div><dt>已耗时</dt><dd>{elapsedSeconds ?? job.elapsedSeconds ?? 0} 秒</dd></div><div><dt>云端已返回结果</dt><dd>{job.processed || 0} / {job.total || 1}</dd></div><div><dt>已确认移入最近删除</dt><dd>{job.deleted || 0} / {job.total || 1}</dd></div></dl>
     <DebugLogLink log={job.debugLog} />
     {job.status === "running" && <small>Apple 尚未返回结果时不显示估算百分比。任务在后台继续，请勿重复提交。</small>}
-    {job.status === "running" && job.autoBatches && <button disabled={job.stopRequested} onClick={async event => {
-      const button = event.currentTarget;
-      button.disabled = true;
+    {job.status === "running" && job.autoBatches && <div className={styles.taskActions}>
+      <button type="button" className={`${styles.button} ${styles.dangerButton}`} disabled={Boolean(stopping)} onClick={async () => {
+      setStopState({ id: job.id, pending: true, error: "" });
       try {
         const response = await fetch("/api/icloud/release/delete/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jobId: job.id }) });
         const data = await response.json() as { error?: string };
         if (!response.ok) throw new Error(data.error || "停止请求未成功，请重试。");
-      } catch (reason) { button.disabled = false; window.alert(reason instanceof Error ? reason.message : "停止请求未成功，请重试。"); }
-    }}>{job.stopRequested ? "已请求停止，等待本批结束" : "停止后续批次"}</button>}
+      } catch (reason) { setStopState({ id: job.id, pending: false, error: reason instanceof Error ? reason.message : "停止请求未成功，请重试。" }); }
+    }}>{stopping ? "已请求停止，等待本批结束" : "停止后续批次"}</button>
+      <small>已提交的当前批次会完成并保存结果，不再提交后续批次。</small>
+      {stopState?.id === job.id && stopState.error && <p className={styles.stopError} role="alert">{stopState.error}</p>}
+    </div>}
   </div>;
 }
