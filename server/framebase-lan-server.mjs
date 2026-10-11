@@ -70,11 +70,13 @@ const recycleBin = createRecycleBin();
 const bundledIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-1.32.3-windows-amd64.exe");
 const compatibleIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-compatible.exe");
 const recoveryIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-inventory-recovery.exe");
+const parallelIcloudPdPath = join(projectRoot, "tools", "icloudpd", "icloudpd-framebase-parallel-downloads.exe");
 const icloudProvider = createIcloudPdProvider({
   executablePath: resolve(
     process.env.FRAMEBASE_ICLOUDPD_PATH
-      || (existsSync(recoveryIcloudPdPath) ? recoveryIcloudPdPath : existsSync(compatibleIcloudPdPath) ? compatibleIcloudPdPath : bundledIcloudPdPath),
+      || (existsSync(parallelIcloudPdPath) ? parallelIcloudPdPath : existsSync(recoveryIcloudPdPath) ? recoveryIcloudPdPath : existsSync(compatibleIcloudPdPath) ? compatibleIcloudPdPath : bundledIcloudPdPath),
   ),
+  downloadConcurrency: process.env.FRAMEBASE_ICLOUD_DOWNLOAD_THREADS || 2,
 });
 const icloudBackupUsers = new Set();
 const releaseDeleteJobs = createReleaseDeleteJobs({ icloud, provider: icloudProvider, recycleBin, debugLogs });
@@ -656,15 +658,19 @@ async function handleIcloudOperation(request, response, url, current) {
     }
     void (async () => {
       try {
+        const backupLog = debugLogs.start(current.username, "full_backup", { ranges });
         const result = await runBackupWithRetries({
           signal: controller.signal,
-          onRetry: ({ retry, waitMs, result }) => icloud.writeFullBackup(current.username, { status: "planning", phase: "retrying", transferRateBps: 0, message: `${result.message} ${waitMs / 1000} 秒后自动重试（${retry}/2），保留已下载文件并跳过已完成范围。` }),
+          onRetry: ({ retry, waitMs, result }) => {
+            backupLog.write("backup_retry", { retry, waitMs, status: result.status, message: result.message });
+            return icloud.writeFullBackup(current.username, { status: "planning", phase: "retrying", transferRateBps: 0, message: `${result.message} ${waitMs / 1000} 秒后自动重试（${retry}/2），保留已下载文件并跳过已完成范围。` });
+          },
           run: async attempt => {
             const checkpoint = attempt ? await icloud.readFullBackup(current.username) : previousState;
             const manifest = attempt ? await icloud.readFullManifest(current.username) : previousManifest;
             const preserveProgress = resumingExisting || attempt > 0;
             const attemptResult = await icloudProvider.backupAll({
-              ...context, jobKey: current.username, previousFiles: manifest.files, ranges,
+              ...context, jobKey: current.username, previousFiles: manifest.files, ranges, debugLog: backupLog,
               initialCompletedRanges: attempt ? checkpoint.completedRanges : initialCompletedRanges, signal: controller.signal,
               onProgress: update => icloud.writeFullBackup(current.username, preserveProgress ? {
                 ...update,
@@ -690,6 +696,7 @@ async function handleIcloudOperation(request, response, url, current) {
             return attemptResult;
           },
         });
+        backupLog.write("finished", { status: result.status, message: result.message });
         if (result.status === "aborted") {
           await icloud.writeFullBackup(current.username, { status: job.stopAs, phase: job.stopAs, transferRateBps: 0, message: job.stopAs === "cancelled" ? "完整备份已取消；已下载的本地文件会保留。" : result.message });
           return;
@@ -697,9 +704,10 @@ async function handleIcloudOperation(request, response, url, current) {
         const savedManifest = await icloud.readFullManifest(current.username);
         const latestProgress = await icloud.readFullBackup(current.username);
         const completed = result.status === "completed";
+        const waitingForIndex = result.status === "indexing";
         if (completed) await icloud.recordCompletedRanges(current.username, ranges.filter(range => result.completedRanges?.includes(range.key)));
         await icloud.writeFullBackup(current.username, {
-          status: completed ? "completed" : "failed", phase: completed ? "completed" : "failed", message: result.message,
+          status: completed ? "completed" : waitingForIndex ? "paused" : "failed", phase: completed ? "completed" : waitingForIndex ? "paused" : "failed", message: result.message,
           completedAt: completed ? new Date().toISOString() : null, currentLibrary: null, currentRange: null,
           rangeIndex: (result.completedRanges || latestProgress.completedRanges).length, rangeCount: ranges.length || 1, completedRanges: result.completedRanges || latestProgress.completedRanges,
           planned: Math.max(latestProgress.planned, result.planned || 0), downloaded: Math.max(latestProgress.downloaded, result.files?.length || 0), verified: Math.max(latestProgress.verified, result.files?.length || 0),

@@ -9,6 +9,8 @@ import ConfirmationDialog, { type ConfirmationRequest } from "../confirmation-di
 import { RecentDebugLogs, DebugLogLink, type DebugLog } from "../icloud-debug-log";
 import styles from "./icloud.module.css";
 import IcloudTutorial from "./tutorial";
+import ReleaseRepairPanel from "./release-repair-panel";
+import { repairBackupMonths, type ReleaseFailure } from "./release-repair";
 import { timelineProgress } from "./timeline-progress";
 import { createBackupNotifier } from "./backup-notifier";
 
@@ -38,7 +40,7 @@ type IcloudConfig = {
 
 type ReleaseProgress = { status: "idle" | "running" | "completed" | "failed"; phase?: string; message?: string; total?: number; checked?: number; failed?: number; reused?: number; rehashed?: number; totalBytes?: number; readBytes?: number; currentFile?: string | null };
 
-type ReleasePlan = { matchedAssetCount: number; matchedLocalFileCount: number; unmatchedLocalFileCount: number; livePhotoAssetCount: number; unmatchedFiles: Array<{ name: string; relativePath: string; size: number }>; id: string | null; status: "ready" | "blocked" | "confirmed"; message: string; createdAt: string | null; confirmedAt: string | null; eligibleCount: number; eligibleBytes: number; failedCount: number; files: Array<{ name: string; relativePath: string; mediaType: "photo" | "video"; size: number }>; assets: Array<{ id: string; library: string; name: string; originalBytes: number }> };
+type ReleasePlan = { failures?: ReleaseFailure[]; matchedAssetCount: number; matchedLocalFileCount: number; unmatchedLocalFileCount: number; livePhotoAssetCount: number; unmatchedFiles: Array<{ name: string; relativePath: string; size: number }>; id: string | null; status: "ready" | "blocked" | "confirmed"; message: string; createdAt: string | null; confirmedAt: string | null; eligibleCount: number; eligibleBytes: number; failedCount: number; files: Array<{ name: string; relativePath: string; mediaType: "photo" | "video"; size: number }>; assets: Array<{ id: string; library: string; name: string; originalBytes: number }> };
 
 type FullBackupState = {
   status: "idle" | "planning" | "downloading" | "verifying" | "paused" | "cancelled" | "completed" | "failed";
@@ -414,6 +416,20 @@ function IcloudCenter({ username }: { username: string }) {
     return { key, label, start: `${year}-${pad(startMonth)}-01T00:00:00`, end: `${endBase.getUTCFullYear()}-${pad(endBase.getUTCMonth() + 1)}-${pad(endBase.getUTCDate())}T23:59:59` };
   }
 
+  function selectRepairBackup() {
+    const failures = config?.releasePlan?.failures || [];
+    const result = repairBackupMonths(failures, (config?.timeline?.months || []).map(bucket => bucket.key));
+    setTimelineGranularity("months");
+    setSelectedPeriods(result.months);
+    setError("");
+    const notes = [];
+    if (result.unavailableMonths.length) notes.push(`云端统计中没有 ${result.unavailableMonths.join("、")}，请刷新统计或检查这些项目是否仍在云端`);
+    if (result.unknownCount) notes.push(`${result.unknownCount} 个文件无法从路径识别日期，请手动选择范围`);
+    if ((config?.releasePlan?.failedCount || 0) > failures.length) notes.push("当前按已显示的失败文件选择月份；修复后再次复核以处理剩余文件");
+    setMessage((result.months.length ? `已切换到按月份，并选择 ${result.months.join("、")}（${result.months.length} 个最小分区），请点击“备份所选范围”开始备份。` : "未找到可自动选择的云端月份，请刷新统计或手动选择备份范围。") + (notes.length ? ` ${notes.join("；")}。` : ""));
+    requestAnimationFrame(() => document.querySelector('[data-icloud-step="3"]')?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
+
   async function createReleasePlan() {
     setBusy("release"); setError(""); setMessage("");
     try {
@@ -593,7 +609,7 @@ function IcloudCenter({ username }: { username: string }) {
         <div className={styles.safetyBanner}><strong>当前安全策略</strong><span>仅允许删除已通过本地 SHA-256、云端资产 ID、文件名、拍摄时间、原始大小和图库六重核对的项目；删除入口位于图片库，每次都先 dry-run 并要求手动确认。</span></div>
         {config?.releaseHistory?.movedCount ? <><div className={styles.releaseSummary}><div><span>云端“最近删除”</span><strong>{config.releaseHistory.movedCount} 个 · {formatBytes(config.releaseHistory.movedBytes)}</strong></div><div><span>Windows 回收站</span><strong>{config.releaseHistory.recycledFileCount || 0} 个 · {formatBytes(config.releaseHistory.recycledBytes || 0)}</strong></div><p>两侧都保留恢复窗口；分别清空 iCloud“最近删除”和 Windows 回收站后，空间才会彻底释放。</p></div>{config.releaseHistory.events?.filter(event => event.recycleStatus === "failed" || event.recycleStatus === "partial").map(event => <div className={styles.recycleRetry} key={event.id}><span>有 {event.recycleResults.filter(result => result.status === "failed").length} 个本地文件未移入回收站。</span><button onClick={() => void retryLocalRecycle(event.id)} disabled={busy !== null}>重试本地回收</button></div>)}</> : null}
         {releaseProgress && releaseProgress.status !== "idle" && <div className={styles.fullStatus} role="status" aria-live="polite">
-          <div><strong>{releaseProgress.status === "running" ? "正在复核本地备份" : releaseProgress.status === "failed" ? "复核失败" : "复核完成"}</strong><span>{releaseProgress.message}</span></div>
+          <div><strong>{releaseProgress.status === "running" ? "正在复核本地备份" : releaseProgress.status === "failed" ? "复核失败" : releaseProgress.failed ? "复核完成 · 有文件未通过" : "复核完成"}</strong><span>{releaseProgress.message}</span></div>
           <div className={styles.progressLine}><div className={styles.progress} role="progressbar" aria-label="本地文件复核进度" aria-valuemin={0} aria-valuemax={releaseProgress.total || 1} aria-valuenow={releaseProgress.checked || 0}><i style={{ width: (releaseProgress.total ? Math.round((releaseProgress.checked || 0) / releaseProgress.total * 100) : 0) + "%" }} /></div><strong>{releaseProgress.checked || 0} / {releaseProgress.total || 0} 个 · {releaseProgress.total ? Math.round((releaseProgress.checked || 0) / releaseProgress.total * 100) : 0}%</strong></div>
           <div className={styles.liveMetrics}><div><span>本轮读取（复用文件无需读取）</span><strong>{formatBytes(releaseProgress.readBytes || 0)}</strong></div><div><span>复用 / 重新计算</span><strong>{releaseProgress.reused || 0} / {releaseProgress.rehashed || 0} 个</strong></div><div><span>复核通过</span><strong>{(releaseProgress.checked || 0) - (releaseProgress.failed || 0)} 个</strong></div><div><span>校验失败</span><strong>{releaseProgress.failed || 0} 个</strong></div></div>
           {releaseProgress.currentFile && <small>当前文件：{releaseProgress.currentFile}</small>}
@@ -603,6 +619,7 @@ function IcloudCenter({ username }: { username: string }) {
           <dl><div><dt>本地通过校验文件</dt><dd>{config.releasePlan.eligibleCount}</dd></div><div><dt>已校验容量</dt><dd>{formatBytes(config.releasePlan.eligibleBytes)}</dd></div><div><dt>匹配云端项目</dt><dd>{config.releasePlan.matchedAssetCount ?? config.releasePlan.assets?.length ?? 0}</dd></div><div><dt>匹配本地文件</dt><dd>{config.releasePlan.matchedLocalFileCount ?? 0}</dd></div><div><dt>未匹配本地文件</dt><dd>{config.releasePlan.unmatchedLocalFileCount ?? 0}</dd></div><div><dt>校验失败</dt><dd>{config.releasePlan.failedCount}</dd></div></dl>
           <p className={styles.releaseExplanation}>本地文件与云端项目按不同单位计数：{config.releasePlan.matchedAssetCount ?? config.releasePlan.assets.length} 个云端项目对应 {config.releasePlan.matchedLocalFileCount ?? 0} 个本地文件，其中 {config.releasePlan.livePhotoAssetCount ?? 0} 个实况照片包含配对视频；另有 {config.releasePlan.unmatchedLocalFileCount ?? 0} 个通过校验的本地文件未完成精确匹配，不开放云端删除。容量是本地已校验文件大小，不代表可释放的 iCloud 容量。</p>
           {Boolean(config.releasePlan.unmatchedLocalFileCount) && <details className={styles.unmatchedFiles}><summary>查看未匹配文件（{config.releasePlan.unmatchedLocalFileCount} 个）</summary><p>这些文件未满足云端项目的唯一匹配条件。可重新统计云端内容后生成计划；本地文件仍保留。</p><ul>{config.releasePlan.unmatchedFiles?.map(file => <li key={file.relativePath}>{file.relativePath} · {formatBytes(file.size)}</li>)}</ul>{config.releasePlan.unmatchedLocalFileCount > 100 && <small>显示前 100 个未匹配文件。</small>}</details>}
+          {config.releasePlan.failedCount > 0 && <ReleaseRepairPanel failures={config.releasePlan.failures || []} failedCount={config.releasePlan.failedCount} backupDirectory={config.backupDirectory} busy={busy !== null || !hasPreciseCloudCatalog} onRecheck={() => void createReleasePlan()} onSelectBackup={selectRepairBackup} />}
           {config.releasePlan.files.length > 0 && <ul className={styles.releaseFiles}>{config.releasePlan.files.slice(0, 5).map(item => <li key={item.relativePath}><span>{item.mediaType === "video" ? "视频" : "图片"}</span><strong>{item.name}</strong><small>{formatBytes(item.size)}</small></li>)}</ul>}
         </div> : <p className={styles.releaseIntro}>{verifiedManifestCount === 0 ? "先在“完整增量备份”中选择至少一个时间范围并完成备份，系统才会建立可用于安全释放的 SHA-256 清单。" : !hasPreciseCloudCatalog ? `本地已有 ${verifiedManifestCount} 个 SHA-256 验证文件，不需要重新备份；但当前时间统计是旧格式，请先到“按时间选择备份”点击“刷新统计”，保存云端资产 ID。` : `本地持久化清单已有 ${verifiedManifestCount} 个 SHA-256 验证文件，可以直接生成释放计划；即使上方任务因服务重启显示“已暂停”，也不需要重新下载。`}</p>}
         <div className={styles.actions}><button onClick={() => void createReleasePlan()} disabled={busy !== null || verifiedManifestCount === 0 || !hasPreciseCloudCatalog}>{releaseStatus === "running" ? "正在复核 " + (releaseProgress?.checked || 0) + " / " + (releaseProgress?.total || verifiedManifestCount) + " 个本地文件…" : busy === "release" ? "正在处理…" : !hasPreciseCloudCatalog && verifiedManifestCount > 0 ? "请先刷新上方时间统计" : config?.releasePlan ? "重新生成释放计划" : "生成只读释放计划"}</button></div>

@@ -288,3 +288,30 @@ Provider 对 `--version` 的成功结果及进行中的查询进行复用，每�
 释放计划的本地 SHA-256 复核结果按 FrameBase 用户保存在 `release-verification-cache.json`。只有备份根目录、文件实际路径、大小、修改时间、状态变更时间、设备与文件编号以及清单中的 SHA-256 全部相同，才复用上次成功结果；新增、变化、缺失及失败文件不会直接复用。首次建立缓存需要完整读取，后续计划生成显示复用与重新计算数量。哈希结束后再次检查文件状态，校验期间变化的文件不进入缓存。
 
 缓存仅用于加速生成本地释放计划。每次生成仍使用当前云端清单重新匹配资产；删除时仍通过兼容工具精确复核云端目标，选择回收本地文件时仍重新计算 SHA-256。缓存损坏会退回完整本地校验。
+
+## 并行原文件下载
+
+在现有 inventory-recovery 源码上运行 `server/icloud-providers/build-parallel-downloads.ps1`，生成 `tools/icloudpd/icloudpd-framebase-parallel-downloads.exe`。构建脚本使用同目录的 `enable-parallel-downloads.py` 修改本地源码，并复制受版本控制的 `parallel-downloads.py`；可重复执行。原有可执行文件保留，正在运行的服务需要重启才会采用新程序。
+
+新程序的 `--threads-num` 支持 1–8，默认 1。图库枚举与过滤仍在主线程执行，下载队列最多保留指定数量的任务，文件响应体可并行传输。会话请求、cookie/认证文件写入受互斥锁保护；原文件、重名去重文件、XMP 和按校验和命名的 `.part` 文件也受锁保护。线程异常向上传递，失败的传输不会记为成功；继续使用现有断点续传机制。取消后不再调度新任务，已开始的线程等待结束；FrameBase 暂停通过终止工具进程停止传输，保留已有文件用于继续任务。
+
+只读文件列表、统计扫描、目标删除、自动删除、下载后删除、按保留天数删除、`--until-found` 及 dry-run 模式保持串行，避免改变顺序和删除语义。完整备份仍按时间范围/图库逐个完成，范围内的文件下载并行，范围完成前仍执行本地校验并保存清单。
+
+FrameBase 优先选择新程序，并读取版本中的 `parallel downloads` 能力标识；仅向支持此功能的工具传递下载线程数。完整增量备份默认 2 路，可在启动后台前设置 `$env:FRAMEBASE_ICLOUD_DOWNLOAD_THREADS='4'` 调为 4 路；设置为 1 可恢复串行下载。旧工具和自定义 `FRAMEBASE_ICLOUDPD_PATH` 不声明能力时继续使用原方式。备份日志 `backup_tool_start.downloadThreads` 记录实际线程数。
+
+验证命令（项目根目录）：
+
+```powershell
+& 'tools/icloudpd/source-review/icloud_photos_downloader-master/.venv/Scripts/python.exe' -m pytest tests/test_icloudpd_parallel_downloads.py -q -p no:cacheprovider
+node --test tests/icloud-parallel-backup.test.mjs tests/icloud-provider.test.mjs tests/backup-retry.test.mjs
+```
+
+回归测试覆盖并发上限、流式传输重叠、会话写入串行、路径与 `.part` 冲突、续传和失败重试、取消、特殊模式串行，以及真实 CLI 的离线响应回放。未使用真实 Apple 账户测量下载提速；实际速度受 Apple 限速、网络与磁盘影响。
+
+### 索引更新期间的备份
+
+完整备份使用 `FRAMEBASE_BACKUP_READONLY=1`，在 Apple 返回 `RUNNING` 时先只读查询照片数量及配对的 CPLMaster/CPLAsset 元数据。数量大于零且配对元数据可读取时，允许下载当前可读取的项目；探测失败仍阻止备份，不绕过 API 或网络错误。
+
+Provider 检查每个工具步骤返回的所有索引诊断。只要本轮观察到 `RUNNING`，本地校验成功的文件仍写入清单，但本轮范围不记为完成；后台将任务保存为“已暂停”，提示索引更新后继续。下次继续会复用本地文件，索引恢复且校验通过后才记录完整范围。空结果不能据此判断图库为空。`RUNNING` 与 `FAILED` 的提示分别说明“索引更新中”和“索引失败”；新备份探测不改变云端删除的限制。
+
+更新后需重新运行 `build-parallel-downloads.ps1` 并重启后台。离线验证增加 `tests/test_icloudpd_backup_indexing.py` 与 `tests/icloud-backup-indexing.test.mjs`，覆盖只读探测、不可读/网络失败、删除保护、部分文件持久化以及索引恢复后的完成记录。

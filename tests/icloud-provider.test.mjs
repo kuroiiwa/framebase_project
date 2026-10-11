@@ -269,7 +269,7 @@ test("icloudpd provider safely backs up at most three recent originals and verif
   }
 });
 
-test("icloudpd provider incrementally backs up and hashes photos, videos, Live Photos, and RAW files without delete flags", async () => {
+test("icloudpd provider incrementally backs up readable abnormal indexes without delete flags", async () => {
   const root = await mkdtemp(join(tmpdir(), "framebase-provider-full-backup-"));
   const executablePath = join(root, "icloudpd.exe");
   const backupDirectory = join(root, "backup");
@@ -281,10 +281,13 @@ test("icloudpd provider incrementally backs up and hashes photos, videos, Live P
     await writeFile(executablePath, "test");
     const provider = createIcloudPdProvider({
       executablePath,
-      runCommand: async (_executable, args) => {
+      runCommand: async (_executable, args, options) => {
         calls.push(args);
         if (args.includes("--version")) return { stdout: "version:1.32.3\n", stderr: "" };
-        if (args.includes("--list-libraries")) return { stdout: "SharedSync\n", stderr: "" };
+        assert.equal(options.env.FRAMEBASE_VERIFY_SESSION, "1");
+        for (const key of ["FRAMEBASE_DELETE_REQUEST", "FRAMEBASE_DELETE_COMMIT", "FRAMEBASE_INVENTORY_JSON", "FRAMEBASE_INVENTORY_RECOVERY_POLICY"]) assert.equal(options.env[key], undefined);
+        if (args.includes("--list-libraries")) return { stdout: 'FRAMEBASE_INDEXING {"indexingState":"FAILED","zoneName":"PrimarySync","readProbe":"readable","count":4152}\nSharedSync\n', stderr: "" };
+        assert.ok(!args.some(arg => arg.startsWith("FRAMEBASE_")));
         if (args.includes("--only-print-filenames")) return args.includes("SharedSync")
           ? { stdout: `${photoPath}\n${liveVideoPath}\n${rawPath}\n`, stderr: "" }
           : { stdout: "", stderr: "" };
@@ -1006,4 +1009,23 @@ test("recovery timeout remains incomplete and changed inventory invalidates cool
   assert.equal(reverseCalls, 2);
   assert.equal((await provider.scanTimeline({ ...context, appleAccount: 'bob@example.com', jobKey: 'bob' })).status, 'incomplete');
   assert.equal(reverseCalls, 3);
+});
+
+
+test("full backup records structured indexing failure with actionable backup advice", async t => {
+  const root = await mkdtemp(join(tmpdir(), "framebase-backup-indexing-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executablePath = join(root, "icloudpd.exe"); await writeFile(executablePath, "test");
+  const logs = [];
+  const provider = createIcloudPdProvider({ executablePath, runCommand: async (_exe, args, options) => {
+    if (args.includes("--version")) return { stdout: "version:1.32.3" };
+    assert.equal(options.env.FRAMEBASE_VERIFY_SESSION, "1");
+    throw Object.assign(new Error("exit 1"), { code: 1, stdout: 'FRAMEBASE_ERROR {"status":"photos_error","reason":"photos_indexing_failed","indexingState":"FAILED"}' });
+  } });
+  const result = await provider.backupAll({ jobKey: 'alice', appleAccount: 'alice@example.com', domain: 'cn', sessionDirectory: join(root, 'session'), backupDirectory: join(root, 'backup'), debugLog: { write: (event, data) => logs.push({ event, data }) } });
+  assert.equal(result.status, 'indexing_failed');
+  assert.match(result.message, /兼容读取检查未能通过/);
+  assert.match(result.message, /本次备份无法继续/);
+  assert.doesNotMatch(result.message, /精确复核或删除|已自动重试/);
+  assert.ok(logs.some(log => log.event === 'backup_tool_failure' && log.data.records[0].indexingState === 'FAILED'));
 });

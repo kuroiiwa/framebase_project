@@ -13,6 +13,7 @@ import ConfirmationDialog, { type ConfirmationRequest } from "./confirmation-dia
 import CloudDeleteWindow from "./cloud-delete-window";
 import { waitForCloudDelete, type CloudDeleteJob } from "./icloud-delete-progress";
 import { collectCloudSelection } from "./photos/bulk-selection";
+import { createMovPreviewBlob } from "./mov-preview";
 
 type FsPermission = "granted" | "denied" | "prompt";
 type FileHandle = {
@@ -295,16 +296,27 @@ async function scanDirectory(source: SourceFolder, marks: Record<string, VideoMa
 
 async function buildPreview(item: VideoItem): Promise<CachedInfo> {
   const file = await item.handle.getFile();
+  try { return await buildVideoPreview(file); }
+  catch (error) {
+    if (!/\.mov$/i.test(file.name) || (error as { mediaCode?: number })?.mediaCode !== 4) throw error;
+    const compatible = await createMovPreviewBlob(file);
+    if (!compatible) throw error;
+    try { return await buildVideoPreview(compatible); }
+    catch (fallbackError) { throw new Error(`MOV 兼容预览仍失败：${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}。请检查当前浏览器的视频解码支持。`); }
+  }
+}
+
+async function buildVideoPreview(file: Blob): Promise<CachedInfo> {
   const url = URL.createObjectURL(file);
   const video = document.createElement("video");
   video.preload = "metadata";
   video.muted = true;
-  video.src = url;
   try {
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("读取视频元数据超时")), 10000);
       video.onloadedmetadata = () => { clearTimeout(timer); resolve(); };
-      video.onerror = () => { clearTimeout(timer); reject(new Error("无法读取视频元数据")); };
+      video.onerror = () => { clearTimeout(timer); reject(Object.assign(new Error(`无法读取视频元数据（MediaError ${video.error?.code ?? "未知"}${video.error?.message ? `：${video.error.message}` : ""}）`), { mediaCode: video.error?.code })); };
+      video.src = url;
     });
     const seekTo = Math.min(Math.max(video.duration * 0.12, 0.2), Math.max(video.duration - 0.1, 0.2));
     if (Number.isFinite(seekTo)) {
@@ -413,6 +425,7 @@ function Library({ username }: { username: string }) {
   const [queueQuery, setQueueQuery] = useState("");
   useEffect(() => () => { if (scanControlRef.current) scanControlRef.current.cancelled = true; }, []);
   const [previewFailures, setPreviewFailures] = useState<Set<string>>(new Set());
+  const [previewFailureDetails, setPreviewFailureDetails] = useState<Map<string, string>>(new Map());
   const [retryingPreviews, setRetryingPreviews] = useState(false);
   const visiblePreviewIds = useRef<Set<string>>(new Set());
   const [tab, setTab] = useState<Tab>("all");
@@ -699,17 +712,22 @@ function Library({ username }: { username: string }) {
         await control?.checkpoint();
         if (cursor >= pending.length) break;
         const item = pending[cursor++];
+        let failureStage = "读取文件与生成画面";
         try {
           const info = await buildPreview(item);
           await control?.checkpoint();
           const file = await item.handle.getFile();
+          failureStage = "保存浏览器预览缓存";
           await dbSet(`media:${item.sourceId}:${item.path}:${file.size}:${file.lastModified}`, info);
           const thumbUrl = URL.createObjectURL(info.thumb);
           item.duration = info.duration; item.width = info.width; item.height = info.height; item.thumb = thumbUrl; item.cacheSize = info.thumb.size;
           setVideos(current => current.map(video => video.id === item.id ? { ...video, duration: info.duration, width: info.width, height: info.height, thumb: thumbUrl, cacheSize: info.thumb.size } : video));
           setPreviewFailures(current => { const next = new Set(current); next.delete(item.id); return next; });
+          setPreviewFailureDetails(current => { const next = new Map(current); next.delete(item.id); return next; });
         } catch (reason) {
           if (control?.cancelled) throw reason;
+          const detail = `${failureStage}：${reason instanceof Error || reason instanceof DOMException ? `${reason.name} · ${reason.message}` : String(reason)}`;
+          setPreviewFailureDetails(current => new Map(current).set(item.id, detail));
           setPreviewFailures(current => new Set(current).add(item.id));
           setScanTask(current => current && control ? { ...current, failed: current.failed + 1 } : current);
         }
@@ -743,6 +761,7 @@ function Library({ username }: { username: string }) {
           setVideos(current => current.map(video => video.id === item.id ? { ...video, thumb: url, cacheSize: cached.thumb.size, duration: cached.duration, width: cached.width, height: cached.height } : video));
         } else {
           setPreviewFailures(current => new Set(current).add(item.id));
+          setPreviewFailureDetails(current => new Map(current).set(item.id, "未找到预览缓存，尚不能判断文件解码是否失败。请点击“重试失败项”，再查看具体原因。"));
         }
       }
     }
@@ -1158,9 +1177,9 @@ function Library({ username }: { username: string }) {
           const file = await video.handle.getFile();
           if (file.size === 0) issues.push({ video, kind: "empty", detail: "文件大小为 0 B" });
           else if (file.size !== video.size || file.lastModified !== video.modified) issues.push({ video, kind: "changed", detail: "文件在上次扫描后已发生变化" });
-          else if (previewFailures.has(video.id) || video.duration == null) issues.push({ video, kind: "preview", detail: "预览或视频元数据尚不可用" });
-        } catch {
-          issues.push({ video, kind: "unavailable", detail: "文件不存在，或浏览器权限已失效" });
+          else if (previewFailures.has(video.id) || video.duration == null) issues.push({ video, kind: "preview", detail: previewFailureDetails.get(video.id) || "预览或视频元数据尚不可用" });
+        } catch (reason) {
+          issues.push({ video, kind: "unavailable", detail: `文件无法读取：${reason instanceof Error || reason instanceof DOMException ? `${reason.name} · ${reason.message}` : String(reason)}。请检查来源权限或重新选择文件夹。` });
         }
         setHealthProgress(index + 1);
         if (index % 20 === 0) await new Promise(resolve => setTimeout(resolve, 0));
@@ -1328,7 +1347,7 @@ function Library({ username }: { username: string }) {
         <>
           <section className="stats" aria-label="视频库统计">
             <div><span>视频</span><strong>{videos.length.toLocaleString()}</strong></div><div><span>总容量</span><strong>{formatBytes(totalSize)}</strong></div><div><span>已点赞</span><strong>{videos.filter(v => v.liked).length}</strong></div><div><span>待清理</span><strong>{videos.filter(v => v.cleanup).length}</strong></div>
-            <div className="cache"><span>预览缓存</span><strong><i style={{ background: `linear-gradient(90deg,#9bc834 ${cachePercent}%,#e5e7df ${cachePercent}%)` }} /> {cachePercent}%</strong><small>{videos.length > cachedCount + failedPreviews.length ? `${scanTask && !scanTask.active ? "预览待处理" : "正在加载预览"} · ${videos.length - cachedCount - failedPreviews.length} 个剩余` : failedPreviews.length ? "预览处理完成" : "缩略图与基础信息已就绪"}{failedPreviews.length > 0 && <> · {failedPreviews.length} 个失败 <button disabled={Boolean(scanTask?.active)} onClick={() => void retryPreviews()}>{retryingPreviews ? "重试中…" : "重试失败项"}</button></>}</small></div>
+            <div className="cache"><span>预览缓存</span><strong><i style={{ background: `linear-gradient(90deg,#9bc834 ${cachePercent}%,#e5e7df ${cachePercent}%)` }} /> {cachePercent}%</strong><small>{videos.length > cachedCount + failedPreviews.length ? `${scanTask && !scanTask.active ? "预览待处理" : "正在加载预览"} · ${videos.length - cachedCount - failedPreviews.length} 个剩余` : failedPreviews.length ? "预览处理完成" : "缩略图与基础信息已就绪"}{failedPreviews.length > 0 && <> · {failedPreviews.length} 个失败 <button disabled={Boolean(scanTask?.active)} onClick={() => void retryPreviews()}>{retryingPreviews ? "重试中…" : "重试失败项"}</button> <button disabled={healthRunning || Boolean(scanTask?.active)} onClick={() => void runHealthCheck()}>查看失败原因</button></>}</small></div>
           </section>
 
           <section className="insight-tools" aria-label="视频库工具">

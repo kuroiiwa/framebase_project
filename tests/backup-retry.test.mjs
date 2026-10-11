@@ -39,7 +39,7 @@ test("verification failure can recover on the second retry", async () => {
   assert.deepEqual(f.attempts, [0, 1, 2]);
 });
 
-for (const status of ["needs_auth", "tool_missing", "indexing_failed", "empty", "aborted"]) {
+for (const status of ["needs_auth", "tool_missing", "indexing_failed", "indexing", "empty", "aborted"]) {
   test(`${status} is returned without automatic retries`, async () => {
     const f = fixture([{ status }]);
     assert.equal((await runBackupWithRetries(f.options)).status, status);
@@ -92,7 +92,7 @@ test("server retry reloads verified files and completed ranges from the latest c
   };
   const controller = new AbortController();
   const run = vm.runInNewContext(`(${source.slice(start + 5, end)}\n})`, {
-    icloud, controller, current: { username: 'alice' }, context: {}, resumingExisting: false,
+    icloud, controller, backupLog: { write() {} }, current: { username: 'alice' }, context: {}, resumingExisting: false,
     previousState: state, previousManifest: { files }, initialCompletedRanges: [],
     ranges: [{ key: 'first' }, { key: 'second' }],
     icloudProvider: { backupAll: async options => {

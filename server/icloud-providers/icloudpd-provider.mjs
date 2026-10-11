@@ -22,6 +22,9 @@ function runExecutable(executablePath, args, options = {}) {
 
 function safeMessage(error) {
   const combined = `${error?.stdout || ""}\n${error?.stderr || ""}\n${error?.message || ""}`;
+  if (/(?:invalid|incorrect|wrong)\s+(?:(?:email|username)[\s/]+)?(?:password|credentials)\b|(?:apple\s*(?:id|account)|username|email)(?:\s+or|\s*\/)\s*password\s+(?:is\s+)?(?:incorrect|invalid)|password\s+(?:is\s+)?(?:incorrect|invalid)|INVALID_CREDENTIALS/i.test(combined)) {
+    return { status: "needs_auth", message: "Apple ID 或密码错误，请检查账号并重新输入密码。" };
+  }
   for (const line of combined.split(/\r?\n/)) {
     const marker = line.indexOf("FRAMEBASE_ERROR ");
     if (marker < 0) continue;
@@ -55,6 +58,17 @@ function spawnInteractive(executablePath, args, options = {}) {
 }
 
 const runningAuthStates = new Set(["starting", "waiting_password", "verifying", "waiting_mfa"]);
+
+function hasMfaPrompt(output) {
+  // Asset IDs and filenames can contain "2fa" or "verification code".
+  // Only interactive prompt text is evidence that input is required.
+  return output.split(/\r?\n/).some(line => {
+    const text = line.trim();
+    if (text.startsWith("FRAMEBASE_")) return false;
+    return /^(?:please\s+)?enter\s+(?:the\s+)?(?:(?:two-(?:factor|step) authentication|verification|security|2fa)\s+)?code\b/i.test(text)
+      || /^two-(?:factor|step) authentication (?:is )?required\b/i.test(text);
+  });
+}
 const photoExtensions = new Set(["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"]);
 const videoExtensions = new Set(["mov", "mp4", "m4v", "avi", "mkv", "mpeg", "mpg", "webm"]);
 const destructiveFlags = new Set(["--auto-delete", "--delete-after-download", "--keep-icloud-recent-days"]);
@@ -115,12 +129,13 @@ function publicAuthState(job) {
   return { status: job.status, message: job.message, startedAt: job.startedAt };
 }
 
-export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive, hashFile = sha256File, verificationConcurrency = 2, progressInterval = 1000 }) {
+export function createIcloudPdProvider({ executablePath, runCommand = runExecutable, spawnProcess = spawnInteractive, hashFile = sha256File, verificationConcurrency = 2, downloadConcurrency = 2, progressInterval = 1000 }) {
   const authJobs = new Map();
   const sessionSecrets = new Map();
   const assetLookupHints = new Map();
   let versionCache;
   const safeVerificationConcurrency = Math.min(4, Math.max(1, Math.floor(Number(verificationConcurrency) || 2)));
+  const safeDownloadConcurrency = Number.isFinite(Number(downloadConcurrency)) ? Math.min(8, Math.max(1, Math.floor(Number(downloadConcurrency) || 2))) : 2;
   const safeProgressInterval = Math.max(10, Math.floor(Number(progressInterval) || 1000));
 
   function runWithRuntimePassword(args, password, timeout = 120_000, signal, processOptions = {}) {
@@ -157,11 +172,11 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           if (typeof child.write === "function") child.write(`${password}\r`);
           else child.stdin.write(`${password}\n`);
         }
-        if (/two-factor authentication|2fa|verification code|security code|enter the code/i.test(output) && !settled) {
+        if (hasMfaPrompt(output) && !settled) {
           settled = true;
           clearTimeout(timer);
           child.kill();
-          reject(Object.assign(new Error("two-factor authentication required"), { stderr: output }));
+          reject(Object.assign(new Error("two-factor authentication required"), { code: "AUTH_MFA_REQUIRED", stderr: output }));
         }
       };
       if (typeof child.onData === "function") child.onData(observe);
@@ -204,7 +219,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         const version = basename(executablePath).includes("framebase-compatible")
           ? "1.32.3 · FrameBase 兼容版"
           : parsedVersion;
-        return { id: "icloudpd", available: true, version, executablePath };
+        return { id: "icloudpd", available: true, version, executablePath, ...(/FrameBase.*parallel downloads/i.test(versionOutput) ? { supportsParallelDownloads: true } : {}) };
       })();
       versionCache = entry;
       try { return await entry.promise; }
@@ -404,7 +419,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
     }
   }
 
-  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], ranges = [], initialCompletedRanges = [], signal, onProgress = () => undefined, onRangeComplete = () => undefined }) {
+  async function backupAll({ jobKey, appleAccount, domain, sessionDirectory, backupDirectory, previousFiles = [], ranges = [], initialCompletedRanges = [], signal, debugLog, onProgress = () => undefined, onRangeComplete = () => undefined }) {
     const providerInfo = await info();
     if (!providerInfo.available) return { status: "tool_missing", message: "找不到 icloudpd 可执行文件。", files: [], providerInfo };
     const password = sessionSecrets.get(jobKey);
@@ -423,9 +438,25 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       "--size", "original",
       "--live-photo-size", "original",
     ];
-    const run = (args, timeout, maxBuffer = 64 * 1024 * 1024) => password
-      ? runWithRuntimePassword(args, password, timeout, signal)
-      : runCommand(executablePath, args, { timeout, maxBuffer, signal });
+    // This marker enables the existing read-only probe for an abnormal index.
+    // Downloads remain non-destructive and still require local verification.
+    const backupEnv = { ...process.env, FRAMEBASE_VERIFY_SESSION: "1", FRAMEBASE_BACKUP_READONLY: "1" };
+    let indexingInProgress = false;
+    for (const key of ["FRAMEBASE_DELETE_REQUEST", "FRAMEBASE_DELETE_COMMIT", "FRAMEBASE_INVENTORY_JSON", "FRAMEBASE_INVENTORY_RECOVERY_POLICY", "FRAMEBASE_INVENTORY_DIRECTION"]) delete backupEnv[key];
+    const run = async (args, timeout, maxBuffer = 64 * 1024 * 1024) => {
+      const phase = args.includes("--list-libraries") ? "discovery" : args.includes("--only-print-filenames") ? "planning" : "downloading";
+      debugLog?.write("backup_tool_start", { phase, library: args.includes("--library") ? args[args.indexOf("--library") + 1] : "default", ...(phase === "downloading" ? { downloadThreads: args.includes("--threads-num") ? Number(args[args.indexOf("--threads-num") + 1]) : 1 } : {}) });
+      try {
+        const result = password
+          ? await runWithRuntimePassword(args, password, timeout, signal, { env: backupEnv, maxOutput: maxBuffer })
+          : await runCommand(executablePath, args, { timeout, maxBuffer, signal, env: backupEnv });
+        logToolDiagnostic(debugLog, "backup_tool_exit", result);
+        for (const marker of `${result.stdout || ""}\n${result.stderr || ""}`.matchAll(/FRAMEBASE_INDEXING\s+\{[^\r\n]+\}/g)) {
+          if (readIndexingDiagnostic({ stdout: marker[0] })?.indexingState === "RUNNING") indexingInProgress = true;
+        }
+        return result;
+      } catch (error) { logToolDiagnostic(debugLog, "backup_tool_failure", error); throw error; }
+    };
     const runProgressStep = async (operation, progress) => {
       const startedAt = Date.now();
       let polling = false;
@@ -494,7 +525,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       await onProgress({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], message: "正在读取 iCloud 图库清单…" });
       if (completedRanges.length === requestedRanges.length) return { status: "completed", message: `所选 ${completedRanges.length} 个时间范围已由本地完成记录确认，无需重复连接 iCloud、下载或哈希。`, files: [], planned: 0, downloadedBytes: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, completedRanges, providerInfo };
       const libraryResult = await runPlanningStep([...baseArgs, "--list-libraries"], 180_000, elapsed => ({ status: "planning", phase: "planning", rangeIndex: 0, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: 0, verified: 0, skipped: 0, failed: 0, verifiedBytes: 0, message: elapsed ? `正在连接 iCloud 并读取图库列表，已等待 ${elapsed} 秒…` : "正在连接 iCloud 并读取图库列表…" }));
-      const namedLibraries = [...new Set(cleanLines(libraryResult.stdout))].slice(0, 32);
+      const namedLibraries = [...new Set(cleanLines(libraryResult.stdout).filter(line => !/^FRAMEBASE_[A-Z_]+\s/.test(line)))].slice(0, 32);
       const libraries = [null, ...namedLibraries];
       const planByPath = new Map();
       const filesByPath = new Map();
@@ -581,7 +612,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           const { library, items } = operation;
           if (signal?.aborted) throw Object.assign(new Error("backup aborted"), { name: "AbortError" });
           const libraryArgs = library ? ["--library", library] : [];
-          const downloadArgs = [...mediaArgs, ...libraryArgs, ...rangeArgs(range)];
+          const downloadArgs = [...mediaArgs, ...libraryArgs, ...rangeArgs(range), ...(providerInfo.supportsParallelDownloads ? ["--threads-num", String(safeDownloadConcurrency)] : [])];
           if (downloadArgs.some(argument => destructiveFlags.has(argument))) throw new Error("unsafe backup arguments");
           await refreshDownloadMetrics(items, false);
           await onProgress({ status: "downloading", phase: "downloading", currentLibrary: library || "主图库", currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), message: `正在备份 ${rangeIndex}/${requestedRanges.length}：${currentRange} · ${library ? `图库“${library}”` : "主图库"}…` });
@@ -649,7 +680,8 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
             await onProgress({ status: "verifying", phase: "verifying", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges, planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), transferRateBps: 0, message: `正在使用 ${safeVerificationConcurrency} 路并行校验 ${rangeIndex}/${requestedRanges.length}：${currentRange}（${processed}/${verificationPlan.length}）…` });
           }
         }
-        const rangeVerified = verificationPlan.length > 0 && failed === failedBeforeRange;
+        const localRangeVerified = verificationPlan.length > 0 && failed === failedBeforeRange;
+        const rangeVerified = localRangeVerified && !indexingInProgress;
         if (rangeVerified) {
           if (!completedRanges.includes(range.key)) completedRanges.push(range.key);
           const rangeFiles = verificationPlan.map(item => filesByPath.get(item.relativePath)).filter(Boolean);
@@ -657,20 +689,29 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
         } else {
           const completedIndex = completedRanges.indexOf(range.key);
           if (completedIndex >= 0) completedRanges.splice(completedIndex, 1);
+          if (localRangeVerified && indexingInProgress) {
+            const rangeFiles = verificationPlan.map(item => filesByPath.get(item.relativePath)).filter(Boolean);
+            await onRangeComplete({ range, files: rangeFiles, completedRanges: [...completedRanges] });
+          }
         }
-        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), transferRateBps: 0, message: rangeVerified ? `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` : `${currentRange} 有文件未通过完整性校验，保留为未完成状态。` });
+        await onProgress({ status: rangeIndex === requestedRanges.length ? "verifying" : "planning", phase: rangeIndex === requestedRanges.length ? "verifying" : "planning", currentLibrary: null, currentRange, rangeIndex, rangeCount: requestedRanges.length, completedRanges: [...completedRanges], planned: planByPath.size, verified: filesByPath.size, skipped, failed, verifiedBytes, ...downloadMetrics(), transferRateBps: 0, message: rangeVerified ? `${currentRange} 已完成规划、下载和校验${rangeIndex < requestedRanges.length ? "，即将处理下一个时间范围。" : "。"}` : localRangeVerified && indexingInProgress ? `${currentRange} 当前可读取的本地文件已通过校验；Apple 索引仍在更新，范围完整性待确认。` : `${currentRange} 有文件未通过完整性校验，保留为未完成状态。` });
       }
       const files = [...filesByPath.values()];
       const verificationTotal = files.length + failed;
       if (verificationTotal === 0 && completedRanges.length === requestedRanges.length) return { status: "completed", message: `所选 ${completedRanges.length} 个时间范围已由本地完成记录确认，无需重复规划、下载或哈希。`, files: [], planned: 0, downloadedBytes: 0, skipped: 0, failed: 0, photoCount: 0, videoCount: 0, verifiedBytes: 0, completedRanges, providerInfo };
+      if (verificationTotal === 0 && indexingInProgress) return { status: "indexing", message: "Apple 图库索引仍在更新，本次未返回可验证的本地文件；不能确认图库为空或备份完整，请稍后继续。", files: [], planned: planByPath.size, completedRanges, providerInfo };
       if (verificationTotal === 0) return { status: "empty", message: "所选时间范围内没有找到可备份的图片或视频。", files: [], planned: planByPath.size, completedRanges, providerInfo };
       const photoCount = files.filter(item => item.mediaType === "photo").length;
       const videoCount = files.length - photoCount;
       if (failed > 0) return { status: "verification_failed", message: `${files.length}/${verificationTotal} 个文件通过 SHA-256 完整性校验，${failed} 个需要重试。`, files, planned: planByPath.size, plannedPhotoCount, plannedVideoCount, downloadedBytes: downloadMetrics().downloadedBytes, skipped, failed, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
+      if (indexingInProgress) return { status: "indexing", message: `已备份并校验 ${files.length} 个当前可读取文件；Apple 图库索引仍在更新，本次范围未标记完成。已保存本地文件和清单，请稍后继续检查剩余项目。`, files, planned: planByPath.size, plannedPhotoCount, plannedVideoCount, downloadedBytes: downloadMetrics().downloadedBytes, skipped, failed: 0, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
       return { status: "completed", message: `已依次完成 ${completedRanges.length} 个时间范围，验证 ${files.length} 个文件（图片 ${photoCount}、视频 ${videoCount}）；iCloud 原文件未删除。`, files, planned: planByPath.size, plannedPhotoCount, plannedVideoCount, downloadedBytes: downloadMetrics().downloadedBytes, skipped, failed: 0, photoCount, videoCount, verifiedBytes, completedRanges, providerInfo };
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) return { status: "aborted", message: "备份任务已安全停止，可稍后从本地已有文件继续。", files: [], providerInfo };
-      return { ...safeMessage(error), files: [], providerInfo };
+      const failure = safeMessage(error);
+      if (failure.status === "indexing") failure.message = "Apple 图库索引仍在更新（RUNNING），当前无法读取可备份的照片清单。已保留本地文件，请稍后继续；重新登录或增加下载线程无法解决索引更新。";
+      if (failure.status === "indexing_failed") failure.message = "Apple 图库索引失败（FAILED），兼容读取检查未能通过，本次备份无法继续。已保留本地文件；请打开 iCloud 网页版确认照片能否正常加载，稍后继续备份。若持续异常，请联系 Apple 支持。";
+      return { ...failure, files: [], providerInfo };
     }
   }
 
@@ -1069,7 +1110,7 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
       if (/icloud password|password for/i.test(job.output)) {
         job.status = "waiting_password";
         job.message = "请输入 Apple ID 密码。密码只会传给本机 icloudpd 进程。";
-      } else if (/two-factor authentication|2fa|verification code|security code|enter the code/i.test(job.output)) {
+      } else if (hasMfaPrompt(job.output)) {
         job.status = "waiting_mfa";
         job.message = "请输入 Apple 设备上显示的六位验证码。";
       }
