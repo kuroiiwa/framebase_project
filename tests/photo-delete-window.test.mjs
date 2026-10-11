@@ -36,7 +36,8 @@ function fixture(mode = 'icloud') {
   const context = {
     crypto: webcrypto, applyBatchRecycling: async () => {},
     MAX_PHOTO_SELECTION, collectCloudSelection, deleteMode: mode, releasingAsset: null, appleSessionBusy: false, autoReleaseAfterReview: false,
-    releaseCatalog: { releasePlan: { id: 'fake-plan' } }, deletePollAbort: { current: null },
+    releaseCatalog: { releasePlan: { id: 'fake-plan', assets: [{ id: 'fake-photo', library: 'test' }, { id: 'pending', library: 'test' }] } }, deletePollAbort: { current: null },
+    setReleaseCatalog: update => { context.releaseCatalog = update(context.releaseCatalog); },
     cloudAssetFor: item => ({ id: item.id, library: 'test', localFiles: [] }),
     setReleasingAsset: value => { state.releasingAsset = value; context.releasingAsset = value; },
     setError: value => { state.error = value; }, setNotice() {}, setDeleteElapsed() {}, setBatchLocalProgress() {},
@@ -83,6 +84,7 @@ test('accepted confirmation submits one background task and retains the result w
   assert.equal(f.state.finished, true);
   assert.equal(f.state.releasingAsset, null);
   assert.equal(f.state.error, '');
+  assert.deepEqual(Array.from(f.context.releaseCatalog.releasePlan.assets, asset => asset.id), ['pending']);
 });
 
 test('canceling local confirmation never hashes or recycles files', async () => {

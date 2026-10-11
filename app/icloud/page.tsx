@@ -87,8 +87,9 @@ function IcloudCenter({ username }: { username: string }) {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-  const [busy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | "release" | null>(null);
+  const [requestBusy, setBusy] = useState<"folder" | "path" | "connection" | "verify" | "auth" | "scan" | "backup" | "full" | "release" | null>(null);
   const [releaseProgress, setReleaseProgress] = useState<ReleaseProgress | null>(null);
+  const busy = requestBusy ?? (releaseProgress?.status === "running" ? "release" : null);
   const [releaseAcknowledged, setReleaseAcknowledged] = useState(false);
   const [timelineGranularity, setTimelineGranularity] = useState<TimelineGranularity>("years");
   const [timelineJob, setTimelineJob] = useState<TimelineJob | null>(null);
@@ -236,7 +237,6 @@ function IcloudCenter({ username }: { username: string }) {
   useEffect(() => {
     let cancelled = false;
     let polling = false;
-    let wasRunning = false;
     const poll = async () => {
       if (polling) return;
       polling = true;
@@ -246,9 +246,7 @@ function IcloudCenter({ username }: { username: string }) {
         if (!response.ok) throw new Error(data.error || "无法读取复核进度");
         if (cancelled) return;
         setReleaseProgress(data.releaseProgress);
-        if (data.releaseProgress.status === "running") { wasRunning = true; setBusy("release"); }
-        else {
-          if (wasRunning) { setBusy(current => current === "release" ? null : current); wasRunning = false; }
+        if (data.releaseProgress.status !== "running") {
           if (data.releasePlan) setConfig(current => current ? { ...current, releasePlan: data.releasePlan } : current);
           if (data.releaseProgress.status === "failed") setError(data.releaseProgress.message || "复核失败");
         }
@@ -440,8 +438,8 @@ function IcloudCenter({ username }: { username: string }) {
       setReleaseAcknowledged(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法生成释放计划");
-      setBusy(null);
     }
+    finally { setBusy(current => current === "release" ? null : current); }
   }
 
   async function confirmReleasePlan(event: React.FormEvent) {

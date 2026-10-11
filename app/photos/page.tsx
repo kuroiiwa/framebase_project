@@ -12,7 +12,7 @@ import { findLivePhotoVideo } from "../../shared/live-photo.mjs";
 import AppleSessionControls from "../apple-session-controls";
 import styles from "./photos.module.css";
 import actionStyles from "../media-actions.module.css";
-import { collectCloudSelection, MAX_PHOTO_SELECTION } from "./bulk-selection";
+import { collectCloudSelection, MAX_PHOTO_SELECTION, nextCloudReleaseBatch } from "./bulk-selection";
 import { viewerAfterRemoval } from "./viewer-navigation";
 import { decodeHeicPreview } from "./heic-preview";
 import { createBrowserThumbnail } from "./thumbnail-preview";
@@ -838,6 +838,7 @@ function PhotoLibrary({ username }: { username: string }) {
         setDeleteElapsed(completed.elapsedSeconds || 0);
         const data = completed.result;
         const deletedKeys = new Set((data?.releaseResult?.results || []).filter(result => result.status === "deleted").map(result => result.library + ":" + result.id));
+        setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(asset => !deletedKeys.has(`${asset.library}:${asset.id}`)) } : null } : current);
         const recycledPaths = new Set((data?.recycleResult?.results || []).filter(result => result.status === "recycled").map(result => result.relativePath.replaceAll("\\", "/").toLowerCase()));
         const outcomes = selection.matched.map(({ item, asset }) => ({ item, mainDeleted: asset.localFiles.some(path => path.split(/[\\/]/).pop()?.toLowerCase() === item.name.toLowerCase() && recycledPaths.has(path.replaceAll("\\", "/").toLowerCase())), companionDeleted: Boolean(item.liveVideo && asset.localFiles.some(path => path.split(/[\\/]/).pop()?.toLowerCase() === item.liveVideo?.name.toLowerCase() && recycledPaths.has(path.replaceAll("\\", "/").toLowerCase()))) }));
         if (recycleLocal) await applyBatchRecycling(items, outcomes);
@@ -1060,6 +1061,34 @@ function PhotoLibrary({ username }: { username: string }) {
     setViewerId(filtered[(viewerIndex + direction + filtered.length) % filtered.length].id);
   }, [filtered, viewerIndex]);
   const selectedPhotos = photos.filter(item => selectedIds.includes(item.id));
+  const pendingCloudBatch = useMemo(() => nextCloudReleaseBatch(filtered, cloudAssetFor), [filtered, cloudAssetFor]);
+  function selectNextCloudBatch() {
+    setSelectionMode(true);
+    setSelectedIds(pendingCloudBatch.batch.map(item => item.id));
+    setNotice(`已跨页选中 ${pendingCloudBatch.batch.length} 个未释放云端项目，当前筛选剩余 ${pendingCloudBatch.remaining} 个。已释放及未匹配文件不会选中；点击“安全释放 iCloud”复核并确认。`);
+  }
+  async function releaseAllFilteredCloudPhotos() {
+    if (releasingAsset !== null || appleSessionBusy || releaseCatalogLoading || releaseCatalogError || dialogItems.length) return;
+    const selection = collectCloudSelection(filtered, cloudAssetFor);
+    if (!selection.assets.length) return;
+    const confirmed = window.confirm(`自动释放当前筛选下全部 ${selection.assets.length} 个未释放云端项目？\n\n共 ${Math.ceil(selection.assets.length / 100)} 批，每批最多 100 个；确认后后台将逐批复核并删除，无需逐批确认。遇到异常自动停止。\n\n本地原片保留，未匹配文件跳过。云端项目移入“最近删除”。\n\n如需处理整个图片库，请先取消所有筛选。`);
+    if (!confirmed) return;
+    setReleasingAsset("all"); setError(""); setNotice("");
+    try {
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: selection.assets.map(asset => `${asset.library}:${asset.id}`), recycleLocal: false, confirmation: true, autoBatches: true, background: true }) });
+      const started = await response.json() as { deleteJob?: DeleteJob; error?: string };
+      if (!response.ok || !started.deleteJob?.id) throw new Error(started.error || "自动分批任务未启动。");
+      setDeleteJob(started.deleteJob);
+      const completed = await waitForCloudDelete<DeleteJob>(started.deleteJob.id, setDeleteJob, deletePollAbort.current?.signal);
+      const deleted = new Set((completed.result?.releaseResult?.results || []).filter(item => item.status === "deleted").map(item => `${item.library}:${item.id}`));
+      setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(asset => !deleted.has(`${asset.library}:${asset.id}`)) } : null } : current);
+      setSelectedIds(current => current.filter(id => !selection.matched.some(({ item, asset }) => item.id === id && deleted.has(`${asset.library}:${asset.id}`))));
+      await refreshReleaseCatalog();
+      setNotice(completed.message || "自动分批已结束。");
+      if (completed.status !== "completed") setError(completed.message || "自动分批未完成，剩余项目已保留。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "自动分批失败，请查看后台状态，勿重复提交。"); }
+    finally { setReleasingAsset(null); }
+  }
   const dialogItems = bulkDeleteItems.length ? bulkDeleteItems : deleteItem ? [deleteItem] : [];
   const dialogCloudSelection = collectCloudSelection(dialogItems, cloudAssetFor);
   const cloudDeleteAvailable = !releaseCatalogLoading && !releaseCatalogError && dialogCloudSelection.assets.length > 0;
@@ -1154,11 +1183,13 @@ function PhotoLibrary({ username }: { username: string }) {
       <button className={actionStyles.button} onClick={toggleSelectionMode}>{selectionMode ? "退出多选" : "批量选择"}</button>
       {selectionMode && <div className={styles.selectionSummary}><strong>已选 {selectedPhotos.length} 张</strong><span>每批最多 {MAX_PHOTO_SELECTION} 张 · 支持跨页与拖动框选</span></div>}
       <div className={styles.selectionTools}>
+        <button className={actionStyles.button} disabled={loading || releasingAsset !== null || appleSessionBusy || releaseCatalogLoading || Boolean(releaseCatalogError) || Boolean(dialogItems.length) || !pendingCloudBatch.remaining} onClick={() => void releaseAllFilteredCloudPhotos()}>自动分批释放全部（{pendingCloudBatch.remaining}）</button>
+        <button className={actionStyles.button} disabled={loading || releasingAsset !== null || releaseCatalogLoading || Boolean(releaseCatalogError) || !pendingCloudBatch.remaining} title="按当前筛选跨页选择，自动跳过已释放和未匹配文件；请先复核并确认释放计划" onClick={selectNextCloudBatch}>选择下一批未释放（{pendingCloudBatch.batch.length} / 剩余 {pendingCloudBatch.remaining}）</button>
         {selectionMode && <button className={actionStyles.button} onClick={() => setSelectedIds([...new Set([...selectedPhotos.map(item => item.id), ...visible.map(item => item.id)])].slice(0, MAX_PHOTO_SELECTION))}>选择本页</button>}
         <button className={actionStyles.button} disabled={loading || !filtered.length} title="选择当前筛选结果，可跨页选择" onClick={selectAllFiltered}>{filtered.length > MAX_PHOTO_SELECTION ? '全选前 ' + MAX_PHOTO_SELECTION + ' 张' : selectionMode ? '全选筛选结果' : '快捷全选'}</button>
         {selectionMode && <button className={actionStyles.button} disabled={!selectedPhotos.length} onClick={() => setSelectedIds([])}>清空</button>}
       </div>
-      {selectionMode && <div className={styles.selectionActions}><button className={actionStyles.button + ' ' + styles.bulkCleanup} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>加入待整理</button><button className={actionStyles.button + ' ' + actionStyles.dangerButton} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除 {selectedPhotos.length} 张</button></div>}
+      {selectionMode && <div className={styles.selectionActions}><button className={actionStyles.button + ' ' + styles.bulkCleanup} disabled={loading || !selectedPhotos.length} onClick={markSelectedForCleanup}>加入待整理</button><button className={actionStyles.button} disabled={loading || releasingAsset !== null || releaseCatalogLoading || Boolean(releaseCatalogError) || !collectCloudSelection(selectedPhotos, cloudAssetFor).assets.length} onClick={() => openDeleteDialog(selectedPhotos, "icloud")}>安全释放 iCloud</button><button className={actionStyles.button + ' ' + actionStyles.dangerButton} disabled={loading || releasingAsset !== null || !selectedPhotos.length} onClick={() => openDeleteDialog(selectedPhotos)}>删除 {selectedPhotos.length} 张</button></div>}
     </section>
     <section className={styles.libraryHead}><p>显示 <strong>{filtered.length}</strong> 张图片</p>{pageCount > 1 && <div ref={paginationRef}><button disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pageCount}</span><button disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></div>}</section>
     {pageCount > 1 && !paginationVisible && !viewer && (dialogItems.length === 0 || deleteMinimized) && <nav className={`${styles.floatingPagination} ${dialogItems.length > 0 && deleteMinimized ? styles.floatingPaginationWithTask : ""}`} aria-label="悬浮图片翻页"><button className={actionStyles.button} disabled={currentPage === 1} onClick={() => changePhotoPage(currentPage - 1)}>← 上一页</button><span aria-live="polite">{currentPage} / {pageCount}</span><button className={actionStyles.button} disabled={currentPage === pageCount} onClick={() => changePhotoPage(currentPage + 1)}>下一页 →</button><button className={`${actionStyles.button} ${styles.floatingSelect}`} aria-pressed={selectionMode} onClick={toggleSelectionMode}>{selectionMode ? "退出多选" : "进入多选"}</button><PhotoPageJump page={currentPage} pageCount={pageCount} onChange={changePhotoPage} /></nav>}

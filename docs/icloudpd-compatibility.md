@@ -315,3 +315,9 @@ node --test tests/icloud-parallel-backup.test.mjs tests/icloud-provider.test.mjs
 Provider 检查每个工具步骤返回的所有索引诊断。只要本轮观察到 `RUNNING`，本地校验成功的文件仍写入清单，但本轮范围不记为完成；后台将任务保存为“已暂停”，提示索引更新后继续。下次继续会复用本地文件，索引恢复且校验通过后才记录完整范围。空结果不能据此判断图库为空。`RUNNING` 与 `FAILED` 的提示分别说明“索引更新中”和“索引失败”；新备份探测不改变云端删除的限制。
 
 更新后需重新运行 `build-parallel-downloads.ps1` 并重启后台。离线验证增加 `tests/test_icloudpd_backup_indexing.py` 与 `tests/icloud-backup-indexing.test.mjs`，覆盖只读探测、不可读/网络失败、删除保护、部分文件持久化以及索引恢复后的完成记录。
+
+### 索引更新期间的精确删除复核
+
+Apple 的正常记录会省略 `isDeleted` / `isExpunged`，直接 lookup 缺失这些字段仍不能独立证明项目处于活动状态。`RUNNING` 时，若只读探测通过，现在允许通过 Apple 的 `CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted` 活动图库查询定位指定目标：有时间与数量上限，必须完整找到本批目标，并检查 master/asset 关联、最新 change tag 和异常/删除标记。所有目标先物化，随后仍逐项比较 ID、图库、文件名、拍摄时间、媒体类型、原始大小，再使用带 change tag 的条件更新。找不到目标不会推断其不存在，也不会提交不完整批次。
+
+FrameBase 删除请求必须检查 Apple 修改响应明确返回目标 `isDeleted=1`，HTTP 200 或含记录级错误都不能算确认删除成功。`enable-delete-indexing-compat.py` 与 `delete-indexing-compat.py` 保存补丁，构建脚本自动安装。日志 `delete_index_compat` 记录目标数和匹配数，不记录照片内容或会话凭据。离线回归：`tests/test_icloudpd_delete_indexing.py`。

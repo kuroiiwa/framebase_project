@@ -913,7 +913,7 @@ test("Apple indexing errors preserve the plan and do not imply missing photos", 
    throw Object.assign(new Error("exit 1"),{stdout:'FRAMEBASE_ERROR {"status":"photos_error","reason":"photos_indexing"}\n'});
   }});
   const result=await provider.verifyExistingSession({appleAccount:"test@example.com",domain:"cn",sessionDirectory:join(root,"session"),backupDirectory:root});
-  assert.equal(result.status,"indexing");assert.match(result.message,/无需因此重新生成/);assert.doesNotMatch(result.message,/未找到|失效/);
+  assert.equal(result.status,"indexing");assert.match(result.message,/无需因此重新生成/);assert.match(result.message,/验证已有会话与照片图库/);assert.doesNotMatch(result.message,/未找到|失效/);
  }finally{await rm(root,{recursive:true,force:true});}
 });
 

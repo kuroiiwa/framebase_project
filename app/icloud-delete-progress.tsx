@@ -4,6 +4,7 @@ import { DebugLogLink, type DebugLog } from "./icloud-debug-log";
 import styles from "./media-actions.module.css";
 
 export type CloudDeleteJob = {
+  autoBatches?: boolean; stopRequested?: boolean;
   debugLog?: DebugLog;
   preview?: boolean; id?: string; status: "idle" | "running" | "completed" | "partial" | "failed";
   phase?: string; name?: string; message?: string; startedAt?: number; elapsedSeconds?: number;
@@ -38,5 +39,14 @@ export function CloudDeleteProgress({ job, elapsedSeconds }: { job: CloudDeleteJ
     <dl><div><dt>已耗时</dt><dd>{elapsedSeconds ?? job.elapsedSeconds ?? 0} 秒</dd></div><div><dt>云端已返回结果</dt><dd>{job.processed || 0} / {job.total || 1}</dd></div><div><dt>已确认移入最近删除</dt><dd>{job.deleted || 0} / {job.total || 1}</dd></div></dl>
     <DebugLogLink log={job.debugLog} />
     {job.status === "running" && <small>Apple 尚未返回结果时不显示估算百分比。任务在后台继续，请勿重复提交。</small>}
+    {job.status === "running" && job.autoBatches && <button disabled={job.stopRequested} onClick={async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/icloud/release/delete/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jobId: job.id }) });
+        const data = await response.json() as { error?: string };
+        if (!response.ok) throw new Error(data.error || "停止请求未成功，请重试。");
+      } catch (reason) { button.disabled = false; window.alert(reason instanceof Error ? reason.message : "停止请求未成功，请重试。"); }
+    }}>{job.stopRequested ? "已请求停止，等待本批结束" : "停止后续批次"}</button>}
   </div>;
 }

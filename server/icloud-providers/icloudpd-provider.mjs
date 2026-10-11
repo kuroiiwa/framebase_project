@@ -31,7 +31,7 @@ function safeMessage(error) {
     try {
       const detail = JSON.parse(line.slice(marker + "FRAMEBASE_ERROR ".length));
       if (detail.status === "photos_error" && (detail.reason === "photos_indexing_failed" || detail.indexingState === "FAILED")) return { status: "indexing_failed", message: "Apple 照片图库索引返回 FAILED（失败），当前无法精确复核或删除。请先打开 iCloud 网页版照片检查图库是否正常加载、是否提示修复或需要确认；若持续失败，请联系 Apple 支持。现有释放计划保留，本次未执行删除；重新登录 FrameBase 或重建计划无法修复 Apple 索引。" };
-      if (detail.status === "photos_error" && detail.reason === "photos_indexing") return { status: "indexing", message: "Apple 照片图库尚未完成索引更新，暂时无法精确复核。现有释放计划保留，无需因此重新生成；请稍后验证图库并重试。" };
+      if (detail.status === "photos_error" && detail.reason === "photos_indexing") return { status: "indexing", message: "Apple 照片图库正在更新索引，当前无法完成精确复核。现有释放计划保留，无需因此重新生成。请打开 iCloud 网页版“照片”确认图库能正常加载；等待一段时间后，在 iCloud 页面点击“验证已有会话与照片图库”，再重试清理。验证通过后，删除前仍会再次复核；若仍提示索引更新，请继续等待，避免连续重试。若长时间持续出现，请联系 Apple 支持。" };
       const messages = { needs_auth: "Apple 登录或验证码验证未通过，请重新登录 Apple。", network_error: "未能连接 Apple iCloud 服务，云端复核没有完成；请检查网络或代理后重试。", photos_error: "Apple 照片图库访问失败，未完成复核；这不代表目标图片不存在。", error: "iCloud 工具执行失败，未完成云端复核，请重试。" };
       if (messages[detail.status]) return { status: detail.status, message: messages[detail.status] };
     } catch { /* Never expose untrusted diagnostic output. */ }
@@ -992,6 +992,15 @@ export function createIcloudPdProvider({ executablePath, runCommand = runExecuta
           if (seenProtocolLines.has(line)) return;
           seenProtocolLines.add(line);
           const indexing = readIndexingDiagnostic({ stdout: line });
+          if (line.startsWith("FRAMEBASE_DELETE_INDEX_COMPAT ")) {
+            try {
+              const diagnostic = JSON.parse(line.slice("FRAMEBASE_DELETE_INDEX_COMPAT ".length));
+              debugLog?.write("delete_index_compat", { library, ...diagnostic });
+              scanMessage = `图库索引更新中，已通过活动图库查询精确复核 ${diagnostic.matched}/${diagnostic.requested} 个目标；仅完整复核通过后继续。`;
+              publish();
+            } catch { /* Ignore malformed diagnostics. */ }
+            return;
+          }
           if (indexing) { indexingFallback = true; scanMessage = `索引状态为 ${indexing.indexingState}，只读查询通过；正在检查最近删除并精确复核目标…`; publish(); return; }
           if (line.includes("FRAMEBASE_DELETE_LIMIT ")) {
             scanMessage = "只读复核已达到查找时间上限，正在汇总已精确匹配的结果；未匹配项目不会删除。";

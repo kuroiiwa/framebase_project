@@ -5,6 +5,8 @@ $sourceRoot = Join-Path $toolRoot 'source-review/icloud_photos_downloader-master
 $python = Join-Path $sourceRoot '.venv/Scripts/python.exe'
 & $python (Join-Path $PSScriptRoot 'enable-parallel-downloads.py') $sourceRoot
 if ($LASTEXITCODE -ne 0) { throw 'Cannot apply download concurrency changes.' }
+& $python (Join-Path $PSScriptRoot 'enable-delete-indexing-compat.py') $sourceRoot
+if ($LASTEXITCODE -ne 0) { throw 'Cannot apply deletion indexing compatibility changes.' }
 $starterPath = Join-Path $sourceRoot 'src/starters/icloudpd.py'
 $starter = [IO.File]::ReadAllText($starterPath)
 $starter = $starter.Replace('FrameBase inventory recovery', 'FrameBase inventory recovery + parallel downloads')

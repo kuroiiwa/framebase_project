@@ -1,5 +1,19 @@
 export const MAX_PHOTO_SELECTION = 100;
 
+export function nextCloudReleaseBatch<T, A extends { id: string; library: string }>(items: T[], match: (item: T) => A | null) {
+  const seen = new Set<string>();
+  const batch: T[] = [];
+  for (const item of items) {
+    const asset = match(item);
+    if (!asset) continue;
+    const key = `${asset.library}:${asset.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (batch.length < MAX_PHOTO_SELECTION) batch.push(item);
+  }
+  return { batch, remaining: seen.size };
+}
+
 export function collectCloudSelection<T, A extends { id: string; library: string }>(items: T[], match: (item: T) => A | null) {
   const assets = new Map<string, A>();
   const matched: Array<{ item: T; asset: A }> = [];

@@ -18,7 +18,7 @@ find(ast);
 assert.ok(workflow);
 const compiled = ts.transpileModule(workflow + '\n' + batchWorkflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
-function fixture(answers, { previewFails = false, reviewResults, recycle = false, batchItems, matches = {}, deleted, recycled, partial = false } = {}) {
+function fixture(answers, { previewFails = false, reviewResults, recycle = false, batchItems, matches = {}, deleted, recycled, partial = false, indexing = false } = {}) {
   const calls = []; const prompts = []; const errors = []; const releasing = []; const jobs = [];
   const current = { videos: [{ id: 'video', sourceId: 'source', size: 123 }, { id: 'survivor', sourceId: 'source', size: 456, liked: true }], sources: [{ id: 'source', videoCount: 2, totalSize: 579 }] };
   let savedVideos;
@@ -43,6 +43,11 @@ function fixture(answers, { previewFails = false, reviewResults, recycle = false
     waitForCloudDelete: async (id, progress) => {
       progress({ id, status: 'running', phase: id === 'review' ? 'verifying' : 'deleting' });
       const completed = { id, status: id === 'review' ? previewFails ? 'failed' : reviewResults ? 'partial' : 'completed' : partial ? 'partial' : 'completed', message: partial ? 'partial result' : 'done', result: id === 'review' ? { releaseResult: { status: previewFails ? 'failed' : reviewResults ? 'incomplete' : 'matched', results: previewFails ? [] : reviewResults || allAssets.map(asset => ({ id: asset.id, library: asset.library, status: 'matched' })) }, localRecyclePlan: { fileCount: 1, bytes: 123 } } : { releaseResult: { status: 'deleted', results: allAssets.filter(asset => calls.at(-1).body.assetKeys.includes(`${asset.library}:${asset.id}`)).map(asset => ({ id: asset.id, library: asset.library, status: !deleted || deleted.includes(asset.id) ? 'deleted' : 'failed' })) }, ...(recycle ? { recycleResult: { status: 'recycled', message: 'done', results: (recycled || ['test.mov']).map(relativePath => ({ relativePath, status: 'recycled' })) } } : {}) } };
+      if (id !== 'review' && indexing) {
+        completed.status = 'failed';
+        completed.message = 'Apple 照片图库正在更新索引，请稍后验证并重试。';
+        completed.result.releaseResult = { status: 'indexing', results: [] };
+      }
       progress(completed);
       return completed;
     },
@@ -188,4 +193,17 @@ test('no verified requested assets refuses deletion even with a foreign matched 
   assert.equal(f.calls.length, 1);
   assert.equal(f.prompts.length, 1);
   assert.equal(f.errors.length, 1);
+});
+
+test('indexing after successful preview reports all pending assets and retains the selection and plan', async () => {
+  const f = fixture(['both', 'confirm'], { batchItems, matches, indexing: true });
+  await f.runBatch();
+  assert.match(f.jobs.at(-1).message, /预览复核已通过.*删除前再次复核/);
+  assert.match(f.jobs.at(-1).message, /云端已确认删除 0\/2/);
+  assert.match(f.jobs.at(-1).message, /2 个项目未确认删除，已保留在释放计划中/);
+  assert.match(f.jobs.at(-1).message, /跳过 1 个未匹配视频/);
+  assert.doesNotMatch(f.jobs.at(-1).message, /保留 0 个|预览未通过/);
+  assert.deepEqual(f.selected(), ['video', 'second', 'unmatched']);
+  assert.deepEqual(f.catalog().releasePlan.assets.map(asset => asset.id), ['one', 'two']);
+  assert.equal(f.savedVideos(), undefined);
 });

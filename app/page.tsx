@@ -12,7 +12,7 @@ import AdminDashboard from "./admin-dashboard";
 import ConfirmationDialog, { type ConfirmationRequest } from "./confirmation-dialog";
 import CloudDeleteWindow from "./cloud-delete-window";
 import { waitForCloudDelete, type CloudDeleteJob } from "./icloud-delete-progress";
-import { collectCloudSelection } from "./photos/bulk-selection";
+import { collectCloudSelection, nextCloudReleaseBatch } from "./photos/bulk-selection";
 import { createMovPreviewBlob } from "./mov-preview";
 
 type FsPermission = "granted" | "denied" | "prompt";
@@ -519,7 +519,20 @@ function Library({ username }: { username: string }) {
   const [releasingAsset, setReleasingAsset] = useState<string | null>(null);
   const [videoDeleteJob, setVideoDeleteJob] = useState<VideoCloudDeleteJob | null>(null);
   const videoDeleteAbort = useRef<AbortController | null>(null);
-  useEffect(() => () => { videoDeleteAbort.current?.abort(); }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    videoDeleteAbort.current = controller;
+    void fetch("/api/icloud/release/delete/status", { cache: "no-store", signal: controller.signal }).then(response => response.json() as Promise<{ deleteJob?: VideoCloudDeleteJob }>).then(async data => {
+      if (controller.signal.aborted || data.deleteJob?.status !== "running" || !data.deleteJob.id) return;
+      setReleasingAsset(data.deleteJob.id); setVideoDeleteJob(data.deleteJob);
+      const completed = await waitForCloudDelete<VideoCloudDeleteJob>(data.deleteJob.id, setVideoDeleteJob, controller.signal);
+      setNotice(completed.message || "后台清理已结束。");
+      const response = await fetch("/api/icloud/release/catalog", { cache: "no-store", signal: controller.signal });
+      if (response.ok) setReleaseCatalog(await response.json() as ReleaseCatalog);
+      setReleasingAsset(null);
+    }).catch(reason => { if (!controller.signal.aborted) { setError(reason instanceof Error ? reason.message : "无法恢复后台清理进度。"); setReleasingAsset(null); } });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => { localStorage.setItem(accountKey("framebase-last-library"), "video"); }, []);
 
@@ -601,7 +614,9 @@ function Library({ username }: { username: string }) {
       }
       const finishedIds = new Set(recycleLocal ? recycledIds : successful.map(({ item }) => item.id));
       setSelected(current => new Set([...current].filter(id => !finishedIds.has(id))));
-      const resultSummary = `云端已确认删除 ${deletedKeys.size}/${verifiedAssets.length} 个项目${recycleLocal ? `，本地已回收 ${recycledIds.size} 个所选视频` : "，本地视频保留"}；保留 ${unverifiedCount} 个未通过复核的云端项目，跳过 ${selection.skipped.length} 个未匹配视频。`;
+      const pendingCount = verifiedAssets.length - deletedKeys.size;
+      const indexingSummary = data.releaseResult.status === "indexing" ? "预览复核已通过，但删除前再次复核遇到 Apple 图库索引更新，清理已暂停。" : "";
+      const resultSummary = `${indexingSummary}云端已确认删除 ${deletedKeys.size}/${verifiedAssets.length} 个项目${recycleLocal ? `，本地已回收 ${recycledIds.size} 个所选视频` : "，本地视频保留"}。${pendingCount ? `另有 ${pendingCount} 个项目未确认删除，已保留在释放计划中，可稍后复核并重试。` : ""}${unverifiedCount ? `预览未通过的 ${unverifiedCount} 个云端项目未提交删除。` : ""}${selection.skipped.length ? `跳过 ${selection.skipped.length} 个未匹配视频。` : ""}`;
       setVideoDeleteJob(current => current ? { ...current, message: `${current.message || ""}\n${resultSummary}` } : current);
       setNotice(resultSummary);
       if (completed.status !== "completed") setError(completed.message || "部分视频未完成，失败项已保留。");
@@ -1118,6 +1133,36 @@ function Library({ username }: { username: string }) {
   }, [videos, sourceFilter, tab, query, customTags, selectedTagIds, tagMatch, format, resolutionFilter, durationFilter, sort, randomSeed, popularitySeed]);
 
   const selectedVideos = videos.filter(video => selected.has(video.id));
+  const pendingCloudBatch = useMemo(() => nextCloudReleaseBatch(filtered, cloudAssetFor), [filtered, cloudAssetFor]);
+  function selectNextCloudBatch() {
+    setSelecting(true);
+    selectionAnchor.current = null;
+    setSelected(new Set(pendingCloudBatch.batch.map(item => item.id)));
+    setNotice(`已跨页选中 ${pendingCloudBatch.batch.length} 个未释放云端项目，当前筛选剩余 ${pendingCloudBatch.remaining} 个。已释放及未匹配文件不会选中；点击“批量安全释放 iCloud”复核并确认。`);
+  }
+  async function releaseAllFilteredCloudVideos() {
+    if (releasingAsset !== null) return;
+    const selection = collectCloudSelection(filtered, cloudAssetFor);
+    if (!selection.assets.length) return;
+    setReleasingAsset("all"); setError(null); setNotice(null);
+    try {
+      const confirmation = await requestCloudConfirmation({ title: "自动分批释放全部云端视频", message: `将处理当前筛选下全部 ${selection.assets.length} 个未释放云端项目，共 ${Math.ceil(selection.assets.length / 100)} 批，每批最多 100 个。\n\n确认后后台逐批复核并移入“最近删除”，无需逐批确认；遇到异常自动停止。可停止后续批次。\n\n本地视频保留，未匹配文件跳过。如需处理整个视频库，请先取消所有筛选。`, choices: [{ label: "取消", value: "cancel" }, { label: "确认自动分批释放全部", value: "confirm", danger: true }] });
+      if (confirmation !== "confirm") return;
+      const response = await fetch("/api/icloud/release/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ planId: releaseCatalog?.releasePlan?.id, assetKeys: selection.assets.map(asset => `${asset.library}:${asset.id}`), recycleLocal: false, confirmation: true, autoBatches: true, background: true }) });
+      const started = await response.json() as { deleteJob?: VideoCloudDeleteJob; error?: string };
+      if (!response.ok || !started.deleteJob?.id) throw new Error(started.error || "自动分批任务未启动。");
+      setVideoDeleteJob(started.deleteJob);
+      const completed = await waitForCloudDelete<VideoCloudDeleteJob>(started.deleteJob.id, setVideoDeleteJob, videoDeleteAbort.current?.signal);
+      const deleted = new Set((completed.result?.releaseResult?.results || []).filter(item => item.status === "deleted").map(item => `${item.library}:${item.id}`));
+      setReleaseCatalog(current => current ? { ...current, releasePlan: current.releasePlan ? { ...current.releasePlan, assets: current.releasePlan.assets.filter(asset => !deleted.has(`${asset.library}:${asset.id}`)) } : null } : current);
+      setSelected(current => new Set([...current].filter(id => !selection.matched.some(({ item, asset }) => item.id === id && deleted.has(`${asset.library}:${asset.id}`)))));
+      const catalogResponse = await fetch("/api/icloud/release/catalog", { cache: "no-store" });
+      if (catalogResponse.ok) setReleaseCatalog(await catalogResponse.json() as ReleaseCatalog);
+      setNotice(completed.message || "自动分批已结束。");
+      if (completed.status !== "completed") setError(completed.message || "自动分批未完成，剩余项目已保留。");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "自动分批失败，请查看后台状态，勿重复提交。"); }
+    finally { setReleasingAsset(null); }
+  }
   const videoById = useMemo(() => new Map(videos.map(video => [video.id, video])), [videos]);
   const availableQueue = playQueue.filter(id => videoById.has(id));
   const queuePosition = player ? availableQueue.indexOf(player.id) : -1;
@@ -1386,6 +1431,8 @@ function Library({ username }: { username: string }) {
             <div className="selection-actions">
               <button className="select-all" disabled={loading || !filtered.length} title={`选中当前筛选结果中的全部 ${filtered.length} 个视频（包含所有分页）`} onClick={() => { setSelecting(true); selectionAnchor.current = null; setSelected(new Set(filtered.map(video => video.id))); }}>全部选中</button>
               {selecting && <><button onClick={() => { selectionAnchor.current = null; setSelected(current => new Set([...current, ...paginatedVideos.map(v => v.id)])); }}>全选本页</button><button onClick={() => { selectionAnchor.current = null; setSelected(current => { const next = new Set(current); paginatedVideos.forEach(video => { if (next.has(video.id)) next.delete(video.id); else next.add(video.id); }); return next; }); }}>反选本页</button><button disabled={!selected.size} onClick={() => { setSelected(new Set()); selectionAnchor.current = null; }}>取消全部</button><span>已选 {selected.size} 个</span><button className="bulk-cloud-release" disabled={!selectedVideos.length || selectedVideos.length > 100 || releasingAsset !== null || releaseCatalog?.releasePlan?.status !== "confirmed"} title={selectedVideos.length > 100 ? "每批最多 100 个视频" : releaseCatalog?.releasePlan?.status !== "confirmed" ? "请先在 iCloud 备份中心复核并确认释放计划" : "仅处理精确匹配项目，每批最多 100 个"} onClick={() => void releaseSelectedVideosFromIcloud()}>批量安全释放 iCloud</button>{selected.size > 0 && <button className="danger-text" onClick={() => setConfirmDelete(true)}>删除</button>}</>}
+              <button className="select" disabled={loading || releasingAsset !== null || !pendingCloudBatch.remaining} onClick={() => void releaseAllFilteredCloudVideos()}>自动分批释放全部（{pendingCloudBatch.remaining}）</button>
+              <button className="select" disabled={loading || releasingAsset !== null || !pendingCloudBatch.remaining} title="按当前筛选跨页选择，自动跳过已释放和未匹配文件；请先复核并确认释放计划" onClick={selectNextCloudBatch}>选择下一批未释放（{pendingCloudBatch.batch.length} / 剩余 {pendingCloudBatch.remaining}）</button>
               <button className="select" aria-pressed={selecting} onClick={() => { setSelecting(value => !value); setSelected(new Set()); selectionAnchor.current = null; }}>{selecting ? "退出选择" : "选择"}</button>
             </div>
           </section>

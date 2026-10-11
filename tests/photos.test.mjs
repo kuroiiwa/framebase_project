@@ -2,6 +2,74 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { findPhotoCloudAsset } from "../app/photos/cloud-match.ts";
+import { nextCloudReleaseBatch, collectCloudSelection } from "../app/photos/bulk-selection.ts";
+import vm from "node:vm";
+import ts from "typescript";
+
+for (const [file, functionName] of [["photos/page.tsx", "releaseAllFilteredCloudPhotos"], ["page.tsx", "releaseAllFilteredCloudVideos"]]) {
+  for (const confirmed of [true, false]) test(`${functionName} ${confirmed ? 'submits every filtered matched asset once' : 'cancels without submitting'}`, async () => {
+    const source = await readFile(new URL(`../app/${file}`, import.meta.url), "utf8");
+    const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    let workflow;
+    function find(node) {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === functionName) workflow = node.getText(ast);
+      ts.forEachChild(node, find);
+    }
+    find(ast); assert.ok(workflow);
+    const assets = Array.from({ length: 205 }, (_, id) => ({ id: String(id), library: "main" }));
+    const calls = []; const prompts = []; let job;
+    const catalog = { releasePlan: { id: "plan", assets } };
+    const run = vm.runInNewContext(`${ts.transpileModule(workflow, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText}\n${functionName}`, {
+      releasingAsset: null, appleSessionBusy: false, releaseCatalogLoading: false, releaseCatalogError: "", dialogItems: [],
+      filtered: [...assets, { id: "unmatched" }], cloudAssetFor: item => item.library ? item : null, collectCloudSelection, releaseCatalog: catalog,
+      window: { confirm: message => { prompts.push(message); return confirmed; } },
+      requestCloudConfirmation: async prompt => { prompts.push(prompt.message); return confirmed ? "confirm" : "cancel"; },
+      setReleasingAsset() {}, setError() {}, setNotice() {}, setDeleteJob: value => { job = value; }, setVideoDeleteJob: value => { job = value; },
+      setReleaseCatalog: update => { if (typeof update === "function") catalog.releasePlan = update(catalog).releasePlan; },
+      setSelected: update => update(new Set()), setSelectedIds: update => update([]), refreshReleaseCatalog: async () => {},
+      deletePollAbort: { current: null }, videoDeleteAbort: { current: null },
+      fetch: async (url, options) => {
+        if (options?.method === "POST") { calls.push(JSON.parse(options.body)); return { ok: true, json: async () => ({ deleteJob: { id: "job", status: "running" } }) }; }
+        return { ok: true, json: async () => catalog };
+      },
+      waitForCloudDelete: async (_id, progress) => { const completed = { status: "completed", result: { releaseResult: { results: assets.map(asset => ({ ...asset, status: "deleted" })) } } }; progress(completed); return completed; },
+    });
+    await run();
+    assert.equal(prompts.length, 1); assert.match(prompts[0], /205/); assert.match(prompts[0], /本地/);
+    assert.equal(calls.length, confirmed ? 1 : 0);
+    if (confirmed) {
+      assert.equal(calls[0].autoBatches, true); assert.equal(calls[0].confirmation, true); assert.equal(calls[0].recycleLocal, false);
+      assert.equal(calls[0].assetKeys.length, 205); assert.ok(!calls[0].assetKeys.includes("main:unmatched"));
+      assert.equal(job.status, "completed"); assert.equal(catalog.releasePlan.assets.length, 0);
+    }
+  });
+}
+
+test("next release batch skips released and unmatched items, deduplicates cloud assets and advances after success", () => {
+  const items = Array.from({ length: 230 }, (_, id) => ({ id }));
+  const pending = new Set(items.slice(10, 220).map(item => item.id));
+  const match = item => pending.has(item.id) ? { id: String(item.id), library: "main" } : null;
+  const first = nextCloudReleaseBatch([items[0], items[10], ...items], match);
+  assert.equal(first.remaining, 210);
+  assert.equal(first.batch.length, 100);
+  assert.deepEqual(first.batch.map(item => item.id), items.slice(10, 110).map(item => item.id));
+  first.batch.forEach(item => pending.delete(item.id));
+  const second = nextCloudReleaseBatch(items, match);
+  assert.equal(second.remaining, 110);
+  assert.deepEqual(second.batch.map(item => item.id), items.slice(110, 210).map(item => item.id));
+  // Failed or unconfirmed results remain eligible for the next review.
+  second.batch.slice(0, 90).forEach(item => pending.delete(item.id));
+  const last = nextCloudReleaseBatch(items, match);
+  assert.equal(last.remaining, 20);
+  assert.equal(last.batch[0].id, 200);
+  assert.equal(nextCloudReleaseBatch(items.slice(210), match).remaining, 10);
+  assert.deepEqual(nextCloudReleaseBatch(items, () => null), { batch: [], remaining: 0 });
+});
+
+test("next release batch distinguishes identical asset IDs in separate libraries", () => {
+  const items = [{ id: "a", library: "one" }, { id: "a", library: "two" }];
+  assert.equal(nextCloudReleaseBatch(items, item => item).remaining, 2);
+});
 
 test("confirmed cloud photos match backup paths independently of local download dates", () => {
   const asset = { id: "photo-1", name: "IMG_2548.HEIC", mediaType: "photo", mainBytes: 100, localFiles: ["2023/12/31/IMG_2548.HEIC"] };

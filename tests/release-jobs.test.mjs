@@ -2,6 +2,56 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createReleaseDeleteJobs } from "../server/framebase-release-jobs.mjs";
 
+function automaticFixture(count, override) {
+  const assets = Array.from({ length: count }, (_, id) => ({ id: String(id), library: "main", name: `${id}.jpg` }));
+  const calls = [];
+  const records = [];
+  const jobs = createReleaseDeleteJobs({
+    icloud: { connectionContext: async () => ({}), recordReleasedAssets: async (_user, batch, result) => { records.push({ batch, result }); return {}; }, readTimeline: async () => ({}) },
+    provider: { deleteAssets: async options => {
+      calls.push(options);
+      const custom = await override?.(options, calls.length, jobs);
+      return custom || { status: options.commit ? "deleted" : "matched", message: "done", results: options.assets.map(asset => ({ ...asset, status: options.commit ? "deleted" : "matched" })) };
+    } }, recycleBin: { recycle: () => assert.fail("automatic release must retain local files") },
+  });
+  return { assets, calls, records, jobs, run: async () => { const started = jobs.start("alice", { assets, recycleLocal: false, autoBatches: true }); return jobs.wait("alice", started.id); } };
+}
+
+test("automatic release serially reviews and deletes batches of 100 and saves each result", async () => {
+  const f = automaticFixture(205);
+  const done = await f.run();
+  assert.equal(done.status, "completed"); assert.equal(done.deleted, 205); assert.equal(done.total, 205);
+  assert.deepEqual(f.calls.map(call => [call.commit, call.assets.length]), [[false, 100], [true, 100], [false, 100], [true, 100], [false, 5], [true, 5]]);
+  assert.equal(f.records.length, 3); assert.equal(done.result.releaseResult.results.length, 205);
+});
+
+for (const status of ["indexing", "partial", "matched"]) test(`automatic release stops before committing an incomplete ${status} review`, async () => {
+  const f = automaticFixture(205, (options, number) => number === 3 ? { status, message: "review unavailable", results: options.assets.slice(0, 99).map(asset => ({ ...asset, status: "matched" })) } : null);
+  const done = await f.run();
+  assert.equal(done.status, "partial"); assert.equal(done.deleted, 100);
+  assert.equal(f.calls.length, 3); assert.equal(f.records.length, 1);
+  assert.match(done.message, /本批未提交删除/);
+});
+
+test("automatic release stops after partial deletion and records only confirmed requested results", async () => {
+  const f = automaticFixture(205, (options, number) => number === 2 ? { status: "partial", message: "partial", results: [{ ...options.assets[0], status: "deleted" }, { ...options.assets[0], status: "deleted" }, { id: "foreign", library: "main", status: "deleted" }] } : null);
+  const done = await f.run();
+  assert.equal(done.deleted, 1); assert.equal(done.status, "partial"); assert.equal(f.calls.length, 2);
+  assert.equal(f.records[0].result.results.length, 1);
+});
+
+test("requesting stop during review never submits that batch", async () => {
+  const f = automaticFixture(205, (_options, number, jobs) => { if (number === 1) jobs.stop("alice", jobs.read("alice").id); });
+  const done = await f.run();
+  assert.equal(done.deleted, 0); assert.equal(f.calls.length, 1); assert.equal(f.records.length, 0);
+});
+
+test("requesting stop during deletion saves the current batch and prevents later batches", async () => {
+  const f = automaticFixture(205, (_options, number, jobs) => { if (number === 2) jobs.stop("alice", jobs.read("alice").id); });
+  const done = await f.run();
+  assert.equal(done.deleted, 100); assert.equal(f.calls.length, 2); assert.equal(f.records.length, 1);
+});
+
 test("an exactly confirmed recently deleted cloud asset permits local recycling", async () => {
   const asset = { id: "trash", library: "PrimarySync", name: "IMG_0050.JPG", localFiles: ["IMG_0050.JPG"] };
   let recycled;

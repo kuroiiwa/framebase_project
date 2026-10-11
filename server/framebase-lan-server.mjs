@@ -763,7 +763,10 @@ async function handleIcloudOperation(request, response, url, current) {
     const body = await readJsonBody(request);
     const plan = await icloud.readReleasePlan(current.username);
     if (!plan || plan.status !== "confirmed" || body.planId !== plan.id) return json(response, 409, { error: "释放计划尚未确认或已经失效。" });
-    const requestedKeys = new Set(Array.isArray(body.assetKeys) ? body.assetKeys.filter(key => typeof key === "string").slice(0, 100) : []);
+    const autoBatches = body.autoBatches === true && url.pathname === "/api/icloud/release/delete";
+    const requestedKeys = new Set(Array.isArray(body.assetKeys) ? body.assetKeys.filter(key => typeof key === "string") : []);
+    if (!autoBatches && requestedKeys.size > 100) return json(response, 400, { error: "每批最多 100 个项目；处理全部请使用自动分批释放。" });
+    if (autoBatches && body.recycleLocal === true) return json(response, 400, { error: "自动分批仅释放 iCloud，本地原片保留。" });
     let assets = plan.assets.filter(asset => requestedKeys.has(`${asset.library}:${asset.id}`));
     if (!assets.length || assets.length !== requestedKeys.size) return json(response, 400, { error: "选择的项目不在已确认释放计划中。" });
     // Inventory positions are lookup hints only: the adapter still verifies ID and
@@ -791,13 +794,17 @@ async function handleIcloudOperation(request, response, url, current) {
       return json(response, preview.status === "matched" ? 200 : 409, { releaseResult: preview, localRecyclePlan: { fileCount: localRecyclePlan.fileCount, bytes: localRecyclePlan.bytes } });
     }
     if (body.confirmation !== true && body.confirmation !== "移入最近删除") return json(response, 400, { error: "请点击确认后再提交删除。" });
-    const deleteJob = releaseDeleteJobs.start(current.username, { assets, recycleLocal });
+    const deleteJob = releaseDeleteJobs.start(current.username, { assets, recycleLocal, autoBatches });
     if (body.background === true) return json(response, 202, { deleteJob });
     const completedJob = await releaseDeleteJobs.wait(current.username, deleteJob.id);
     return json(response, completedJob.status === "completed" || completedJob.status === "partial" ? 200 : 409, completedJob.result || { error: completedJob.message });
   }
   if (request.method === "GET" && url.pathname === "/api/icloud/release/delete/status") {
     return json(response, 200, { deleteJob: releaseDeleteJobs.read(current.username) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/icloud/release/delete/stop") {
+    const body = await readJsonBody(request);
+    return json(response, 200, { deleteJob: releaseDeleteJobs.stop(current.username, body.jobId) });
   }
   if (request.method === "POST" && url.pathname === "/api/icloud/release/recycle/retry") {
     const body = await readJsonBody(request);
